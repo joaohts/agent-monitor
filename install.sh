@@ -90,7 +90,23 @@ else
 fi
 echo
 
-# ── 5. Done ─────────────────────────────────────────────────────────────────
+# ── 5. Symlink into ~/Applications so Spotlight can find it ─────────────────
+APPS_DIR="$HOME/Applications"
+APP_LINK="$APPS_DIR/AgentMonitor.app"
+APP_TARGET="$REPO_DIR/AgentMonitor.app"
+
+mkdir -p "$APPS_DIR"
+
+# Replace any existing symlink/copy with a fresh symlink to our build location
+if [ -L "$APP_LINK" ] || [ -e "$APP_LINK" ]; then
+    rm -rf "$APP_LINK"
+fi
+ln -s "$APP_TARGET" "$APP_LINK"
+echo "==> Symlinked $APP_LINK → $APP_TARGET"
+echo "    (search 'Agent Monitor' in Spotlight to launch it)"
+echo
+
+# ── 6. Done ─────────────────────────────────────────────────────────────────
 cat <<EOF
 ==> Installation complete.
 
