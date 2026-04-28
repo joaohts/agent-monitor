@@ -78,14 +78,34 @@ Hooks are external shell scripts. Appending one JSON line is trivial (`echo >> f
 - `jq` — `brew install jq`
 - `claude` CLI logged in (for AI title and live-status features)
 
-### One-time setup
+### One-shot install (recommended)
+
+```bash
+cd /path/to/agent-monitor
+./install.sh
+```
+
+This script:
+- Verifies prereqs (`swiftc`, `jq`, `claude` CLI) and prints install hints if any are missing
+- Builds `AgentMonitor.app` via `build.sh`
+- Smoke-tests the hook script with sample input
+- **Idempotent merge** of hook entries into `~/.claude/settings.json` via `jq`:
+  - Existing hooks for other tools are preserved (added as additional matchers, not overwritten)
+  - Re-running won't duplicate our entries (detects our hook path is already registered)
+  - Backup of `settings.json` saved as `settings.json.bak.YYYYMMDD_HHMMSS` before any change
+  - If `jq` produces invalid JSON, the original is left untouched and the script exits non-zero
+- Prints next-step instructions for TCC prompts
+
+### Manual install
+
+If you'd rather do it by hand:
 
 ```bash
 cd /path/to/agent-monitor
 ./build.sh           # compiles + launches AgentMonitor.app
 ```
 
-The hook script registration in `~/.claude/settings.json` should already be in place. If not, add:
+Then add to `~/.claude/settings.json`:
 
 ```json
 {

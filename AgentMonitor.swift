@@ -486,8 +486,14 @@ final class AgentStore: ObservableObject {
         }
         let newAgents = enrichWithTranscripts(assignSiblingIndices(sorted))
 
+        let withStaleness = applyTranscriptStaleness(newAgents)
+
+        // Sound check must run AFTER staleness, otherwise the pre-staleness status
+        // (from raw apply) compared against the post-staleness previousStatuses
+        // looks like a constant flap (e.g. needs_attention ↔ running every tick),
+        // replaying Funk on every reload.
         if hasLoadedInitial && soundEnabled {
-            for agent in newAgents {
+            for agent in withStaleness {
                 let prev = previousStatuses[agent.id]
                 if prev != agent.status {
                     playTransitionSound(from: prev, to: agent.status)
@@ -495,37 +501,60 @@ final class AgentStore: ObservableObject {
             }
         }
 
-        let withStaleness = applyTranscriptStaleness(newAgents)
         previousStatuses = Dictionary(uniqueKeysWithValues: withStaleness.map { ($0.id, $0.status) })
         hasLoadedInitial = true
         agents = withStaleness
         ensureStaleCheckTimer()
     }
 
-    /// If a .running agent's transcript has been silent for >30s, mark as .away
-    /// (still in the Running column, just visually flagged as inactive). Never
-    /// auto-transitions to .stopped — that only happens via a real Stop event.
-    /// Activity (transcript writes) flips it back to .running automatically.
+    /// Two transcript-mtime-based transitions:
+    /// - .running → .away when transcript has been silent for >60s
+    /// - .needsAttention → .running when transcript activity resumes (permission
+    ///   granted; Claude continues silently with no hook event)
+    /// Never auto-transitions to .stopped — that requires a real Stop event.
     private func applyTranscriptStaleness(_ agents: [Agent]) -> [Agent] {
         let now = Date()
         return agents.map { a in
-            guard a.status == .running, let path = a.transcriptPath, !path.isEmpty else { return a }
+            guard let path = a.transcriptPath, !path.isEmpty else { return a }
             let info = transcriptReader.read(path: path)
             guard let mtime = info.lastModified else { return a }
-            // Anchor against runStartedAt too — a freshly started run hasn't had time
-            // to write to the transcript yet, so the prior mtime shouldn't count as "stale".
-            let lastActivity = max(mtime, a.runStartedAt ?? mtime)
-            let idleSec = now.timeIntervalSince(lastActivity)
-            guard idleSec > Self.awayThresholdSec else { return a }
+            let writeIdleSec = now.timeIntervalSince(mtime)
 
-            var copy = a
-            copy.status = .away
-            return copy
+            switch a.status {
+            case .running:
+                let lastActivity = max(mtime, a.runStartedAt ?? mtime)
+                let idleSec = now.timeIntervalSince(lastActivity)
+                guard idleSec > Self.awayThresholdSec else { return a }
+                var copy = a
+                copy.status = .away
+                return copy
+
+            case .needsAttention:
+                // After the needs_attention event, if the transcript gets a write
+                // that's clearly newer than the event itself (>1s buffer for clock
+                // races between hook fire and tool_use being flushed), Claude has
+                // resumed. Stay .running until a real Stop event arrives.
+                guard let lastUpdateDate = Self.iso8601.date(from: a.lastUpdate) else { return a }
+                guard mtime > lastUpdateDate.addingTimeInterval(1.0) else { return a }
+                var copy = a
+                copy.status = .running
+                copy.runStartedAt = mtime
+                return copy
+
+            default:
+                return a
+            }
         }
     }
 
     private func ensureStaleCheckTimer() {
-        let needsTimer = agents.contains { $0.status == .running }
+        // Keep polling while any agent is in a time-sensitive state:
+        //  .running        → check for staleness (→ .away)
+        //  .away           → detect resumption (→ .running)
+        //  .needsAttention → detect post-permission resumption (→ .running, no hook fires)
+        let needsTimer = agents.contains {
+            $0.status == .running || $0.status == .away || $0.status == .needsAttention
+        }
         if needsTimer && staleCheckTimer == nil {
             staleCheckTimer = Timer.scheduledTimer(
                 withTimeInterval: Self.staleCheckInterval, repeats: true
