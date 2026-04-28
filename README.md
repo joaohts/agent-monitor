@@ -158,6 +158,8 @@ Run `./build.sh` once. From then on the app sits in your menu/dock and the float
 - **Visible on all Spaces** (`canJoinAllSpaces` collection behavior)
 - **Movable by background** — drag from anywhere in the window
 - Standard traffic-light buttons: minimize, close, zoom
+- **Spotlight-launchable** — installer symlinks `AgentMonitor.app` into `~/Applications`, so `Cmd+Space → "Agent Monitor"` works
+- **Custom dock/Spotlight icon** generated from `assets/icon.png` on every build (auto-padded to square + scaled to all 10 required iconset sizes)
 
 ### Header bar
 
@@ -187,6 +189,17 @@ Run `./build.sh` once. From then on the app sits in your menu/dock and the float
 | `stopped` | ⚪ gray | left | `Stop` hook fires (turn done) | frozen at stop time |
 
 **Sort order within columns:** `needsAttention < running < away < stopped < idle` then by recency.
+
+### Row layout
+
+```
+project-name #1                                   ← cwd basename + sibling index
+0:42 · running · sonnet-4.6                       ← time · status · model alias
+writing Swift app monitor                         ← live status (callout font, white) while running
+                                                    ↳ persistent generated title (caption font, gray) when not
+```
+
+The third metadata token is the **model** in use, parsed from the most recent assistant entry in the transcript (e.g. `sonnet-4.6`, `opus-4.7`, `haiku-4.5`). Falls back to a session ID prefix for brand-new sessions where no transcript exists yet.
 
 ### Status transitions
 
