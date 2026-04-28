@@ -60,7 +60,6 @@ Hooks are external shell scripts. Appending one JSON line is trivial (`echo >> f
 |---|---|
 | `AgentMonitor.swift` | Single-file SwiftUI app (~700 lines) |
 | `build.sh` | Compiles to `.app` bundle, kills prior instance, launches |
-| `seed.sh` | Writes sample events for visual testing |
 | `hooks/agent-monitor-hook.sh` | The Claude Code hook script |
 | `~/.claude/agents.jsonl` | Event log (the database) |
 | `~/.claude/settings.json` | Where the hooks are registered globally |

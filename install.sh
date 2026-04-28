@@ -34,7 +34,7 @@ echo
 
 # ── 2. Build ─────────────────────────────────────────────────────────────────
 echo "==> Building AgentMonitor.app..."
-chmod +x "$HOOK_PATH" build.sh seed.sh
+chmod +x "$HOOK_PATH" build.sh
 ./build.sh
 echo
 
