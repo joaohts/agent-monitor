@@ -1,0 +1,8 @@
+AgentMonitor.app/
+AgentMonitor
+*.dSYM/
+
+.DS_Store
+Screenshot*.png
+
+.claude/
