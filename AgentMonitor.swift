@@ -52,6 +52,7 @@ struct Agent: Identifiable {
     var latestSummary: String?
     var generatedTitle: String?
     var liveStatus: String?
+    var model: String?
     var siblingIndex: Int? = nil
     // Runtime tracking: ticks while .running, frozen when .needsAttention or .stopped
     var accumulatedSeconds: Double = 0
@@ -142,6 +143,7 @@ struct TranscriptInfo {
     let liveExcerpt: String
     let lastModified: Date?    // transcript file mtime
     let isToolPending: Bool    // last tool_use has no matching tool_result yet
+    let model: String?         // most recent assistant message's model
 }
 
 @MainActor
@@ -153,7 +155,7 @@ final class TranscriptReader {
     private var cache: [String: CacheEntry] = [:]
     private static let empty = TranscriptInfo(
         initialTask: nil, latestSummary: nil, userMessageCount: 0,
-        titleExcerpt: "", liveExcerpt: "", lastModified: nil, isToolPending: false
+        titleExcerpt: "", liveExcerpt: "", lastModified: nil, isToolPending: false, model: nil
     )
 
     func read(path: String) -> TranscriptInfo {
@@ -180,6 +182,7 @@ final class TranscriptReader {
         var latestSummary: String?
         var turns: [(role: String, text: String)] = []
         var pendingToolUseIds: Set<String> = []
+        var lastModel: String?
 
         for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
             guard let lineData = line.data(using: .utf8),
@@ -207,6 +210,10 @@ final class TranscriptReader {
                 if let txt = extractText(obj["message"]) {
                     turns.append((role: "Assistant", text: txt))
                 }
+                if let msg = obj["message"] as? [String: Any],
+                   let m = msg["model"] as? String, !m.isEmpty {
+                    lastModel = m
+                }
             case "summary":
                 if let s = obj["summary"] as? String, !s.isEmpty { latestSummary = s }
             default: break
@@ -224,7 +231,8 @@ final class TranscriptReader {
             titleExcerpt: titleExcerpt,
             liveExcerpt: liveExcerpt,
             lastModified: lastModified,
-            isToolPending: !pendingToolUseIds.isEmpty
+            isToolPending: !pendingToolUseIds.isEmpty,
+            model: lastModel
         )
     }
 
@@ -402,19 +410,19 @@ final class LiveStatusGenerator {
 
     nonisolated private static func runClaude(excerpt: String) -> String? {
         let prompt = """
-        You are observing an in-progress Claude Code session. Below is the recent context: the last few user messages and Claude's responses, plus an optional earlier summary.
+        You are watching an in-progress Claude Code session. Recent context follows.
 
-        Generate a concise 5-7 word phrase describing EXACTLY what Claude is doing RIGHT NOW — the most recent action in progress. Use present-continuous, action-focused language (e.g. "writing Swift app", "debugging failing tests", "refactoring auth module").
-
-        IMPORTANT: the phrase will be truncated to ~50 characters when displayed. Front-load the most informative words — the core meaning MUST be conveyed in the first 50 characters even if the rest is cut off.
-
-        Output ONLY the phrase — no quotes, no preamble, no trailing punctuation.
+        Output a SINGLE phrase, MAX 50 CHARACTERS TOTAL, describing exactly what Claude is doing right now. Present-continuous (e.g. "writing Swift app", "debugging failing tests", "refactoring auth module"). No quotes, no preamble, no trailing punctuation, no second line. If you can't fit the action in 50 chars, abbreviate ruthlessly.
 
         ---
         \(excerpt)
         """
         guard let raw = ClaudeP.run(prompt: prompt) else { return nil }
-        return ClaudeP.sanitizeShortPhrase(raw)
+        guard let phrase = ClaudeP.sanitizeShortPhrase(raw) else { return nil }
+        // Hard-truncate at 50 chars even if the model overshot
+        if phrase.count <= 50 { return phrase }
+        let idx = phrase.index(phrase.startIndex, offsetBy: 50)
+        return String(phrase[..<idx]).trimmingCharacters(in: .whitespaces)
     }
 }
 
@@ -706,6 +714,7 @@ final class AgentStore: ObservableObject {
                 let info = transcriptReader.read(path: path)
                 copy.initialTask = info.initialTask
                 copy.latestSummary = info.latestSummary
+                copy.model = info.model
 
                 if titleGenerationEnabled {
                     titleGenerator.considerGenerating(
@@ -949,7 +958,7 @@ struct AgentRow: View {
                         .font(.caption2)
                         .foregroundStyle(statusColor)
                     Text("·").foregroundStyle(.tertiary)
-                    Text(agent.id.prefix(8))
+                    Text(modelLabel)
                         .font(.caption2.monospaced())
                         .foregroundStyle(.tertiary)
                 }
@@ -1017,6 +1026,21 @@ struct AgentRow: View {
             return "\(base) #\(idx)"
         }
         return base
+    }
+
+    private var modelLabel: String {
+        guard let m = agent.model, !m.isEmpty else { return String(agent.id.prefix(8)) }
+        // claude-sonnet-4-6-20250101 → sonnet-4.6
+        // claude-haiku-4-5            → haiku-4.5
+        // claude-opus-4-7-20251201    → opus-4.7
+        let pieces = m.split(separator: "-").map(String.init)
+        guard pieces.count >= 4, pieces[0] == "claude" else {
+            return m  // unknown shape, show as-is
+        }
+        let family = pieces[1]
+        let major = pieces[2]
+        let minor = pieces[3]
+        return "\(family)-\(major).\(minor)"
     }
 
     @ViewBuilder
