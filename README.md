@@ -95,6 +95,14 @@ This script:
   - If `jq` produces invalid JSON, the original is left untouched and the script exits non-zero
 - Prints next-step instructions for TCC prompts
 
+### Uninstall
+
+```bash
+./uninstall.sh
+```
+
+Stops the running app, removes the `~/Applications` symlink, and removes our hook entries from `~/.claude/settings.json` (preserving any other tools' hooks). User data (`agents.jsonl`, debug log) and the repo itself are left alone.
+
 ### Manual install
 
 If you'd rather do it by hand:
