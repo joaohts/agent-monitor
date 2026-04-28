@@ -98,10 +98,21 @@ This script:
 ### Uninstall
 
 ```bash
-./uninstall.sh
+./uninstall.sh             # full clean slate
+./uninstall.sh --keep-data # preserve agents.jsonl + debug log
 ```
 
-Stops the running app, removes the `~/Applications` symlink, and removes our hook entries from `~/.claude/settings.json` (preserving any other tools' hooks). User data (`agents.jsonl`, debug log) and the repo itself are left alone.
+The default is a complete clean slate:
+- Stops the running app
+- Removes the `~/Applications/AgentMonitor.app` symlink
+- Unregisters our hooks from `~/.claude/settings.json` (preserves other tools' hooks; saves a backup first)
+- Deletes the `AgentMonitor.app` build artifact in the repo
+- Deletes `~/.claude/agents.jsonl` and `~/.claude/agent-monitor-debug.log`
+
+Not auto-handled (deliberately):
+- **TCC permissions** (Full Disk Access etc) — revoke manually in System Settings → Privacy & Security
+- **`settings.json.bak.*` backups** — kept as safety nets, rm them yourself
+- **The repo itself** — `rm -rf` or `git clean` manually
 
 ### Manual install
 

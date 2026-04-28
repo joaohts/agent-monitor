@@ -1,20 +1,33 @@
 #!/bin/bash
-# Reverses install.sh:
+# Full uninstall: clean slate, as if you'd never installed Agent Monitor.
 # - Stops the running app
 # - Removes ~/Applications/AgentMonitor.app symlink
 # - Removes our hook entries from ~/.claude/settings.json (with backup)
-# Does NOT delete user data (~/.claude/agents.jsonl, debug log) by default.
+# - Deletes ~/.claude/agents.jsonl (event log)
+# - Deletes ~/.claude/agent-monitor-debug.log (debug log)
+# - Removes the AgentMonitor.app build artifact in the repo
+# Does NOT delete the repo itself — git rm or rm -rf manually if you want.
+# Does NOT revoke TCC permissions — see message at end for manual steps.
+#
+# Pass --keep-data to preserve agents.jsonl and the debug log.
 set -euo pipefail
 cd "$(dirname "$0")"
+
+KEEP_DATA=0
+[ "${1:-}" = "--keep-data" ] && KEEP_DATA=1
 
 REPO_DIR="$(pwd)"
 HOOK_PATH="$REPO_DIR/hooks/agent-monitor-hook.sh"
 SETTINGS="$HOME/.claude/settings.json"
 APP_LINK="$HOME/Applications/AgentMonitor.app"
+EVENTS_LOG="$HOME/.claude/agents.jsonl"
+DEBUG_LOG="$HOME/.claude/agent-monitor-debug.log"
+APP_BUNDLE="$REPO_DIR/AgentMonitor.app"
 
 echo "==> Agent Monitor uninstaller"
 echo "    repo:    $REPO_DIR"
 echo "    hook:    $HOOK_PATH"
+[ $KEEP_DATA -eq 1 ] && echo "    mode:    --keep-data (will preserve event log + debug log)"
 echo
 
 # ── 1. Stop running app ─────────────────────────────────────────────────────
@@ -85,15 +98,38 @@ else
 fi
 echo
 
-# ── 4. Done ─────────────────────────────────────────────────────────────────
-cat <<EOF
-==> Uninstall complete.
+# ── 4. Remove build artifact ────────────────────────────────────────────────
+if [ -d "$APP_BUNDLE" ]; then
+    echo "==> Removing build artifact $APP_BUNDLE..."
+    rm -rf "$APP_BUNDLE"
+    echo "    ✓ removed (rebuild anytime with ./build.sh)"
+else
+    echo "==> No build artifact at $APP_BUNDLE, skipping"
+fi
+echo
 
-Preserved (user data — delete manually if you want):
-  ~/.claude/agents.jsonl                      (event log)
-  ~/.claude/agent-monitor-debug.log           (debug log)
-  $REPO_DIR/AgentMonitor.app                 (build artifact)
-  $REPO_DIR                                   (repo)
+# ── 5. Remove user data (event log, debug log) ──────────────────────────────
+if [ $KEEP_DATA -eq 1 ]; then
+    echo "==> Skipping user data deletion (--keep-data was passed)"
+else
+    for f in "$EVENTS_LOG" "$DEBUG_LOG"; do
+        if [ -f "$f" ]; then
+            echo "==> Removing $f..."
+            rm -f "$f"
+            echo "    ✓ removed"
+        fi
+    done
+fi
+echo
+
+# ── 6. Done ─────────────────────────────────────────────────────────────────
+cat <<EOF
+==> Uninstall complete. Clean slate.
+
+Not auto-revoked (manual cleanup if you want):
+  - TCC permissions (Full Disk Access, etc): System Settings → Privacy & Security
+  - settings.json backups (.bak.YYYYMMDD_HHMMSS): kept as safety nets
+  - The repo itself ($REPO_DIR): \`rm -rf\` or \`git clean\` manually
 
 To reinstall later:
   ./install.sh
