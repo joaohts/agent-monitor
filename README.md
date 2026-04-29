@@ -167,6 +167,7 @@ Run `./build.sh` once. From then on the app sits in your menu/dock and the float
 |---|---|
 | Count badge | Total agents in the list |
 | ✨ sparkles | Toggle AI title + live-status generation (saves tokens when off) |
+| 🔔 bell | Toggle push notifications to phone (disabled if jsplayground not configured) |
 | 🔊 / 🔇 speaker | Mute / unmute transition sounds |
 | ↻ arrow | Force reload from `agents.jsonl` |
 
@@ -285,6 +286,72 @@ Both generators run output through `ClaudeP.sanitizeShortPhrase`:
 - Take only the first line
 - Strip wrapping quotes (`"`, `'`, `` ` ``)
 - Strip trailing `.`, `!`, `?`, `…`
+
+---
+
+## Push notifications (optional)
+
+The 🔔 bell button in the header sends pushes to your phone via the **jsplayground MCP server** when:
+
+- A session transitions to **`.needsAttention`** → urgent push: `🟠 <project> needs attention`
+- A session transitions to **`.idle`** from `running` / `away` / `needs_attention` (real turn completion) → info push: `✅ <project> finished`
+
+Skipped: brand-new sessions (`nil → idle`), automatic decay (`idle → inactive`), all other transitions.
+
+### Configuration
+
+The app reads jsplayground server config from `~/.claude.json` at launch. Add this block under `mcpServers`:
+
+```json
+{
+  "mcpServers": {
+    "jsplayground": {
+      "type": "http",
+      "url": "https://mcp.jsplayground.cc/mcp",
+      "headers": {
+        "Authorization": "Bearer <YOUR_TOKEN>"
+      }
+    }
+  }
+}
+```
+
+Token comes from however jsplayground issues them (it's João's personal Pager API service — not generally available).
+
+### Button states
+
+- **Configured + on** — `bell.badge.fill` in accent color, sending pushes
+- **Configured + off** — outline `bell` in secondary color, dormant
+- **Not configured** — grayed out + disabled, tooltip explains how to enable
+
+The on/off toggle is persisted to `UserDefaults` so it survives app restarts. The config itself is read once at app launch, so if you edit `~/.claude.json` you must restart the app:
+
+```bash
+pkill -x AgentMonitor && open ~/Applications/AgentMonitor.app
+```
+
+### Wire format
+
+The app posts JSON-RPC `tools/call` for the `send_push` tool to the configured endpoint:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "<uuid>",
+  "method": "tools/call",
+  "params": {
+    "name": "send_push",
+    "arguments": {
+      "title": "🟠 agent-monitor needs attention",
+      "message": "<live status / last hook message>",
+      "category": "urgent",
+      "source": "agent-monitor"
+    }
+  }
+}
+```
+
+With `Authorization: Bearer <token>`. Failures are silent (logged to `~/.claude/agent-monitor-debug.log` with `push:` prefix).
 
 ---
 
