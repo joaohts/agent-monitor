@@ -110,7 +110,15 @@ final class PushNotifier: ObservableObject {
     }
 
     func send(title: String, message: String, category: String = "alert") {
-        guard enabled, let config = config else { return }
+        guard enabled else {
+            Self.debugLog("push: skipped (disabled)")
+            return
+        }
+        guard let config = config else {
+            Self.debugLog("push: skipped (no jsplayground config)")
+            return
+        }
+        Self.debugLog("push: sending → \(title)")
         let url = config.url
         let bearer = config.bearer
         Task.detached(priority: .utility) {
@@ -129,7 +137,9 @@ final class PushNotifier: ObservableObject {
                     "title": title,
                     "message": message,
                     "category": category,
-                    "source": "agent-monitor"
+                    // The Pager API only accepts: system, email-agent, cron, manual.
+                    // We claim "system" since this fires automatically.
+                    "source": "system"
                 ]
             ]
         ]
@@ -142,16 +152,25 @@ final class PushNotifier: ObservableObject {
         req.httpBody = payload
         req.timeoutInterval = 8
         do {
-            let (_, response) = try await URLSession.shared.data(for: req)
+            let (data, response) = try await URLSession.shared.data(for: req)
             if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
                 debugLog("push: HTTP \(http.statusCode)")
+                return
             }
+            // The MCP server returns 200 even on tool errors, with isError:true in the
+            // JSON-RPC result. Parse the SSE-style body to surface real failures.
+            if let body = String(data: data, encoding: .utf8), body.contains("\"isError\":true") {
+                let snippet = body.split(separator: "\n").first(where: { $0.hasPrefix("data:") }).map(String.init) ?? body
+                debugLog("push: tool error: \(snippet.prefix(300))")
+                return
+            }
+            debugLog("push: ok")
         } catch {
             debugLog("push: \(error.localizedDescription)")
         }
     }
 
-    nonisolated private static func debugLog(_ msg: String) {
+    nonisolated static func debugLog(_ msg: String) {
         let line = "[\(ISO8601DateFormatter().string(from: Date()))] \(msg)\n"
         let path = NSHomeDirectory() + "/.claude/agent-monitor-debug.log"
         if let data = line.data(using: .utf8) {
