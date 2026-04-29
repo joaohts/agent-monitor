@@ -5,11 +5,18 @@ import Combine
 // MARK: - Event log format
 
 enum AgentEventKind: String, Codable {
-    case idle              // session opened, no prompt yet
-    case started           // a run began (UserPromptSubmit)
+    case idle              // SessionStart: session opened, no prompt yet
+    case started           // UserPromptSubmit: a run began
     case needsAttention = "needs_attention"
-    case stopped
-    case cleared
+    case stopped           // Stop: turn finished
+    case cleared           // SessionEnd: session terminated
+    // Synthetic events emitted by the app itself (not by hooks) so the event
+    // log captures all state transitions, including the ones derived from
+    // transcript-mtime polling. Required for accurate stats.
+    case awayStart           = "away_start"
+    case awayEnd             = "away_end"
+    case needsAttentionEnd   = "needs_attention_end"
+    case inactiveStart       = "inactive_start"
 }
 
 struct AgentEvent: Codable {
@@ -63,6 +70,234 @@ struct Agent: Identifiable {
             return accumulatedSeconds + now.timeIntervalSince(started)
         }
         return accumulatedSeconds
+    }
+}
+
+// MARK: - Stats
+
+enum StatsWindow: String, CaseIterable, Identifiable {
+    case daily, weekly, monthly, allTime
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .daily:    return "Daily"
+        case .weekly:   return "Weekly"
+        case .monthly:  return "Monthly"
+        case .allTime:  return "All time"
+        }
+    }
+}
+
+struct WindowStats {
+    var sessionsCreated: Int = 0
+    var stepsCount: Int = 0
+    var totalRunningSec: Double = 0
+    var totalAwaySec: Double = 0
+    var totalNeedsAttentionSec: Double = 0
+    var maxConcurrentRunning: Int = 0
+    /// time spent with running concurrency >= N for N in 1...5
+    var timeAtConcurrency: [Int: Double] = [1: 0, 2: 0, 3: 0, 4: 0, 5: 0]
+    /// running seconds per cwd (for top-projects)
+    var runningPerProject: [String: Double] = [:]
+    /// running seconds bucketed by local hour-of-day (0..23)
+    var runningPerHour: [Int: Double] = [:]
+
+    var avgRunningPerStep: Double { stepsCount > 0 ? totalRunningSec / Double(stepsCount) : 0 }
+    var avgAwayPerStep: Double { stepsCount > 0 ? totalAwaySec / Double(stepsCount) : 0 }
+    var avgNeedsAttentionPerStep: Double { stepsCount > 0 ? totalNeedsAttentionSec / Double(stepsCount) : 0 }
+
+    var topProjects: [(cwd: String, sec: Double)] {
+        runningPerProject
+            .map { ($0.key, $0.value) }
+            .sorted { $0.1 > $1.1 }
+            .prefix(3)
+            .map { (cwd: $0.0, sec: $0.1) }
+    }
+}
+
+struct StatsBundle {
+    var daily: WindowStats = WindowStats()
+    var weekly: WindowStats = WindowStats()
+    var monthly: WindowStats = WindowStats()
+    var allTime: WindowStats = WindowStats()
+
+    func get(_ w: StatsWindow) -> WindowStats {
+        switch w {
+        case .daily:    return daily
+        case .weekly:   return weekly
+        case .monthly:  return monthly
+        case .allTime:  return allTime
+        }
+    }
+
+    static let empty = StatsBundle()
+}
+
+enum StatsCompute {
+    /// Single chronological pass over events that produces stats for all four
+    /// windows simultaneously. State machine per session; concurrency timeline
+    /// computed via a global "currently running set" + interval accumulation.
+    static func compute(events: [AgentEvent], now: Date = Date()) -> StatsBundle {
+        let isoFmt = ISO8601DateFormatter()
+        isoFmt.formatOptions = [.withInternetDateTime]
+
+        let dailyStart   = Calendar.current.startOfDay(for: now)
+        let weeklyStart  = now.addingTimeInterval(-7 * 86400)
+        let monthlyStart = now.addingTimeInterval(-30 * 86400)
+        let allTimeStart = Date.distantPast
+        // Windows in fixed order matching keys 0..3 below
+        let windowStarts: [Date] = [dailyStart, weeklyStart, monthlyStart, allTimeStart]
+        var ws: [WindowStats] = [WindowStats(), WindowStats(), WindowStats(), WindowStats()]
+
+        // Per-session current state, when it entered that state, and last-seen cwd
+        var sessionState: [String: AgentStatus] = [:]
+        var sessionSince: [String: Date] = [:]
+        var sessionCwd: [String: String] = [:]
+        let calendar = Calendar.current
+        // Globally running session ids and the timestamp the running set last changed
+        var runningSet: Set<String> = []
+        var runningSince: Date? = nil
+
+        // Distribute running time across local-hour-of-day buckets within [lo, hi].
+        func addHourBuckets(into idx: Int, from lo: Date, to hi: Date) {
+            var cursor = lo
+            while cursor < hi {
+                let comps = calendar.dateComponents([.year, .month, .day, .hour], from: cursor)
+                let hourStart = calendar.date(from: comps) ?? cursor
+                let hourEnd = calendar.date(byAdding: .hour, value: 1, to: hourStart) ?? hi
+                let chunkEnd = min(hi, hourEnd)
+                let dur = chunkEnd.timeIntervalSince(cursor)
+                if dur > 0 {
+                    let h = comps.hour ?? 0
+                    ws[idx].runningPerHour[h, default: 0] += dur
+                }
+                cursor = chunkEnd
+            }
+        }
+
+        // Accumulate the time `state` was entered from `from` to `to` into each window.
+        func addStateTime(_ state: AgentStatus, sid: String, from: Date, to: Date) {
+            for i in 0..<4 {
+                let lo = max(from, windowStarts[i])
+                let hi = min(to, now)
+                guard lo < hi else { continue }
+                let dur = hi.timeIntervalSince(lo)
+                switch state {
+                case .running:
+                    ws[i].totalRunningSec += dur
+                    if let cwd = sessionCwd[sid], !cwd.isEmpty {
+                        ws[i].runningPerProject[cwd, default: 0] += dur
+                    }
+                    addHourBuckets(into: i, from: lo, to: hi)
+                case .away:           ws[i].totalAwaySec += dur
+                case .needsAttention: ws[i].totalNeedsAttentionSec += dur
+                default: break
+                }
+            }
+        }
+
+        // Accumulate concurrency time AND update max in each window over [from, to].
+        func addConcurrency(level: Int, from: Date, to: Date) {
+            guard from < to else { return }
+            for i in 0..<4 {
+                let lo = max(from, windowStarts[i])
+                let hi = min(to, now)
+                guard lo < hi else { continue }
+                let dur = hi.timeIntervalSince(lo)
+                if level > 0 {
+                    let cap = min(5, level)
+                    for k in 1...cap {
+                        ws[i].timeAtConcurrency[k, default: 0] += dur
+                    }
+                }
+                if level > ws[i].maxConcurrentRunning {
+                    ws[i].maxConcurrentRunning = level
+                }
+            }
+        }
+
+        let sorted = events.sorted { $0.ts < $1.ts }
+
+        for ev in sorted {
+            guard let t = isoFmt.date(from: ev.ts) else { continue }
+            let sid = ev.sessionId
+
+            // Concurrency interval ending at this event
+            if let since = runningSince {
+                addConcurrency(level: runningSet.count, from: since, to: t)
+            }
+
+            // Capture cwd from event if present so subsequent state-time accounting
+            // can attribute running time to the right project.
+            if let cwd = ev.cwd, !cwd.isEmpty {
+                sessionCwd[sid] = cwd
+            }
+
+            // Per-session state-time interval ending at this event
+            if let oldState = sessionState[sid], let since = sessionSince[sid] {
+                addStateTime(oldState, sid: sid, from: since, to: t)
+            }
+            let oldState = sessionState[sid]
+
+            // Apply event → new state
+            let newState: AgentStatus?
+            var stepInc = 0
+            var sessionCreated = false
+            switch ev.event {
+            case .idle:
+                newState = .idle
+                if oldState == nil { sessionCreated = true }
+            case .started:
+                newState = .running
+                stepInc = 1
+            case .needsAttention:    newState = .needsAttention
+            case .stopped:           newState = .idle
+            case .cleared:           newState = nil
+            case .awayStart:         newState = .away
+            case .awayEnd:           newState = .running
+            case .needsAttentionEnd: newState = .running
+            case .inactiveStart:     newState = .inactive
+            }
+            if let new = newState {
+                sessionState[sid] = new
+                sessionSince[sid] = t
+            } else {
+                sessionState.removeValue(forKey: sid)
+                sessionSince.removeValue(forKey: sid)
+            }
+
+            // Update running set
+            let wasRun = oldState == .running
+            let nowRun = newState == .running
+            if wasRun != nowRun {
+                if nowRun { runningSet.insert(sid) } else { runningSet.remove(sid) }
+            }
+            runningSince = t
+
+            // Counters
+            if sessionCreated {
+                for i in 0..<4 where t >= windowStarts[i] && t <= now {
+                    ws[i].sessionsCreated += 1
+                }
+            }
+            if stepInc > 0 {
+                for i in 0..<4 where t >= windowStarts[i] && t <= now {
+                    ws[i].stepsCount += stepInc
+                }
+            }
+        }
+
+        // Tail: from last event up to now
+        if let since = runningSince {
+            addConcurrency(level: runningSet.count, from: since, to: now)
+        }
+        for (sid, state) in sessionState {
+            if let since = sessionSince[sid] {
+                addStateTime(state, sid: sid, from: since, to: now)
+            }
+        }
+
+        return StatsBundle(daily: ws[0], weekly: ws[1], monthly: ws[2], allTime: ws[3])
     }
 }
 
@@ -137,9 +372,7 @@ final class PushNotifier: ObservableObject {
                     "title": title,
                     "message": message,
                     "category": category,
-                    // The Pager API only accepts: system, email-agent, cron, manual.
-                    // We claim "system" since this fires automatically.
-                    "source": "system"
+                    "source": "agent-monitor"
                 ]
             ]
         ]
@@ -583,6 +816,8 @@ final class LiveStatusGenerator {
 @MainActor
 final class AgentStore: ObservableObject {
     @Published var agents: [Agent] = []
+    @Published var stats: StatsBundle = .empty
+    @Published var statsOverlayOpen: Bool = false
     @Published var fileURL: URL
     @Published var soundEnabled: Bool = true
     @Published var titleGenerationEnabled: Bool = true
@@ -633,12 +868,15 @@ final class AgentStore: ObservableObject {
         }
 
         var byId: [String: Agent] = [:]
+        var allEvents: [AgentEvent] = []
         let decoder = JSONDecoder()
         for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
             guard let lineData = line.data(using: .utf8),
                   let rec = try? decoder.decode(AgentEvent.self, from: lineData) else { continue }
+            allEvents.append(rec)
             apply(rec, into: &byId)
         }
+        stats = StatsCompute.compute(events: allEvents, now: Date())
 
         let sorted = byId.values.sorted { a, b in
             if statusRank(a.status) != statusRank(b.status) {
@@ -648,7 +886,14 @@ final class AgentStore: ObservableObject {
         }
         let newAgents = enrichWithTranscripts(assignSiblingIndices(sorted))
 
-        let withStaleness = applyTranscriptStaleness(newAgents)
+        let (withStaleness, syntheticEvents) = applyTranscriptStaleness(newAgents)
+        // Persist synthetic transitions to agents.jsonl so the event log captures
+        // every state change (used for stats). The file watcher will fire a
+        // redundant reload, which is idempotent (apply() will then process these
+        // same events as part of the regular pass).
+        for ev in syntheticEvents {
+            appendEvent(ev)
+        }
 
         // Sound check must run AFTER staleness, otherwise the pre-staleness status
         // (from raw apply) compared against the post-staleness previousStatuses
@@ -677,11 +922,25 @@ final class AgentStore: ObservableObject {
     /// - .needsAttention → .running when transcript activity resumes (permission
     ///   granted; Claude continues silently with no hook event)
     /// Never auto-transitions to .stopped — that requires a real Stop event.
-    private func applyTranscriptStaleness(_ agents: [Agent]) -> [Agent] {
+    /// Detects state transitions that don't have hook-fired events, mutates
+    /// the agent list to reflect them, AND emits synthetic events back into
+    /// agents.jsonl so the event log captures the full state timeline (needed
+    /// for accurate stats).
+    /// Returns (post-transition agents, list of synthetic events to append).
+    private func applyTranscriptStaleness(_ agents: [Agent]) -> ([Agent], [AgentEvent]) {
         let now = Date()
-        return agents.map { a in
+        let nowTs = Self.iso8601.string(from: now)
+        var newAgents: [Agent] = []
+        var newEvents: [AgentEvent] = []
+
+        func makeEvent(_ kind: AgentEventKind, sessionId: String) -> AgentEvent {
+            AgentEvent(event: kind, sessionId: sessionId,
+                       cwd: nil, ts: nowTs, message: nil, transcriptPath: nil)
+        }
+
+        for a in agents {
             // .idle → .inactive after 5min of NO activity (events OR transcript writes).
-            // Doesn't require a transcript file (covers freshly-opened sessions too).
+            // Doesn't require a transcript file — covers freshly-opened sessions too.
             if a.status == .idle {
                 let lastUpdateDate = Self.iso8601.date(from: a.lastUpdate)
                 var lastActivity = lastUpdateDate ?? .distantPast
@@ -691,42 +950,71 @@ final class AgentStore: ObservableObject {
                     }
                 }
                 if now.timeIntervalSince(lastActivity) > Self.inactiveThresholdSec {
-                    var copy = a
-                    copy.status = .inactive
-                    return copy
+                    var copy = a; copy.status = .inactive
+                    newAgents.append(copy)
+                    newEvents.append(makeEvent(.inactiveStart, sessionId: a.id))
+                    continue
                 }
-                return a
+                newAgents.append(a)
+                continue
             }
 
-            guard let path = a.transcriptPath, !path.isEmpty else { return a }
+            guard let path = a.transcriptPath, !path.isEmpty else {
+                newAgents.append(a); continue
+            }
             let info = transcriptReader.read(path: path)
-            guard let mtime = info.lastModified else { return a }
+            guard let mtime = info.lastModified else {
+                newAgents.append(a); continue
+            }
 
             switch a.status {
             case .running:
                 let lastActivity = max(mtime, a.runStartedAt ?? mtime)
-                let idleSec = now.timeIntervalSince(lastActivity)
-                guard idleSec > Self.awayThresholdSec else { return a }
-                var copy = a
-                copy.status = .away
-                return copy
+                if now.timeIntervalSince(lastActivity) > Self.awayThresholdSec {
+                    var copy = a; copy.status = .away
+                    newAgents.append(copy)
+                    newEvents.append(makeEvent(.awayStart, sessionId: a.id))
+                } else {
+                    newAgents.append(a)
+                }
+
+            case .away:
+                // .away → .running when transcript gets fresh writes after the away_start.
+                guard let lastUpdateDate = Self.iso8601.date(from: a.lastUpdate) else {
+                    newAgents.append(a); continue
+                }
+                if mtime > lastUpdateDate.addingTimeInterval(1.0) {
+                    var copy = a
+                    copy.status = .running
+                    copy.runStartedAt = mtime
+                    newAgents.append(copy)
+                    newEvents.append(makeEvent(.awayEnd, sessionId: a.id))
+                } else {
+                    newAgents.append(a)
+                }
 
             case .needsAttention:
-                // After the needs_attention event, if the transcript gets a write
-                // that's clearly newer than the event itself (>1s buffer for clock
-                // races between hook fire and tool_use being flushed), Claude has
-                // resumed. Stay .running until a real Stop event arrives.
-                guard let lastUpdateDate = Self.iso8601.date(from: a.lastUpdate) else { return a }
-                guard mtime > lastUpdateDate.addingTimeInterval(1.0) else { return a }
-                var copy = a
-                copy.status = .running
-                copy.runStartedAt = mtime
-                return copy
+                // .needsAttention → .running when Claude resumes silently after
+                // permission grant (no hook fires; we detect via transcript mtime).
+                guard let lastUpdateDate = Self.iso8601.date(from: a.lastUpdate) else {
+                    newAgents.append(a); continue
+                }
+                if mtime > lastUpdateDate.addingTimeInterval(1.0) {
+                    var copy = a
+                    copy.status = .running
+                    copy.runStartedAt = mtime
+                    newAgents.append(copy)
+                    newEvents.append(makeEvent(.needsAttentionEnd, sessionId: a.id))
+                } else {
+                    newAgents.append(a)
+                }
 
             default:
-                return a
+                newAgents.append(a)
             }
         }
+
+        return (newAgents, newEvents)
     }
 
     private func ensureStaleCheckTimer() {
@@ -756,13 +1044,19 @@ final class AgentStore: ObservableObject {
 
     func dismiss(_ sessionId: String) {
         let ts = ISO8601DateFormatter().string(from: Date())
-        let event = AgentEvent(event: .cleared, sessionId: sessionId, cwd: nil, ts: ts, message: nil, transcriptPath: nil)
+        appendEvent(AgentEvent(
+            event: .cleared, sessionId: sessionId,
+            cwd: nil, ts: ts, message: nil, transcriptPath: nil
+        ))
+    }
+
+    private func appendEvent(_ event: AgentEvent) {
         guard let data = try? JSONEncoder().encode(event),
               let line = String(data: data, encoding: .utf8) else { return }
         let toAppend = (line + "\n").data(using: .utf8) ?? Data()
         if let handle = try? FileHandle(forWritingTo: fileURL) {
             defer { try? handle.close() }
-            try? handle.seekToEnd()
+            _ = try? handle.seekToEnd()
             try? handle.write(contentsOf: toAppend)
         }
     }
@@ -787,7 +1081,7 @@ final class AgentStore: ObservableObject {
             // Skip nil → idle (new session) and inactive → idle (we don't currently re-enter idle from inactive).
             guard old == .running || old == .away || old == .needsAttention else { return }
             pushNotifier.send(
-                title: "✅ \(project) finished",
+                title: "🔵 \(project) idle",
                 message: detail.isEmpty ? "Turn complete" : detail,
                 category: "info"
             )
@@ -909,6 +1203,50 @@ final class AgentStore: ObservableObject {
             }
         case .cleared:
             byId.removeValue(forKey: rec.sessionId)
+
+        case .awayStart:
+            // Synthetic: applyTranscriptStaleness flipped .running → .away.
+            // Freeze the running timer at this point.
+            if var a = byId[rec.sessionId] {
+                if a.status == .running, let started = a.runStartedAt {
+                    a.accumulatedSeconds += max(0, recDate.timeIntervalSince(started))
+                    a.runStartedAt = nil
+                }
+                a.status = .away
+                a.lastUpdate = rec.ts
+                byId[rec.sessionId] = a
+            }
+
+        case .awayEnd:
+            // Synthetic: applyTranscriptStaleness flipped .away → .running.
+            if var a = byId[rec.sessionId] {
+                if a.status == .away {
+                    a.runStartedAt = recDate
+                }
+                a.status = .running
+                a.lastUpdate = rec.ts
+                byId[rec.sessionId] = a
+            }
+
+        case .needsAttentionEnd:
+            // Synthetic: applyTranscriptStaleness flipped .needsAttention → .running
+            // (permission granted, transcript writes resumed; no hook fires for this).
+            if var a = byId[rec.sessionId] {
+                if a.status == .needsAttention {
+                    a.runStartedAt = recDate
+                }
+                a.status = .running
+                a.lastUpdate = rec.ts
+                byId[rec.sessionId] = a
+            }
+
+        case .inactiveStart:
+            // Synthetic: applyTranscriptStaleness flipped .idle → .inactive.
+            if var a = byId[rec.sessionId] {
+                a.status = .inactive
+                a.lastUpdate = rec.ts
+                byId[rec.sessionId] = a
+            }
         }
     }
 
@@ -1004,31 +1342,39 @@ struct ContentView: View {
     @EnvironmentObject var store: AgentStore
 
     var body: some View {
-        VStack(spacing: 0) {
-            header
-            Divider()
-            if store.agents.isEmpty {
-                emptyState
-            } else {
-                HStack(spacing: 0) {
-                    column(
-                        title: "Idle / Attention",
-                        agents: store.agents.filter {
-                            $0.status != .running && $0.status != .away
-                        }
-                    )
-                    Divider()
-                    column(
-                        title: "Running",
-                        agents: store.agents.filter {
-                            $0.status == .running || $0.status == .away
-                        }
-                    )
+        ZStack {
+            VStack(spacing: 0) {
+                header
+                Divider()
+                if store.agents.isEmpty {
+                    emptyState
+                } else {
+                    HStack(spacing: 0) {
+                        column(
+                            title: "Idle / Attention",
+                            agents: store.agents.filter {
+                                $0.status != .running && $0.status != .away
+                            }
+                        )
+                        Divider()
+                        column(
+                            title: "Running",
+                            agents: store.agents.filter {
+                                $0.status == .running || $0.status == .away
+                            }
+                        )
+                    }
                 }
+                footer
             }
-            footer
+            if store.statsOverlayOpen {
+                StatsView()
+                    .background(.regularMaterial)
+                    .transition(.opacity)
+            }
         }
         .frame(minWidth: 520, minHeight: 260)
+        .animation(.easeInOut(duration: 0.18), value: store.statsOverlayOpen)
     }
 
     private func column(title: String, agents: [Agent]) -> some View {
@@ -1084,6 +1430,15 @@ struct ContentView: View {
                 .padding(.horizontal, 6)
                 .padding(.vertical, 2)
                 .background(Capsule().fill(.secondary.opacity(0.15)))
+            Button {
+                store.statsOverlayOpen.toggle()
+            } label: {
+                Image(systemName: "chart.bar.xaxis")
+                    .foregroundStyle(store.statsOverlayOpen ? Color.accentColor : Color.secondary)
+            }
+            .buttonStyle(.borderless)
+            .help(store.statsOverlayOpen ? "Close stats" : "Open stats")
+
             Button {
                 store.titleGenerationEnabled.toggle()
             } label: {
@@ -1331,6 +1686,225 @@ struct AgentRow: View {
             return out.string(from: d)
         }
         return ts
+    }
+}
+
+// MARK: - Stats overlay
+
+/// Evenly-spaced dot leader filling whatever horizontal space it's given.
+/// Replaces the Text("..." × N) hack which produced uneven trailing clusters.
+struct DotLeader: View {
+    var spacing: CGFloat = 4
+    var dotSize: CGFloat = 2
+
+    var body: some View {
+        Canvas { ctx, size in
+            let count = max(0, Int(size.width / spacing))
+            let y = size.height / 2
+            for i in 0..<count {
+                let x = CGFloat(i) * spacing + spacing / 2
+                let rect = CGRect(x: x - dotSize / 2, y: y - dotSize / 2,
+                                  width: dotSize, height: dotSize)
+                ctx.fill(Path(ellipseIn: rect), with: .color(.secondary.opacity(0.4)))
+            }
+        }
+        .frame(height: 6)
+    }
+}
+
+struct StatsView: View {
+    @EnvironmentObject var store: AgentStore
+    @State private var selected: StatsWindow = .daily
+
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+            Divider()
+            Picker("", selection: $selected) {
+                ForEach(StatsWindow.allCases) { w in
+                    Text(w.label).tag(w)
+                }
+            }
+            .pickerStyle(.segmented)
+            .padding(8)
+            Divider()
+            ScrollView {
+                let s = store.stats.get(selected)
+                VStack(spacing: 0) {
+                    HStack(alignment: .top, spacing: 0) {
+                        VStack(spacing: 0) {
+                            section("Activity", rows: [
+                                ("Sessions created", "\(s.sessionsCreated)"),
+                                ("Steps (turns)",    "\(s.stepsCount)"),
+                            ])
+                            section("Time totals", rows: [
+                                ("Running",         formatDuration(s.totalRunningSec)),
+                                ("Away",            formatDuration(s.totalAwaySec)),
+                                ("Needs attention", formatDuration(s.totalNeedsAttentionSec)),
+                            ])
+                            topProjectsSection(s)
+                        }
+                        Divider()
+                        VStack(spacing: 0) {
+                            section("Per-step averages", rows: [
+                                ("Running / step",    formatDuration(s.avgRunningPerStep)),
+                                ("Away / step",       formatDuration(s.avgAwayPerStep)),
+                                ("Needs-att / step",  formatDuration(s.avgNeedsAttentionPerStep)),
+                            ])
+                            section("Concurrency (running)", rows: [
+                                ("Max concurrent", "\(s.maxConcurrentRunning)"),
+                                ("Time at ≥1",     formatDuration(s.timeAtConcurrency[1] ?? 0)),
+                                ("Time at ≥2",     formatDuration(s.timeAtConcurrency[2] ?? 0)),
+                                ("Time at ≥3",     formatDuration(s.timeAtConcurrency[3] ?? 0)),
+                                ("Time at ≥4",     formatDuration(s.timeAtConcurrency[4] ?? 0)),
+                                ("Time at ≥5",     formatDuration(s.timeAtConcurrency[5] ?? 0)),
+                            ])
+                        }
+                    }
+                    Divider().padding(.top, 6)
+                    hourHistogram(s)
+                }
+                .padding(.bottom, 8)
+            }
+        }
+    }
+
+    private var header: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "chart.bar.xaxis").foregroundStyle(.tint)
+            Text("Stats").font(.headline)
+            Spacer()
+            Button {
+                store.statsOverlayOpen = false
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundStyle(.tertiary)
+            }
+            .buttonStyle(.borderless)
+            .help("Close stats")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(.ultraThinMaterial)
+    }
+
+    private func section(_ title: String, rows: [(String, String)]) -> some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text(title)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .textCase(.uppercase)
+                Spacer()
+            }
+            .padding(.horizontal, 12)
+            .padding(.top, 10)
+            .padding(.bottom, 4)
+            ForEach(rows, id: \.0) { r in
+                row(r.0, r.1)
+            }
+        }
+    }
+
+    private func row(_ label: String, _ value: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(label)
+                .foregroundStyle(.secondary)
+                .font(.callout)
+                .fixedSize(horizontal: true, vertical: false)
+            DotLeader()
+                .frame(maxWidth: .infinity)
+            Text(value)
+                .font(.callout.monospacedDigit())
+                .fixedSize(horizontal: true, vertical: false)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 4)
+    }
+
+    private func topProjectsSection(_ s: WindowStats) -> some View {
+        let top = s.topProjects
+        return VStack(spacing: 0) {
+            HStack {
+                Text("Top projects (running)")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .textCase(.uppercase)
+                Spacer()
+            }
+            .padding(.horizontal, 12)
+            .padding(.top, 10)
+            .padding(.bottom, 4)
+            if top.isEmpty {
+                HStack {
+                    Text("—").foregroundStyle(.tertiary).font(.callout)
+                    Spacer()
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 4)
+            } else {
+                ForEach(Array(top.enumerated()), id: \.element.cwd) { idx, proj in
+                    let name = (proj.cwd as NSString).lastPathComponent
+                    row("\(idx + 1). \(name)", formatDuration(proj.sec))
+                }
+            }
+        }
+    }
+
+    private func hourHistogram(_ s: WindowStats) -> some View {
+        let buckets = (0..<24).map { s.runningPerHour[$0] ?? 0 }
+        let maxValue = buckets.max() ?? 0
+        return VStack(spacing: 6) {
+            HStack {
+                Text("Running by hour of day")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .textCase(.uppercase)
+                Spacer()
+            }
+            .padding(.horizontal, 12)
+            .padding(.top, 10)
+
+            GeometryReader { geo in
+                HStack(alignment: .bottom, spacing: 1) {
+                    ForEach(0..<24, id: \.self) { h in
+                        let v = buckets[h]
+                        let frac = maxValue > 0 ? CGFloat(v / maxValue) : 0
+                        let height = max(2, frac * geo.size.height)
+                        Rectangle()
+                            .fill(Color.accentColor.opacity(v > 0 ? 0.85 : 0.18))
+                            .frame(height: height)
+                            .frame(maxWidth: .infinity)
+                    }
+                }
+            }
+            .frame(height: 60)
+            .padding(.horizontal, 12)
+
+            HStack {
+                Text("0").font(.caption2).foregroundStyle(.tertiary)
+                Spacer()
+                Text("6").font(.caption2).foregroundStyle(.tertiary)
+                Spacer()
+                Text("12").font(.caption2).foregroundStyle(.tertiary)
+                Spacer()
+                Text("18").font(.caption2).foregroundStyle(.tertiary)
+                Spacer()
+                Text("24").font(.caption2).foregroundStyle(.tertiary)
+            }
+            .padding(.horizontal, 12)
+            .padding(.bottom, 6)
+        }
+    }
+
+    private func formatDuration(_ sec: Double) -> String {
+        let total = max(0, Int(sec.rounded()))
+        let h = total / 3600
+        let m = (total % 3600) / 60
+        let s = total % 60
+        if h > 0 { return String(format: "%dh %02dm", h, m) }
+        if m > 0 { return String(format: "%dm %02ds", m, s) }
+        return "\(s)s"
     }
 }
 
