@@ -1083,7 +1083,7 @@ final class AgentStore: ObservableObject {
             pushNotifier.send(
                 title: "🔵 \(project) idle",
                 message: detail.isEmpty ? "Turn complete" : detail,
-                category: "info"
+                category: "urgent"
             )
         default:
             return
