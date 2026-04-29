@@ -9,14 +9,16 @@ Built in a single Swift file with no external dependencies (no Xcode project, no
 ## What it does
 
 - **Always-on-top floating window** that lists every Claude Code session you have open
-- Live status per session: `idle`, `running`, `away`, `needs attention`, `stopped`
+- Live status per session: `running`, `away`, `needs attention`, `idle`, `inactive`
 - Per-turn runtime timer that ticks while running and freezes on stop
 - AI-generated session titles via a side-car `claude -p` call
 - Live "what's happening right now" subtitle while a session is actively processing
 - Sound alerts when a session needs your attention or finishes
+- **Push notifications to your phone** (optional) via the jsplayground MCP
+- **Stats overlay** with daily / weekly / monthly / all-time tabs: sessions, steps, time totals, per-step averages, concurrency duration, top-3 projects, hour-of-day histogram
 - Two-column layout: things that need you on the left, active sessions on the right
 
-All state lives in `~/.claude/agents.jsonl`. Claude Code hooks append events; the app reads and renders.
+All state lives in `~/.claude/agents.jsonl`. Claude Code hooks append events; the app reads and renders. State transitions that aren't fired by hooks (`.away`, `.inactive`, post-permission resume) are detected by transcript-mtime polling and persisted as synthetic events so the log captures the full timeline.
 
 ---
 
@@ -183,13 +185,15 @@ Run `./build.sh` once. From then on the app sits in your menu/dock and the float
 
 | Status | Color | Column | When | Timer |
 |---|---|---|---|---|
-| `idle` | 🔵 blue | left | `SessionStart` fires; session opened, no prompt yet | not running |
 | `running` | 🟢 green | right | `UserPromptSubmit` fires; Claude actively processing | live ticking |
-| `away` | 🟡 yellow | right | Auto: transcript silent for >60s and run age >60s | keeps ticking, dimmed |
+| `away` | 🟡 yellow | right | Auto: `.running` transcript silent for >60s | keeps ticking, dimmed |
 | `needs attention` | 🟠 orange | left | `Notification` with `notification_type: permission_prompt` | frozen |
-| `stopped` | ⚪ gray | left | `Stop` hook fires (turn done) | frozen at stop time |
+| `idle` | 🔵 blue | left | Recently active — freshly opened OR just finished a turn | frozen |
+| `inactive` | ⚪ gray | left | Auto: `.idle` for >5 min — abandoned | frozen |
 
-**Sort order within columns:** `needsAttention < running < away < stopped < idle` then by recency.
+**Sort order within columns:** `needsAttention < running < away < idle < inactive`, then by recency.
+
+The `Stop` hook now maps to `.idle` (not the old `.stopped`). After 5 min of no activity (events OR transcript writes), it auto-decays to `.inactive`. To go back to `.running`, the user just needs to send another prompt (`UserPromptSubmit` resets the timer).
 
 ### Row layout
 
@@ -382,6 +386,59 @@ A single bash script registered for 5 hooks. Designed to never block or fail Cla
 {"event":"started","session_id":"abc12345","cwd":"/path/to/proj","ts":"2026-04-28T03:42:01Z","message":"user prompt","transcript_path":"/Users/.../session_id.jsonl"}
 ```
 
+### Synthetic events (emitted by the app, not the hook)
+
+To make the event log a complete state-transition timeline, the app writes synthetic events back into `agents.jsonl` whenever it detects a transition that no hook fires for:
+
+| Event | When | Why |
+|---|---|---|
+| `away_start` | `.running` transcript silent for >60s | Captures `.running → .away` transition |
+| `away_end` | `.away` transcript writes resume | Captures `.away → .running` resumption |
+| `needs_attention_end` | `.needsAttention` transcript writes resume (>1s after the event) | Captures post-permission resume (no Claude hook fires for this) |
+| `inactive_start` | `.idle` with no activity for >5 min | Captures abandonment |
+
+These are required for accurate stats — without them, time spent in away/needs-attention vs running can't be cleanly split.
+
+---
+
+## Stats overlay
+
+Click the 📊 chart icon in the header to overlay a stats sheet on top of the agents view. Tabs at top switch between four time windows:
+
+- **Daily** — local midnight today to now (uses `Calendar.current`, so timezone follows macOS)
+- **Weekly** — past 7 days
+- **Monthly** — past 30 days
+- **All time** — since the beginning of `agents.jsonl`
+
+### Metrics
+
+| Section | Metric | Notes |
+|---|---|---|
+| Activity | Sessions created | Count of `idle` (SessionStart) events in window |
+| | Steps (turns) | Count of `started` (UserPromptSubmit) events in window |
+| Time totals | Running | Total seconds in `.running` |
+| | Away | Total seconds in `.away` |
+| | Needs attention | Total seconds in `.needsAttention` (excludes post-permission resume) |
+| Per-step averages | Running / step | Total running / step count |
+| | Away / step | Total away / step count |
+| | Needs-att / step | Total needs-attention / step count |
+| Top projects (running) | Top 3 cwds | Sorted by running time, basename only |
+| Concurrency (running) | Max concurrent | Peak number of sessions in `.running` simultaneously |
+| | Time at ≥1..≥5 | Total seconds with that many or more `.running` sessions |
+| Hour-of-day histogram | 24 buckets | Running time bucketed by local hour-of-day, normalized to max |
+
+### How it computes
+
+A single chronological pass over all events in `agents.jsonl` produces all four windows simultaneously. Per-session state machine tracks transitions; running interval distribution into hour buckets is done at the same time. Live tail handling means in-progress states keep accumulating up to `Date()` — totals grow second-by-second as a session runs.
+
+The 1Hz polling timer that already exists for `.running`/`.away`/`.needsAttention`/`.idle` agents triggers `reload()`, which re-runs the stats compute. So the overlay is always live, no refresh button needed.
+
+**Old-data caveat**: sessions that ran *before* this build don't have synthetic `away_start` / `needs_attention_end` / `inactive_start` events in the log, so:
+- Time between `needs_attention` and `stopped` is fully attributed to needs-attention (under-counts running for permission turns)
+- Quiet stretches during running are attributed to running (over-counts running for long turns)
+
+The two errors partially offset. New sessions going forward have the full event log and produce accurate breakdowns.
+
 ---
 
 ## Smart features and edge cases
@@ -420,10 +477,11 @@ When any agent is `.running`, a 1Hz `Timer` calls `reload()` so the staleness ch
 ```swift
 // AgentStore
 static let awayThresholdSec: TimeInterval = 60      // .running → .away
-static let staleCheckInterval: TimeInterval = 1     // periodic reload while running
+static let inactiveThresholdSec: TimeInterval = 300 // .idle → .inactive (5 min)
+static let staleCheckInterval: TimeInterval = 1     // periodic reload while running/away/needsAttention/idle
 
 // LiveStatusGenerator
-static let minRunSeconds: TimeInterval = 15         // gate live status until run is ≥15s
+static let minRunSeconds: TimeInterval = 5          // gate live status until run is ≥5s
 static let minIntervalSeconds: TimeInterval = 60    // throttle: ≥60s between calls per session
 
 // TranscriptReader
