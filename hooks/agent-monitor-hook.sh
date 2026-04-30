@@ -22,6 +22,8 @@ TRANSCRIPT=$(echo "$INPUT" | jq -r '.transcript_path // ""' 2>/dev/null)
 echo "[$(date +%H:%M:%S)] $HOOK ${SESSION_ID:0:8}" >> "$HOME/.claude/agent-monitor-debug.log" 2>/dev/null
 
 TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+AGENT_TYPE=""
+PARENT_SID=""
 
 case "$HOOK" in
     SessionStart)
@@ -51,6 +53,22 @@ case "$HOOK" in
         EVENT="cleared"
         MSG="session ended"
         ;;
+    SubagentStart|SubagentStop)
+        # Subagent lifecycle hooks fire in the parent session.
+        # We re-key the row by agent_id so the subagent gets its own row,
+        # and stash agent_type + parent_session_id for the app to render.
+        AGENT_ID=$(echo "$INPUT" | jq -r '.agent_id // ""' 2>/dev/null)
+        AGENT_TYPE=$(echo "$INPUT" | jq -r '.agent_type // ""' 2>/dev/null)
+        [ -z "$AGENT_ID" ] && exit 0
+        PARENT_SID="$SESSION_ID"
+        SESSION_ID="$AGENT_ID"
+        if [ "$HOOK" = "SubagentStart" ]; then
+            EVENT="started"
+        else
+            EVENT="stopped"
+        fi
+        MSG=""
+        ;;
     *)
         exit 0
         ;;
@@ -63,7 +81,11 @@ jq -nc \
     --arg ts "$TS" \
     --arg message "$MSG" \
     --arg transcript "$TRANSCRIPT" \
-    '{event: $event, session_id: $session_id, cwd: $cwd, ts: $ts, message: $message, transcript_path: $transcript}' \
+    --arg agent_type "$AGENT_TYPE" \
+    --arg parent_sid "$PARENT_SID" \
+    '{event: $event, session_id: $session_id, cwd: $cwd, ts: $ts, message: $message, transcript_path: $transcript}
+     + (if $agent_type != "" then {agent_type: $agent_type} else {} end)
+     + (if $parent_sid  != "" then {parent_session_id: $parent_sid} else {} end)' \
     >> "$OUT" 2>/dev/null
 
 exit 0

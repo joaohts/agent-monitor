@@ -26,6 +26,11 @@ struct AgentEvent: Codable {
     let ts: String
     let message: String?
     let transcriptPath: String?
+    // Set on SubagentStart / SubagentStop events. agentType is the subagent's
+    // declared type ("Explore", "code-reviewer", …); parentSessionId is the
+    // top-level session that spawned it.
+    var agentType: String? = nil
+    var parentSessionId: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case event
@@ -34,6 +39,8 @@ struct AgentEvent: Codable {
         case ts
         case message
         case transcriptPath = "transcript_path"
+        case agentType = "agent_type"
+        case parentSessionId = "parent_session_id"
     }
 }
 
@@ -61,6 +68,11 @@ struct Agent: Identifiable {
     var liveStatus: String?
     var model: String?
     var siblingIndex: Int? = nil
+    // For subagents (sessions spawned via the Agent tool). agentType is what
+    // the row is named after; parentSessionId is used to group it under its
+    // parent in the list. Both nil for top-level sessions.
+    var agentType: String? = nil
+    var parentSessionId: String? = nil
     // Runtime tracking: ticks while .running, frozen when .needsAttention or .stopped
     var accumulatedSeconds: Double = 0
     var runStartedAt: Date? = nil
@@ -243,13 +255,17 @@ enum StatsCompute {
             let newState: AgentStatus?
             var stepInc = 0
             var sessionCreated = false
+            // Subagent rows count toward time totals + project attribution
+            // (their cwd matches the parent's), but should not inflate the
+            // top-level "sessions created" / "steps" counters.
+            let isSubagent = ev.agentType != nil
             switch ev.event {
             case .idle:
                 newState = .idle
-                if oldState == nil { sessionCreated = true }
+                if oldState == nil && !isSubagent { sessionCreated = true }
             case .started:
                 newState = .running
-                stepInc = 1
+                if !isSubagent { stepInc = 1 }
             case .needsAttention:    newState = .needsAttention
             case .stopped:           newState = .idle
             case .cleared:           newState = nil
@@ -884,7 +900,8 @@ final class AgentStore: ObservableObject {
             }
             return a.lastUpdate > b.lastUpdate
         }
-        let newAgents = enrichWithTranscripts(assignSiblingIndices(sorted))
+        let grouped = groupSubagentsUnderParents(sorted)
+        let newAgents = enrichWithTranscripts(assignSiblingIndices(grouped))
 
         let (withStaleness, syntheticEvents) = applyTranscriptStaleness(newAgents)
         // Persist synthetic transitions to agents.jsonl so the event log captures
@@ -1066,6 +1083,8 @@ final class AgentStore: ObservableObject {
     }
 
     private func handlePushOnTransition(agent: Agent, from old: AgentStatus?, to new: AgentStatus) {
+        // Don't fire pushes for subagent lifecycle — too noisy.
+        if agent.agentType != nil { return }
         let project = projectName(for: agent)
         let detail = agent.generatedTitle ?? agent.initialTask ?? agent.lastMessage ?? ""
         switch new {
@@ -1159,12 +1178,16 @@ final class AgentStore: ObservableObject {
                 a.lastMessage = rec.message ?? a.lastMessage
                 if let cwd = rec.cwd { a.cwd = cwd }
                 if let tp = rec.transcriptPath, !tp.isEmpty { a.transcriptPath = tp }
+                if a.agentType == nil { a.agentType = rec.agentType }
+                if a.parentSessionId == nil { a.parentSessionId = rec.parentSessionId }
                 byId[rec.sessionId] = a
             } else {
                 byId[rec.sessionId] = Agent(
                     id: rec.sessionId, cwd: rec.cwd, status: .running,
                     firstSeen: rec.ts, lastUpdate: rec.ts, lastMessage: rec.message,
                     transcriptPath: rec.transcriptPath,
+                    agentType: rec.agentType,
+                    parentSessionId: rec.parentSessionId,
                     runStartedAt: recDate
                 )
             }
@@ -1288,9 +1311,45 @@ final class AgentStore: ObservableObject {
         }
     }
 
+    /// Reorders the list so each subagent appears immediately after its
+    /// parent (preserving the existing status-then-recency order between
+    /// parents). When parent and subagent end up in different columns
+    /// (e.g. parent .running, subagent .idle after stopping) the column
+    /// filter still order-preserves, so they stay correctly ordered within
+    /// each column.
+    private func groupSubagentsUnderParents(_ agents: [Agent]) -> [Agent] {
+        var byParent: [String: [Agent]] = [:]
+        for a in agents {
+            if let pid = a.parentSessionId {
+                byParent[pid, default: []].append(a)
+            }
+        }
+        var seen: Set<String> = []
+        var result: [Agent] = []
+        for a in agents where a.parentSessionId == nil {
+            result.append(a)
+            seen.insert(a.id)
+            if let kids = byParent[a.id] {
+                for kid in kids.sorted(by: { $0.firstSeen < $1.firstSeen }) {
+                    result.append(kid)
+                    seen.insert(kid.id)
+                }
+            }
+        }
+        // Orphaned subagents (parent dismissed): tack onto the end so they
+        // don't disappear from the UI.
+        for a in agents where a.parentSessionId != nil && !seen.contains(a.id) {
+            result.append(a)
+        }
+        return result
+    }
+
     private func assignSiblingIndices(_ agents: [Agent]) -> [Agent] {
         var byCwd: [String: [Agent]] = [:]
         for a in agents {
+            // Subagents share their parent's cwd; don't let them bump the
+            // parent's sibling index.
+            if a.parentSessionId != nil { continue }
             guard let cwd = a.cwd, !cwd.isEmpty else { continue }
             byCwd[cwd, default: []].append(a)
         }
@@ -1622,10 +1681,14 @@ struct AgentRow: View {
         } else {
             base = String(agent.id.prefix(8))
         }
+        var name = base
         if let idx = agent.siblingIndex {
-            return "\(base) #\(idx)"
+            name = "\(base) #\(idx)"
         }
-        return base
+        if let type = agent.agentType, !type.isEmpty {
+            return "\(name) ↳ \(type)"
+        }
+        return name
     }
 
     private var modelLabel: String {
