@@ -852,6 +852,7 @@ final class AgentStore: ObservableObject {
     // tuned to avoid false positives during thinking and tool waits.
     static let awayThresholdSec: TimeInterval = 60      // .running silent for 60s → .away
     static let inactiveThresholdSec: TimeInterval = 300 // .idle inactive for 5min → .inactive
+    static let subagentClearAfterStoppedSec: TimeInterval = 300 // subagents: auto-clear 5min after SubagentStop (skip .idle)
     static let staleCheckInterval: TimeInterval = 1
 
     init() {
@@ -956,6 +957,20 @@ final class AgentStore: ObservableObject {
         }
 
         for a in agents {
+            // Subagents go to .inactive immediately on stop (apply()), then
+            // auto-clear 5min later. Top-level sessions stay sticky and require
+            // manual dismissal. lastUpdate is the SubagentStop timestamp, so the
+            // 5min countdown starts from when it actually finished.
+            if a.status == .inactive, a.agentType != nil {
+                let lastUpdateDate = Self.iso8601.date(from: a.lastUpdate) ?? .distantPast
+                if now.timeIntervalSince(lastUpdateDate) > Self.subagentClearAfterStoppedSec {
+                    newEvents.append(makeEvent(.cleared, sessionId: a.id))
+                    continue  // drop from list; .cleared will remove from byId on next reload
+                }
+                newAgents.append(a)
+                continue
+            }
+
             // .idle → .inactive after 5min of NO activity (events OR transcript writes).
             // Doesn't require a transcript file — covers freshly-opened sessions too.
             if a.status == .idle {
@@ -1042,7 +1057,9 @@ final class AgentStore: ObservableObject {
         //  .idle           → check for inactivity (→ .inactive after 5min)
         let needsTimer = agents.contains {
             $0.status == .running || $0.status == .away ||
-            $0.status == .needsAttention || $0.status == .idle
+            $0.status == .needsAttention || $0.status == .idle ||
+            // Inactive subagents have a 5-min auto-clear timer; keep polling.
+            ($0.status == .inactive && $0.agentType != nil)
         }
         if needsTimer && staleCheckTimer == nil {
             staleCheckTimer = Timer.scheduledTimer(
@@ -1211,14 +1228,16 @@ final class AgentStore: ObservableObject {
                 )
             }
         case .stopped:
-            // The Stop hook → .idle (recently finished, still recent).
-            // Auto-transitions to .inactive after 5min via applyTranscriptStaleness.
+            // The Stop hook → .idle for top-level sessions (recently finished,
+            // still recent — auto-decays to .inactive after 5min).
+            // For subagents → .inactive immediately, then auto-clears 5min later
+            // (no point lingering in idle since they're ephemeral).
             if var a = byId[rec.sessionId] {
                 if a.status == .running, let started = a.runStartedAt {
                     a.accumulatedSeconds += max(0, recDate.timeIntervalSince(started))
                     a.runStartedAt = nil
                 }
-                a.status = .idle
+                a.status = (a.agentType != nil) ? .inactive : .idle
                 a.lastUpdate = rec.ts
                 a.lastMessage = rec.message ?? a.lastMessage
                 if let tp = rec.transcriptPath, !tp.isEmpty { a.transcriptPath = tp }
