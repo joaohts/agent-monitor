@@ -76,7 +76,10 @@ def add_hook(name):
 | add_hook("SessionStart")
 | add_hook("UserPromptSubmit")
 | add_hook("Notification")
+| add_hook("PermissionRequest")
+| add_hook("Elicitation")
 | add_hook("Stop")
+| add_hook("StopFailure")
 | add_hook("SessionEnd")
 | add_hook("SubagentStart")
 | add_hook("SubagentStop")
@@ -84,7 +87,7 @@ def add_hook(name):
 
 if jq -e . "$TMP" >/dev/null 2>&1; then
     mv "$TMP" "$SETTINGS"
-    echo "    ✓ registered: SessionStart, UserPromptSubmit, Notification, Stop, SessionEnd, SubagentStart, SubagentStop"
+    echo "    ✓ registered: SessionStart, UserPromptSubmit, Notification, PermissionRequest, Elicitation, Stop, StopFailure, SessionEnd, SubagentStart, SubagentStop"
 else
     echo "    ✗ jq produced invalid JSON; settings.json untouched"
     rm -f "$TMP"

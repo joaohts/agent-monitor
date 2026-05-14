@@ -80,7 +80,10 @@ else
         filter_event("SessionStart")
         | filter_event("UserPromptSubmit")
         | filter_event("Notification")
+        | filter_event("PermissionRequest")
+        | filter_event("Elicitation")
         | filter_event("Stop")
+        | filter_event("StopFailure")
         | filter_event("SessionEnd")
         | filter_event("SubagentStart")
         | filter_event("SubagentStop")
@@ -89,7 +92,7 @@ else
 
         if jq -e . "$TMP" >/dev/null 2>&1; then
             mv "$TMP" "$SETTINGS"
-            echo "    ✓ unregistered: SessionStart, UserPromptSubmit, Notification, Stop, SessionEnd, SubagentStart, SubagentStop"
+            echo "    ✓ unregistered: SessionStart, UserPromptSubmit, Notification, PermissionRequest, Elicitation, Stop, StopFailure, SessionEnd, SubagentStart, SubagentStop"
             echo "    (other tools' hooks preserved)"
         else
             echo "    ✗ jq produced invalid JSON; settings.json untouched"

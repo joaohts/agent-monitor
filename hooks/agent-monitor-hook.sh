@@ -35,19 +35,41 @@ case "$HOOK" in
         MSG="user prompt"
         ;;
     Notification)
-        # Claude Code sends two flavors of Notification:
-        #   permission_prompt → real attention needed
+        # Claude Code sends several Notification flavors via notification_type:
+        #   permission_prompt → real attention needed (legacy path; now also covered
+        #                       by the dedicated PermissionRequest hook below)
         #   idle_prompt       → 60s "waiting for your input" nudge; ignore
+        #   auth_success / elicitation_*, etc → ignore
+        # Treat only permission_prompt as needs_attention; everything else skip.
         NTYPE=$(echo "$INPUT" | jq -r '.notification_type // ""' 2>/dev/null)
-        if [ "$NTYPE" = "idle_prompt" ]; then
+        if [ "$NTYPE" != "permission_prompt" ]; then
             exit 0
         fi
         EVENT="needs_attention"
         MSG=$(echo "$INPUT" | jq -r '.message // "needs attention"' 2>/dev/null)
         ;;
+    PermissionRequest)
+        # Fires when Claude Code shows a permission dialog. This is the modern
+        # path for permission asks; older versions used Notification with
+        # notification_type=permission_prompt.
+        EVENT="needs_attention"
+        MSG=$(echo "$INPUT" | jq -r '.message // "permission required"' 2>/dev/null)
+        ;;
     Stop)
         EVENT="stopped"
         MSG="turn complete"
+        ;;
+    StopFailure)
+        # Turn ended due to an API error. Without this, the session would sit
+        # in .running until transcript-mtime polling flips it to .away.
+        EVENT="stopped"
+        MSG=$(echo "$INPUT" | jq -r '.error // "turn errored"' 2>/dev/null)
+        ;;
+    Elicitation)
+        # MCP server is asking the user for input — same flavor of "blocked
+        # waiting on you" as a permission prompt.
+        EVENT="needs_attention"
+        MSG=$(echo "$INPUT" | jq -r '.message // "MCP server needs input"' 2>/dev/null)
         ;;
     SessionEnd)
         EVENT="cleared"
