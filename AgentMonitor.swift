@@ -161,6 +161,15 @@ enum StatsCompute {
         let windowStarts: [Date] = [dailyStart, weeklyStart, monthlyStart, allTimeStart]
         var ws: [WindowStats] = [WindowStats(), WindowStats(), WindowStats(), WindowStats()]
 
+        // Cap on how long a single uninterrupted state interval may contribute.
+        // A session that sits in one state for longer than this with NO event was
+        // almost certainly abandoned (machine asleep, or its terminating Stop/
+        // SessionEnd hook was lost) rather than genuinely active for that whole
+        // span — counting the raw gap would attribute days of phantom running/away
+        // time. Real turns are bounded by events and never approach this; only
+        // dead sessions do. Clipping keeps the damage to at most this much.
+        let maxIntervalSec: TimeInterval = 2 * 3600
+
         // Per-session current state, when it entered that state, and last-seen cwd
         var sessionState: [String: AgentStatus] = [:]
         var sessionSince: [String: Date] = [:]
@@ -189,9 +198,10 @@ enum StatsCompute {
 
         // Accumulate the time `state` was entered from `from` to `to` into each window.
         func addStateTime(_ state: AgentStatus, sid: String, from: Date, to: Date) {
+            let cappedTo = min(to, from.addingTimeInterval(maxIntervalSec))
             for i in 0..<4 {
                 let lo = max(from, windowStarts[i])
-                let hi = min(to, now)
+                let hi = min(cappedTo, now)
                 guard lo < hi else { continue }
                 let dur = hi.timeIntervalSince(lo)
                 switch state {
@@ -211,9 +221,10 @@ enum StatsCompute {
         // Accumulate concurrency time AND update max in each window over [from, to].
         func addConcurrency(level: Int, from: Date, to: Date) {
             guard from < to else { return }
+            let cappedTo = min(to, from.addingTimeInterval(maxIntervalSec))
             for i in 0..<4 {
                 let lo = max(from, windowStarts[i])
-                let hi = min(to, now)
+                let hi = min(cappedTo, now)
                 guard lo < hi else { continue }
                 let dur = hi.timeIntervalSince(lo)
                 if level > 0 {
@@ -269,10 +280,15 @@ enum StatsCompute {
             case .needsAttention:    newState = .needsAttention
             case .stopped:           newState = .idle
             case .cleared:           newState = nil
-            case .awayStart:         newState = .away
-            case .awayEnd:           newState = .running
-            case .needsAttentionEnd: newState = .running
-            case .inactiveStart:     newState = .inactive
+            // Synthetic continuation events only make sense as transitions OF an
+            // already-tracked session. If the session isn't currently tracked
+            // (e.g. a stray away_end logged 1s after a SessionEnd cleared the row),
+            // they must NOT create a fresh session — that resurrects a dead row
+            // into a state that never terminates and accrues phantom time forever.
+            case .awayStart:         newState = (oldState == nil) ? nil : .away
+            case .awayEnd:           newState = (oldState == nil) ? nil : .running
+            case .needsAttentionEnd: newState = (oldState == nil) ? nil : .running
+            case .inactiveStart:     newState = (oldState == nil) ? nil : .inactive
             }
             if let new = newState {
                 sessionState[sid] = new
