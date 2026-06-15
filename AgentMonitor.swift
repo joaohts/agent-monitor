@@ -2,6 +2,19 @@ import SwiftUI
 import AppKit
 import Combine
 
+// MARK: - Shared ISO8601 formatter
+
+/// ISO8601DateFormatter is costly to allocate, so we share one instance rather
+/// than building a fresh formatter per log line / stats pass / event timestamp.
+/// Apple's ISO8601DateFormatter is thread-safe for both parsing and formatting.
+enum ISO8601 {
+    static let formatter: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        return f
+    }()
+}
+
 // MARK: - Event log format
 
 enum AgentEventKind: String, Codable {
@@ -150,8 +163,7 @@ enum StatsCompute {
     /// windows simultaneously. State machine per session; concurrency timeline
     /// computed via a global "currently running set" + interval accumulation.
     static func compute(events: [AgentEvent], now: Date = Date()) -> StatsBundle {
-        let isoFmt = ISO8601DateFormatter()
-        isoFmt.formatOptions = [.withInternetDateTime]
+        let isoFmt = ISO8601.formatter
 
         let dailyStart   = Calendar.current.startOfDay(for: now)
         let weeklyStart  = now.addingTimeInterval(-7 * 86400)
@@ -436,7 +448,7 @@ final class PushNotifier: ObservableObject {
     }
 
     nonisolated static func debugLog(_ msg: String) {
-        let line = "[\(ISO8601DateFormatter().string(from: Date()))] \(msg)\n"
+        let line = "[\(ISO8601.formatter.string(from: Date()))] \(msg)\n"
         let path = NSHomeDirectory() + "/.claude/agent-monitor-debug.log"
         if let data = line.data(using: .utf8) {
             if let h = FileHandle(forWritingAtPath: path) {
@@ -507,7 +519,7 @@ enum ClaudeP {
     }
 
     nonisolated private static func log(_ msg: String) {
-        let line = "[\(ISO8601DateFormatter().string(from: Date()))] claude-p: \(msg)\n"
+        let line = "[\(ISO8601.formatter.string(from: Date()))] claude-p: \(msg)\n"
         let path = NSHomeDirectory() + "/.claude/agent-monitor-debug.log"
         if let data = line.data(using: .utf8) {
             if let h = FileHandle(forWritingAtPath: path) {
@@ -1159,7 +1171,7 @@ final class AgentStore: ObservableObject {
     }
 
     func dismiss(_ sessionId: String) {
-        let ts = ISO8601DateFormatter().string(from: Date())
+        let ts = ISO8601.formatter.string(from: Date())
         appendEvent(AgentEvent(
             event: .cleared, sessionId: sessionId,
             cwd: nil, ts: ts, message: nil, transcriptPath: nil
@@ -1247,11 +1259,7 @@ final class AgentStore: ObservableObject {
         }
     }
 
-    private static let iso8601: ISO8601DateFormatter = {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime]
-        return f
-    }()
+    private static let iso8601 = ISO8601.formatter
 
     private func apply(_ rec: AgentEvent, into byId: inout [String: Agent]) {
         let recDate = Self.iso8601.date(from: rec.ts) ?? Date()
@@ -1839,17 +1847,6 @@ struct AgentRow: View {
         case .idle:           return .blue
         case .inactive:       return .gray
         }
-    }
-
-    private func shortTime(_ ts: String) -> String {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime]
-        if let d = f.date(from: ts) {
-            let out = DateFormatter()
-            out.dateFormat = "HH:mm:ss"
-            return out.string(from: d)
-        }
-        return ts
     }
 }
 
