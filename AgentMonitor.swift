@@ -550,8 +550,25 @@ struct TranscriptInfo {
 
 @MainActor
 final class TranscriptReader {
+    // Per-transcript accumulator. Transcripts are append-only JSONL, so we keep
+    // a byte offset and the running parse state, then fold in ONLY the bytes that
+    // were appended since the last read instead of re-reading the whole file.
+    // This is what keeps realtime polling cheap even for multi-MB transcripts: a
+    // running session is still re-read on every tick (realtime is preserved), but
+    // each re-read touches only the few new lines, not the entire conversation.
+    private struct ParseState {
+        var offset: UInt64 = 0          // bytes consumed up to the last complete line
+        var inode: UInt64 = 0           // file identity; a change means the file was replaced
+        var initialTask: String?
+        var latestSummary: String?
+        var turns: [(role: String, text: String)] = []
+        var userMessageCount: Int = 0   // tracked incrementally; turns may be trimmed
+        var pendingToolUseIds: Set<String> = []
+        var lastModel: String?
+    }
     private struct CacheEntry {
         let mtime: TimeInterval
+        var state: ParseState
         let info: TranscriptInfo
     }
     private var cache: [String: CacheEntry] = [:]
@@ -570,71 +587,119 @@ final class TranscriptReader {
         if let cached = cache[path], cached.mtime == mtime {
             return cached.info
         }
-        let parsed = parse(path: path, lastModified: date)
-        cache[path] = CacheEntry(mtime: mtime, info: parsed)
-        return parsed
+        // Carry the accumulator forward from the previous read (if any).
+        var state = cache[path]?.state ?? ParseState()
+        // Detect that the file is no longer the append-only continuation we last
+        // saw, so the saved offset is meaningless and we must re-read from the top:
+        //   - inode changed → the path points at a different file (restarted session)
+        //   - size < offset → it was truncated/rewritten shorter than we consumed
+        let inode = (attrs[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0
+        let size  = (attrs[.size] as? NSNumber)?.uint64Value ?? 0
+        if state.offset > 0 && (inode != state.inode || size < state.offset) {
+            state = ParseState()
+        }
+        state.inode = inode
+
+        // If the file couldn't be read this tick (a delete racing the stat above,
+        // or a transient IO error), keep the previous result and retry next tick
+        // rather than caching an empty snapshot under the new mtime.
+        guard ingestNewBytes(path: path, into: &state) else {
+            return cache[path]?.info ?? Self.empty
+        }
+
+        let info = buildInfo(from: state, lastModified: date)
+        cache[path] = CacheEntry(mtime: mtime, state: state, info: info)
+        return info
     }
 
-    private func parse(path: String, lastModified: Date) -> TranscriptInfo {
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
-              let text = String(data: data, encoding: .utf8) else {
-            return Self.empty
+    /// Reads the bytes appended past `state.offset` and folds the new complete
+    /// lines into `state`. A trailing partial line (a write caught mid-flush) is
+    /// left unconsumed so it's re-read whole on the next tick. Returns false only
+    /// if the file could not be read at all, so the caller keeps the prior result.
+    private func ingestNewBytes(path: String, into state: inout ParseState) -> Bool {
+        guard let handle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: path)) else { return false }
+        defer { try? handle.close() }
+        let newData: Data
+        do {
+            try handle.seek(toOffset: state.offset)
+            newData = try handle.readToEnd() ?? Data()
+        } catch {
+            return false
         }
-        var initialTask: String?
-        var latestSummary: String?
-        var turns: [(role: String, text: String)] = []
-        var pendingToolUseIds: Set<String> = []
-        var lastModel: String?
+        guard !newData.isEmpty, let lastNL = newData.lastIndex(of: 0x0A) else { return true }
 
-        for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
-            guard let lineData = line.data(using: .utf8),
-                  let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] else { continue }
-            // Track unmatched tool_use ids regardless of message role
+        let completeCount = newData.distance(from: newData.startIndex, to: lastNL) + 1
+        let completeData = newData.prefix(completeCount)
+        state.offset += UInt64(completeCount)
+
+        for lineData in completeData.split(separator: 0x0A, omittingEmptySubsequences: true) {
+            guard let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] else { continue }
+            ingestLine(obj, into: &state)
+        }
+
+        // Bound memory: the excerpts only ever read the first `headTurns` plus a
+        // recent window, so on a long session retain the head (seed task) and a
+        // generous tail and drop the middle. userMessageCount is tracked
+        // separately, so trimming never affects counts.
+        let cap = Self.headTurns + Self.retainedTailTurns
+        if state.turns.count > cap {
+            state.turns = Array(state.turns.prefix(Self.headTurns) + state.turns.suffix(Self.retainedTailTurns))
+        }
+        return true
+    }
+
+    /// Folds a single decoded transcript line into the running parse state.
+    private func ingestLine(_ obj: [String: Any], into state: inout ParseState) {
+        // Track unmatched tool_use ids regardless of message role
+        if let msg = obj["message"] as? [String: Any],
+           let content = msg["content"] as? [[String: Any]] {
+            for item in content {
+                let typ = item["type"] as? String ?? ""
+                if typ == "tool_use", let id = item["id"] as? String {
+                    state.pendingToolUseIds.insert(id)
+                } else if typ == "tool_result", let id = item["tool_use_id"] as? String {
+                    state.pendingToolUseIds.remove(id)
+                }
+            }
+        }
+        switch obj["type"] as? String ?? "" {
+        case "user":
+            if (obj["isMeta"] as? Bool) == true { break }
+            if let txt = extractText(obj["message"]) {
+                state.turns.append((role: "User", text: txt))
+                state.userMessageCount += 1
+                if state.initialTask == nil { state.initialTask = txt }
+            }
+        case "assistant":
+            if let txt = extractText(obj["message"]) {
+                state.turns.append((role: "Assistant", text: txt))
+            }
             if let msg = obj["message"] as? [String: Any],
-               let content = msg["content"] as? [[String: Any]] {
-                for item in content {
-                    let typ = item["type"] as? String ?? ""
-                    if typ == "tool_use", let id = item["id"] as? String {
-                        pendingToolUseIds.insert(id)
-                    } else if typ == "tool_result", let id = item["tool_use_id"] as? String {
-                        pendingToolUseIds.remove(id)
-                    }
-                }
+               let m = msg["model"] as? String, !m.isEmpty {
+                state.lastModel = m
             }
-            switch obj["type"] as? String ?? "" {
-            case "user":
-                if (obj["isMeta"] as? Bool) == true { break }
-                if let txt = extractText(obj["message"]) {
-                    turns.append((role: "User", text: txt))
-                    if initialTask == nil { initialTask = txt }
-                }
-            case "assistant":
-                if let txt = extractText(obj["message"]) {
-                    turns.append((role: "Assistant", text: txt))
-                }
-                if let msg = obj["message"] as? [String: Any],
-                   let m = msg["model"] as? String, !m.isEmpty {
-                    lastModel = m
-                }
-            case "summary":
-                if let s = obj["summary"] as? String, !s.isEmpty { latestSummary = s }
-            default: break
-            }
+        case "summary":
+            if let s = obj["summary"] as? String, !s.isEmpty { state.latestSummary = s }
+        default: break
         }
+    }
 
-        let userCount = turns.filter { $0.role == "User" }.count
-        let titleExcerpt = buildExcerpt(turns: turns, latestSummary: latestSummary)
-        let liveExcerpt = buildLiveExcerpt(turns: turns, latestSummary: latestSummary)
+    /// Derives the public TranscriptInfo from accumulated state. Cheap: counting
+    /// and excerpt-slicing over already-parsed turns, no JSON work.
+    private func buildInfo(from state: ParseState, lastModified: Date) -> TranscriptInfo {
+        let userCount = state.userMessageCount
+        let titleExcerpt = buildExcerpt(turns: state.turns, latestSummary: state.latestSummary)
+        let liveExcerpt = buildLiveExcerpt(turns: state.turns, latestSummary: state.latestSummary)
 
         return TranscriptInfo(
-            initialTask: initialTask,
-            latestSummary: latestSummary,
+            initialTask: state.initialTask,
+            latestSummary: state.latestSummary,
             userMessageCount: userCount,
             titleExcerpt: titleExcerpt,
             liveExcerpt: liveExcerpt,
             lastModified: lastModified,
-            isToolPending: !pendingToolUseIds.isEmpty,
-            model: lastModel
+            isToolPending: !state.pendingToolUseIds.isEmpty,
+            model: state.lastModel
         )
     }
 
@@ -659,6 +724,7 @@ final class TranscriptReader {
     static let liveUserMessages   = 5     // live status: last N user messages + their assistant turns
     static let perTurnCharCap     = 600   // truncate each turn's text
     static let summaryCharCap     = 1200  // truncate the auto-summary if huge
+    static let retainedTailTurns  = 100   // memory bound: turns kept past the head (covers tail + live windows)
 
     private func buildExcerpt(turns: [(role: String, text: String)], latestSummary: String?) -> String {
         func trim(_ s: String, _ cap: Int) -> String {
