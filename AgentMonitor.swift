@@ -1083,6 +1083,14 @@ final class AgentStore: ObservableObject {
 
             switch a.status {
             case .running:
+                // While a tool is in flight the transcript stays silent
+                // between tool_use and tool_result — that's not idleness, the
+                // session is actively waiting on the tool. Skip the .away flip
+                // entirely until the tool resolves.
+                if info.isToolPending {
+                    newAgents.append(a)
+                    break
+                }
                 let lastActivity = max(mtime, a.runStartedAt ?? mtime)
                 if now.timeIntervalSince(lastActivity) > Self.awayThresholdSec {
                     var copy = a; copy.status = .away
@@ -1093,7 +1101,8 @@ final class AgentStore: ObservableObject {
                 }
 
             case .away:
-                // .away → .running when transcript gets fresh writes after the away_start.
+                // .away → .running when transcript gets fresh writes after the
+                // away_start (a resumed tool_result write IS such a write).
                 guard let lastUpdateDate = Self.iso8601.date(from: a.lastUpdate) else {
                     newAgents.append(a); continue
                 }
@@ -1103,6 +1112,12 @@ final class AgentStore: ObservableObject {
                     copy.runStartedAt = mtime
                     newAgents.append(copy)
                     newEvents.append(makeEvent(.awayEnd, sessionId: a.id))
+                } else if now.timeIntervalSince(lastUpdateDate) > Self.inactiveThresholdSec {
+                    // .away → .inactive after 5min — covers abandoned sessions
+                    // (interrupted, no Stop hook, no further transcript writes).
+                    var copy = a; copy.status = .inactive
+                    newAgents.append(copy)
+                    newEvents.append(makeEvent(.inactiveStart, sessionId: a.id))
                 } else {
                     newAgents.append(a)
                 }
@@ -1343,10 +1358,12 @@ final class AgentStore: ObservableObject {
 
         case .awayEnd:
             // Synthetic: applyTranscriptStaleness flipped .away → .running.
-            if var a = byId[rec.sessionId] {
-                if a.status == .away {
-                    a.runStartedAt = recDate
-                }
+            // Guard against race-emitted stale events: if a real Stop arrived
+            // in the same reload window the status is already .idle/.inactive,
+            // and we must NOT clobber it back to .running (this was the source
+            // of the infinite away_start ↔ away_end loop after turn end).
+            if var a = byId[rec.sessionId], a.status == .away {
+                a.runStartedAt = recDate
                 a.status = .running
                 a.lastUpdate = rec.ts
                 byId[rec.sessionId] = a
@@ -1355,18 +1372,19 @@ final class AgentStore: ObservableObject {
         case .needsAttentionEnd:
             // Synthetic: applyTranscriptStaleness flipped .needsAttention → .running
             // (permission granted, transcript writes resumed; no hook fires for this).
-            if var a = byId[rec.sessionId] {
-                if a.status == .needsAttention {
-                    a.runStartedAt = recDate
-                }
+            // Same race guard as .awayEnd above.
+            if var a = byId[rec.sessionId], a.status == .needsAttention {
+                a.runStartedAt = recDate
                 a.status = .running
                 a.lastUpdate = rec.ts
                 byId[rec.sessionId] = a
             }
 
         case .inactiveStart:
-            // Synthetic: applyTranscriptStaleness flipped .idle → .inactive.
-            if var a = byId[rec.sessionId] {
+            // Synthetic: applyTranscriptStaleness flipped .idle/.away → .inactive.
+            // Guard against stale events: only honor it if the status is still
+            // one of the source states.
+            if var a = byId[rec.sessionId], a.status == .idle || a.status == .away {
                 a.status = .inactive
                 a.lastUpdate = rec.ts
                 byId[rec.sessionId] = a
