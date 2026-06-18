@@ -915,7 +915,13 @@ final class LiveStatusGenerator {
 final class AgentStore: ObservableObject {
     @Published var agents: [Agent] = []
     @Published var stats: StatsBundle = .empty
-    @Published var statsOverlayOpen: Bool = false
+    @Published var statsOverlayOpen: Bool = false {
+        didSet {
+            // Stats are computed only while the overlay is visible (see reload()),
+            // so force one fresh compute the moment it opens.
+            if statsOverlayOpen && !oldValue { reload() }
+        }
+    }
     @Published var fileURL: URL
     @Published var soundEnabled: Bool = true
     @Published var titleGenerationEnabled: Bool = true
@@ -966,16 +972,23 @@ final class AgentStore: ObservableObject {
             return
         }
 
+        // Stats are a full chronological pass over the entire event history — too
+        // expensive to run on every reload (1Hz + every file write). Only build the
+        // event list and recompute while the stats overlay is actually visible; the
+        // didSet on statsOverlayOpen forces a compute the moment it opens.
+        let computeStats = statsOverlayOpen
         var byId: [String: Agent] = [:]
         var allEvents: [AgentEvent] = []
         let decoder = JSONDecoder()
         for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
             guard let lineData = line.data(using: .utf8),
                   let rec = try? decoder.decode(AgentEvent.self, from: lineData) else { continue }
-            allEvents.append(rec)
+            if computeStats { allEvents.append(rec) }
             apply(rec, into: &byId)
         }
-        stats = StatsCompute.compute(events: allEvents, now: Date())
+        if computeStats {
+            stats = StatsCompute.compute(events: allEvents, now: Date())
+        }
 
         let sorted = byId.values.sorted { a, b in
             if statusRank(a.status) != statusRank(b.status) {
