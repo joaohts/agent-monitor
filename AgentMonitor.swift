@@ -929,9 +929,21 @@ final class AgentStore: ObservableObject {
     @Published var stats: StatsBundle = .empty
     @Published var statsOverlayOpen: Bool = false {
         didSet {
-            // Stats are computed only while the overlay is visible (see reload()),
-            // so force one fresh compute the moment it opens.
-            if statsOverlayOpen && !oldValue { reload() }
+            guard statsOverlayOpen != oldValue else { return }
+            // Stats are a full-history pass, so they run only while the overlay is
+            // visible: compute once on open and keep a slow refresh tick alive so
+            // running totals advance; tear it all down on close.
+            if statsOverlayOpen {
+                recomputeStats()
+                statsRefreshTimer = Timer.scheduledTimer(
+                    withTimeInterval: Self.statsRefreshInterval, repeats: true
+                ) { [weak self] _ in
+                    Task { @MainActor [weak self] in self?.recomputeStats() }
+                }
+            } else {
+                statsRefreshTimer?.invalidate()
+                statsRefreshTimer = nil
+            }
         }
     }
     @Published var fileURL: URL
@@ -945,27 +957,46 @@ final class AgentStore: ObservableObject {
     private let transcriptReader = TranscriptReader()
     private let titleGenerator = TitleGenerator()
     private let liveStatusGenerator = LiveStatusGenerator()
-    private var staleCheckTimer: Timer?
+
+    // ── Incremental ingest state for agents.jsonl ──
+    // byId is the live fold of the event log, advanced one delta at a time so a
+    // reload costs O(new lines) instead of O(whole file). offset/inode mirror
+    // TranscriptReader's append-only tracking (reset on truncation / new inode).
+    private var byId: [String: Agent] = [:]
+    private var agentsOffset: UInt64 = 0
+    private var agentsInode: UInt64 = 0
+
+    // ── Event-driven staleness (replaces the old 1Hz poll) ──
+    // One kqueue watcher per live agent's transcript: a write IS the resumption
+    // signal (.away/.needsAttention → .running) and resets the away deadline.
+    private var transcriptWatchers: [String: DispatchSourceFileSystemObject] = [:]
+    // A single one-shot timer armed to the nearest pending deadline across all
+    // agents (away/inactive/clear). Zero wakeups while nothing is pending.
+    private var deadlineTimer: DispatchSourceTimer?
+    // Stats are a full-history pass; refresh on a slow tick only while the
+    // overlay is visible, never on the live hot path.
+    private var statsRefreshTimer: Timer?
 
     // Claude Code doesn't fire any hook on Ctrl+C/ESC. We detect interrupts
-    // by polling transcript mtime + tool-pending state, with grace periods
-    // tuned to avoid false positives during thinking and tool waits.
+    // via transcript mtime + tool-pending state, with grace periods tuned to
+    // avoid false positives during thinking and tool waits.
     static let awayThresholdSec: TimeInterval = 60      // .running silent for 60s → .away
     static let inactiveThresholdSec: TimeInterval = 300 // .idle inactive for 5min → .inactive
     static let subagentClearAfterStoppedSec: TimeInterval = 300 // subagents: auto-clear 5min after SubagentStop (skip .idle)
-    static let staleCheckInterval: TimeInterval = 1
+    static let statsRefreshInterval: TimeInterval = 2   // stats overlay refresh cadence
 
     init() {
         let home = FileManager.default.homeDirectoryForCurrentUser
         self.fileURL = home.appending(path: ".claude/agents.jsonl")
         ensureFileExists()
         titleGenerator.onTitleUpdated = { [weak self] _, _ in
-            self?.reload()
+            self?.rebuildView()
         }
         liveStatusGenerator.onUpdated = { [weak self] _, _ in
-            self?.reload()
+            self?.rebuildView()
         }
-        reload()
+        ingestAgentsFile()
+        rebuildView()
         startWatching()
     }
 
@@ -977,29 +1008,61 @@ final class AgentStore: ObservableObject {
         }
     }
 
+    /// Public entry point for UI-initiated refreshes (refresh button, stats
+    /// overlay open). Folds in any new bytes, then rebuilds the presentation.
     func reload() {
-        guard let data = try? Data(contentsOf: fileURL),
-              let text = String(data: data, encoding: .utf8) else {
-            agents = []
+        ingestAgentsFile()
+        rebuildView()
+    }
+
+    /// Incrementally folds the bytes appended to agents.jsonl past `agentsOffset`
+    /// into the persistent `byId`. Mirrors TranscriptReader.ingestNewBytes:
+    /// detects a new inode or a shrink (truncation/rotation) and rebuilds from
+    /// the top, otherwise reads only the delta. A trailing partial line (a write
+    /// caught mid-flush) is left unconsumed and re-read whole next time.
+    private func ingestAgentsFile() {
+        let attrs = (try? FileManager.default.attributesOfItem(atPath: fileURL.path)) ?? [:]
+        let inode = (attrs[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0
+        let size  = (attrs[.size] as? NSNumber)?.uint64Value ?? 0
+        if agentsOffset > 0 && (inode != agentsInode || size < agentsOffset) {
+            agentsOffset = 0
+            byId = [:]
+        }
+        agentsInode = inode
+
+        guard let handle = try? FileHandle(forReadingFrom: fileURL) else { return }
+        defer { try? handle.close() }
+        let newData: Data
+        do {
+            try handle.seek(toOffset: agentsOffset)
+            newData = try handle.readToEnd() ?? Data()
+        } catch {
             return
         }
+        guard !newData.isEmpty, let lastNL = newData.lastIndex(of: 0x0A) else { return }
+        let completeCount = newData.distance(from: newData.startIndex, to: lastNL) + 1
+        agentsOffset += UInt64(completeCount)
 
-        // Stats are a full chronological pass over the entire event history — too
-        // expensive to run on every reload (1Hz + every file write). Only build the
-        // event list and recompute while the stats overlay is actually visible; the
-        // didSet on statsOverlayOpen forces a compute the moment it opens.
-        let computeStats = statsOverlayOpen
-        var byId: [String: Agent] = [:]
-        var allEvents: [AgentEvent] = []
         let decoder = JSONDecoder()
-        for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
-            guard let lineData = line.data(using: .utf8),
-                  let rec = try? decoder.decode(AgentEvent.self, from: lineData) else { continue }
-            if computeStats { allEvents.append(rec) }
+        for lineData in newData.prefix(completeCount).split(separator: 0x0A, omittingEmptySubsequences: true) {
+            guard let rec = try? decoder.decode(AgentEvent.self, from: lineData) else { continue }
             apply(rec, into: &byId)
         }
-        if computeStats {
-            stats = StatsCompute.compute(events: allEvents, now: Date())
+    }
+
+    /// Rebuilds the published presentation from `byId`: detects time/transcript
+    /// driven transitions (emitting synthetic events folded straight back through
+    /// apply()), enriches, fires sound/push, then re-arms the transcript watchers
+    /// and the next deadline. No file scan of the whole log — only the delta.
+    private func rebuildView() {
+        // Detect staleness transitions and persist them as events. We append then
+        // immediately re-ingest so apply() remains the single state mutator (no
+        // dual-path divergence) with no kqueue round-trip latency. The watcher's
+        // later fire on our own append is a cheap no-op (offset already past it).
+        let syntheticEvents = detectStaleness(Array(byId.values))
+        if !syntheticEvents.isEmpty {
+            for ev in syntheticEvents { appendEvent(ev) }
+            ingestAgentsFile()
         }
 
         let sorted = byId.values.sorted { a, b in
@@ -1011,21 +1074,8 @@ final class AgentStore: ObservableObject {
         let grouped = groupSubagentsUnderParents(sorted)
         let newAgents = enrichWithTranscripts(assignSiblingIndices(grouped))
 
-        let (withStaleness, syntheticEvents) = applyTranscriptStaleness(newAgents)
-        // Persist synthetic transitions to agents.jsonl so the event log captures
-        // every state change (used for stats). The file watcher will fire a
-        // redundant reload, which is idempotent (apply() will then process these
-        // same events as part of the regular pass).
-        for ev in syntheticEvents {
-            appendEvent(ev)
-        }
-
-        // Sound check must run AFTER staleness, otherwise the pre-staleness status
-        // (from raw apply) compared against the post-staleness previousStatuses
-        // looks like a constant flap (e.g. needs_attention ↔ running every tick),
-        // replaying Funk on every reload.
         if hasLoadedInitial {
-            for agent in withStaleness {
+            for agent in newAgents {
                 let prev = previousStatuses[agent.id]
                 if prev != agent.status {
                     if soundEnabled {
@@ -1036,26 +1086,44 @@ final class AgentStore: ObservableObject {
             }
         }
 
-        previousStatuses = Dictionary(uniqueKeysWithValues: withStaleness.map { ($0.id, $0.status) })
+        previousStatuses = Dictionary(uniqueKeysWithValues: newAgents.map { ($0.id, $0.status) })
         hasLoadedInitial = true
-        agents = withStaleness
-        ensureStaleCheckTimer()
+        agents = newAgents
+
+        if statsOverlayOpen { recomputeStats() }
+        reconcileTranscriptWatchers(newAgents)
+        rescheduleDeadline(newAgents)
     }
 
-    /// Two transcript-mtime-based transitions:
-    /// - .running → .away when transcript has been silent for >60s
-    /// - .needsAttention → .running when transcript activity resumes (permission
-    ///   granted; Claude continues silently with no hook event)
+    /// Full-history stats pass. Deliberately reads the entire log — only ever
+    /// called while the stats overlay is visible (on open and on the slow
+    /// refresh tick), never on the live hot path.
+    private func recomputeStats() {
+        guard let data = try? Data(contentsOf: fileURL),
+              let text = String(data: data, encoding: .utf8) else { return }
+        let decoder = JSONDecoder()
+        var allEvents: [AgentEvent] = []
+        for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
+            guard let lineData = line.data(using: .utf8),
+                  let rec = try? decoder.decode(AgentEvent.self, from: lineData) else { continue }
+            allEvents.append(rec)
+        }
+        stats = StatsCompute.compute(events: allEvents, now: Date())
+    }
+
+    /// Detects state transitions that have no hook-fired event and returns the
+    /// synthetic events that represent them. Pure: it does NOT mutate state —
+    /// rebuildView() appends these and folds them back through apply(), keeping
+    /// apply() the single mutator. The same thresholds back the deadline timer
+    /// in nextDeadline(for:), so a transition fires the instant its deadline does.
+    ///   - .running → .away      when transcript silent > 60s (tool not pending)
+    ///   - .away/.needsAttention → .running on fresh transcript writes (resume)
+    ///   - .idle/.away → .inactive after 5min idle
+    ///   - subagent .inactive → cleared 5min after stop
     /// Never auto-transitions to .stopped — that requires a real Stop event.
-    /// Detects state transitions that don't have hook-fired events, mutates
-    /// the agent list to reflect them, AND emits synthetic events back into
-    /// agents.jsonl so the event log captures the full state timeline (needed
-    /// for accurate stats).
-    /// Returns (post-transition agents, list of synthetic events to append).
-    private func applyTranscriptStaleness(_ agents: [Agent]) -> ([Agent], [AgentEvent]) {
+    private func detectStaleness(_ agents: [Agent]) -> [AgentEvent] {
         let now = Date()
         let nowTs = Self.iso8601.string(from: now)
-        var newAgents: [Agent] = []
         var newEvents: [AgentEvent] = []
 
         func makeEvent(_ kind: AgentEventKind, sessionId: String) -> AgentEvent {
@@ -1065,136 +1133,164 @@ final class AgentStore: ObservableObject {
 
         for a in agents {
             // Subagents go to .inactive immediately on stop (apply()), then
-            // auto-clear 5min later. Top-level sessions stay sticky and require
-            // manual dismissal. lastUpdate is the SubagentStop timestamp, so the
-            // 5min countdown starts from when it actually finished.
+            // auto-clear 5min later. lastUpdate is the SubagentStop timestamp, so
+            // the 5min countdown starts from when it actually finished.
             if a.status == .inactive, a.agentType != nil {
                 let lastUpdateDate = Self.iso8601.date(from: a.lastUpdate) ?? .distantPast
                 if now.timeIntervalSince(lastUpdateDate) > Self.subagentClearAfterStoppedSec {
                     newEvents.append(makeEvent(.cleared, sessionId: a.id))
-                    continue  // drop from list; .cleared will remove from byId on next reload
                 }
-                newAgents.append(a)
                 continue
             }
 
-            // .idle → .inactive after 5min of NO activity (events OR transcript writes).
-            // Doesn't require a transcript file — covers freshly-opened sessions too.
+            // .idle → .inactive after 5min of NO activity (events OR transcript
+            // writes). Doesn't require a transcript file — covers fresh sessions.
             if a.status == .idle {
-                let lastUpdateDate = Self.iso8601.date(from: a.lastUpdate)
-                var lastActivity = lastUpdateDate ?? .distantPast
-                if let path = a.transcriptPath, !path.isEmpty {
-                    if let mtime = transcriptReader.read(path: path).lastModified {
-                        lastActivity = max(lastActivity, mtime)
-                    }
+                var lastActivity = Self.iso8601.date(from: a.lastUpdate) ?? .distantPast
+                if let path = a.transcriptPath, !path.isEmpty,
+                   let mtime = transcriptReader.read(path: path).lastModified {
+                    lastActivity = max(lastActivity, mtime)
                 }
                 if now.timeIntervalSince(lastActivity) > Self.inactiveThresholdSec {
-                    var copy = a; copy.status = .inactive
-                    newAgents.append(copy)
                     newEvents.append(makeEvent(.inactiveStart, sessionId: a.id))
-                    continue
                 }
-                newAgents.append(a)
                 continue
             }
 
-            guard let path = a.transcriptPath, !path.isEmpty else {
-                newAgents.append(a); continue
-            }
+            guard let path = a.transcriptPath, !path.isEmpty else { continue }
             let info = transcriptReader.read(path: path)
-            guard let mtime = info.lastModified else {
-                newAgents.append(a); continue
-            }
+            guard let mtime = info.lastModified else { continue }
 
             switch a.status {
             case .running:
-                // While a tool is in flight the transcript stays silent
-                // between tool_use and tool_result — that's not idleness, the
-                // session is actively waiting on the tool. Skip the .away flip
-                // entirely until the tool resolves.
-                if info.isToolPending {
-                    newAgents.append(a)
-                    break
-                }
+                // While a tool is in flight the transcript stays silent between
+                // tool_use and tool_result — that's not idleness. Skip the .away
+                // flip until the tool resolves (its tool_result write will fire
+                // the transcript watcher and re-arm the deadline).
+                if info.isToolPending { break }
                 let lastActivity = max(mtime, a.runStartedAt ?? mtime)
                 if now.timeIntervalSince(lastActivity) > Self.awayThresholdSec {
-                    var copy = a; copy.status = .away
-                    newAgents.append(copy)
                     newEvents.append(makeEvent(.awayStart, sessionId: a.id))
-                } else {
-                    newAgents.append(a)
                 }
 
             case .away:
                 // .away → .running when transcript gets fresh writes after the
                 // away_start (a resumed tool_result write IS such a write).
-                guard let lastUpdateDate = Self.iso8601.date(from: a.lastUpdate) else {
-                    newAgents.append(a); continue
-                }
+                guard let lastUpdateDate = Self.iso8601.date(from: a.lastUpdate) else { continue }
                 if mtime > lastUpdateDate.addingTimeInterval(1.0) {
-                    var copy = a
-                    copy.status = .running
-                    copy.runStartedAt = mtime
-                    newAgents.append(copy)
                     newEvents.append(makeEvent(.awayEnd, sessionId: a.id))
                 } else if now.timeIntervalSince(lastUpdateDate) > Self.inactiveThresholdSec {
-                    // .away → .inactive after 5min — covers abandoned sessions
+                    // .away → .inactive after 5min — abandoned sessions
                     // (interrupted, no Stop hook, no further transcript writes).
-                    var copy = a; copy.status = .inactive
-                    newAgents.append(copy)
                     newEvents.append(makeEvent(.inactiveStart, sessionId: a.id))
-                } else {
-                    newAgents.append(a)
                 }
 
             case .needsAttention:
                 // .needsAttention → .running when Claude resumes silently after
-                // permission grant (no hook fires; we detect via transcript mtime).
-                guard let lastUpdateDate = Self.iso8601.date(from: a.lastUpdate) else {
-                    newAgents.append(a); continue
-                }
+                // permission grant (no hook fires; detected via transcript mtime).
+                guard let lastUpdateDate = Self.iso8601.date(from: a.lastUpdate) else { continue }
                 if mtime > lastUpdateDate.addingTimeInterval(1.0) {
-                    var copy = a
-                    copy.status = .running
-                    copy.runStartedAt = mtime
-                    newAgents.append(copy)
                     newEvents.append(makeEvent(.needsAttentionEnd, sessionId: a.id))
-                } else {
-                    newAgents.append(a)
                 }
 
             default:
-                newAgents.append(a)
+                break
             }
         }
 
-        return (newAgents, newEvents)
+        return newEvents
     }
 
-    private func ensureStaleCheckTimer() {
-        // Keep polling while any agent is in a time-sensitive state:
-        //  .running        → check for staleness (→ .away)
-        //  .away           → detect resumption (→ .running)
-        //  .needsAttention → detect post-permission resumption (→ .running)
-        //  .idle           → check for inactivity (→ .inactive after 5min)
-        let needsTimer = agents.contains {
-            $0.status == .running || $0.status == .away ||
-            $0.status == .needsAttention || $0.status == .idle ||
-            // Inactive subagents have a 5-min auto-clear timer; keep polling.
-            ($0.status == .inactive && $0.agentType != nil)
+    /// The next moment `a` could cross a staleness threshold, or nil if it has no
+    /// pending time-based transition (terminal states, needsAttention awaiting a
+    /// transcript write, or running with a tool in flight). The minimum of these
+    /// across all agents is what the one-shot deadline timer is armed to.
+    private func nextDeadline(for a: Agent) -> Date? {
+        func date(_ s: String) -> Date? { Self.iso8601.date(from: s) }
+
+        if a.status == .inactive, a.agentType != nil {
+            return date(a.lastUpdate)?.addingTimeInterval(Self.subagentClearAfterStoppedSec)
         }
-        if needsTimer && staleCheckTimer == nil {
-            staleCheckTimer = Timer.scheduledTimer(
-                withTimeInterval: Self.staleCheckInterval, repeats: true
-            ) { [weak self] _ in
-                Task { @MainActor [weak self] in
-                    guard let self = self else { return }
-                    self.reload()
-                }
+        switch a.status {
+        case .idle:
+            var last = date(a.lastUpdate) ?? .distantPast
+            if let path = a.transcriptPath, !path.isEmpty,
+               let mtime = transcriptReader.read(path: path).lastModified {
+                last = max(last, mtime)
             }
-        } else if !needsTimer && staleCheckTimer != nil {
-            staleCheckTimer?.invalidate()
-            staleCheckTimer = nil
+            return last.addingTimeInterval(Self.inactiveThresholdSec)
+        case .running:
+            guard let path = a.transcriptPath, !path.isEmpty else { return nil }
+            let info = transcriptReader.read(path: path)
+            guard let mtime = info.lastModified, !info.isToolPending else { return nil }
+            let lastActivity = max(mtime, a.runStartedAt ?? mtime)
+            return lastActivity.addingTimeInterval(Self.awayThresholdSec)
+        case .away:
+            // Earliest of the resume-window edge and the 5min inactive cutoff;
+            // resume itself is transcript-driven, so we only schedule the cutoff.
+            return date(a.lastUpdate)?.addingTimeInterval(Self.inactiveThresholdSec)
+        default:
+            return nil // .needsAttention, .stopped, etc. — no time-based deadline
+        }
+    }
+
+    /// Arms a single one-shot timer at the nearest pending deadline across all
+    /// agents, replacing the old fixed 1Hz poll. Re-armed after every rebuild.
+    private func rescheduleDeadline(_ agents: [Agent]) {
+        deadlineTimer?.cancel()
+        deadlineTimer = nil
+
+        let now = Date()
+        guard let soonest = agents.compactMap({ nextDeadline(for: $0) }).min() else { return }
+        let delay = max(0, soonest.timeIntervalSince(now))
+
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        // +0.5s so the threshold is comfortably crossed when detectStaleness re-checks.
+        timer.schedule(deadline: .now() + delay + 0.5, leeway: .milliseconds(250))
+        timer.setEventHandler { [weak self] in
+            self?.rebuildView()
+        }
+        deadlineTimer = timer
+        timer.resume()
+    }
+
+    /// Opens a kqueue watcher on each live agent's transcript and tears down the
+    /// rest. A write to a watched transcript drives resume detection and re-arms
+    /// the away deadline — that's what lets us delete the steady poll entirely.
+    private func reconcileTranscriptWatchers(_ agents: [Agent]) {
+        var desired = Set<String>()
+        for a in agents {
+            switch a.status {
+            case .running, .away, .needsAttention, .idle:
+                if let path = a.transcriptPath, !path.isEmpty { desired.insert(path) }
+            default:
+                break
+            }
+        }
+
+        for (path, src) in transcriptWatchers where !desired.contains(path) {
+            src.cancel()
+            transcriptWatchers.removeValue(forKey: path)
+        }
+        for path in desired where transcriptWatchers[path] == nil {
+            let fd = open(path, O_EVTONLY)
+            guard fd >= 0 else { continue }
+            let src = DispatchSource.makeFileSystemObjectSource(
+                fileDescriptor: fd,
+                eventMask: [.write, .extend, .delete, .rename],
+                queue: .main
+            )
+            src.setEventHandler { [weak self, weak src] in
+                guard let self = self, let src = src else { return }
+                if src.data.contains(.delete) || src.data.contains(.rename) {
+                    src.cancel()
+                    self.transcriptWatchers.removeValue(forKey: path)
+                }
+                self.rebuildView()
+            }
+            src.setCancelHandler { close(fd) }
+            transcriptWatchers[path] = src
+            src.resume()
         }
     }
 
@@ -1365,7 +1461,7 @@ final class AgentStore: ObservableObject {
             byId.removeValue(forKey: rec.sessionId)
 
         case .awayStart:
-            // Synthetic: applyTranscriptStaleness flipped .running → .away.
+            // Synthetic: detectStaleness flagged .running → .away.
             // Freeze the running timer at this point.
             if var a = byId[rec.sessionId] {
                 if a.status == .running, let started = a.runStartedAt {
@@ -1378,7 +1474,7 @@ final class AgentStore: ObservableObject {
             }
 
         case .awayEnd:
-            // Synthetic: applyTranscriptStaleness flipped .away → .running.
+            // Synthetic: detectStaleness flagged .away → .running.
             // Guard against race-emitted stale events: if a real Stop arrived
             // in the same reload window the status is already .idle/.inactive,
             // and we must NOT clobber it back to .running (this was the source
@@ -1391,7 +1487,7 @@ final class AgentStore: ObservableObject {
             }
 
         case .needsAttentionEnd:
-            // Synthetic: applyTranscriptStaleness flipped .needsAttention → .running
+            // Synthetic: detectStaleness flagged .needsAttention → .running
             // (permission granted, transcript writes resumed; no hook fires for this).
             // Same race guard as .awayEnd above.
             if var a = byId[rec.sessionId], a.status == .needsAttention {
@@ -1402,7 +1498,7 @@ final class AgentStore: ObservableObject {
             }
 
         case .inactiveStart:
-            // Synthetic: applyTranscriptStaleness flipped .idle/.away → .inactive.
+            // Synthetic: detectStaleness flagged .idle/.away → .inactive.
             // Guard against stale events: only honor it if the status is still
             // one of the source states.
             if var a = byId[rec.sessionId], a.status == .idle || a.status == .away {
@@ -1521,6 +1617,11 @@ final class AgentStore: ObservableObject {
             if mask.contains(.delete) || mask.contains(.rename) {
                 source.cancel()
                 self.ensureFileExists()
+                // The log we were folding is gone — drop the incremental state so
+                // ingestAgentsFile re-reads the (now empty) file from the top.
+                self.agentsOffset = 0
+                self.agentsInode = 0
+                self.byId = [:]
                 self.reload()
                 self.startWatching()
             } else {
