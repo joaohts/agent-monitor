@@ -36,6 +36,10 @@ session.
   can't accidentally drop old entries and output stays near-empty on quiet turns.
 
 Schema:
+> **Note:** this schema is the *original* design. The shipped version uses a three-level
+> summary (`title` / `subtitle` / `summary`) — see **Changes since the original design**
+> at the end of this doc. The ledger structure below is unchanged.
+
 ```jsonc
 {
   "summary": "≤ ~120 words",   // rewrite each fold
@@ -239,3 +243,51 @@ store the cards observe.
 
 Rough size: ~500–700 lines net in the single Swift file; no new deps, no threading
 risk (another async side-car). Cost is breadth, not difficulty.
+
+---
+
+## Changes since the original design
+
+The sections above are the original design. The shipped implementation refined it:
+
+- **Three-level summary** (replaces `summary` + `status`): a sticky **`title`** (PR-style,
+  ≤12 words — only rewritten on a substantial focus change), a live **`subtitle`** (the
+  current phase, most dynamic), and the detailed **`summary`**. All three are rewritten
+  each fold; the ledgers are unchanged.
+- **Summary is Markdown, bullet-first, timely-first.** The prompt asks for short `-`
+  bullets under `## Now` / `## Recently` / `## Background`. A small dependency-free
+  `MarkdownText` view renders headers/bullets/`**bold**`/italic/code in the report.
+- **Recency-bias fix.** Each fold also receives a **recent-context window** (last ~60
+  projected lines) for the summary, while the cursor delta still drives the ledgers. The
+  prompt is reframed as **cumulative** — "the current summary is long-term memory: preserve
+  and extend, never collapse to the latest step."
+- **Trigger gate — no fold on a lone user message.** A fold only runs once the *assistant*
+  has produced new work (an `A:`/`T:` line in the delta). A turn that just started no
+  longer triggers a premature, recency-biased fold; the question folds together with its
+  answer. Effective triggers: Stop (answer), heartbeat (timer), permission, manual.
+- **Depth-1 coalescing.** A trigger arriving while a fold is in flight is remembered
+  (latest wins) and flushed exactly once when the fold finishes — so a Stop landing
+  mid-fold isn't lost. One fold at a time; no overlap or runaway loop.
+- **Markdown export is throttled to turn boundaries** (`Stop`/inactive), not every fold,
+  to keep a synced vault from churning. JSON state still writes every fold.
+
+### Frontend (shipped)
+
+- **Workspace** — collapsible right `AgentSidebar` + a tiling `PaneWorkspace` of
+  `ReportView` panes (click-to-replace, drag-to-split, auto-tile up to 4 then scroll).
+  Opens near-fullscreen. Replaced the live/dashboard mode toggle.
+- **ReportView** — single orange accent (everything else secondary), title/subtitle/markdown
+  summary, **collapsible ledger sections (collapsed by default)** with item counts.
+- **Report font scaling** — `store.reportFontScale`, header buttons + `⌘=` / `⌘−` / `⌘0`,
+  persisted.
+- **Classic view** — header + Settings → Interface toggle that restores the original
+  two-column live list and **disables the summary agent entirely** (no folds, no tokens).
+- **Settings** — Interface (classic toggle), Housekeeping (enable, backend, heartbeat,
+  markdown export via a native **folder picker**).
+
+### Install / upgrade impact
+
+Drop-in: only `AgentMonitor.swift` changed — **no hook, `settings.json`, dependency, or
+`build.sh` changes**. No new hard requirements (reuses the logged-in `claude` CLI;
+`ANTHROPIC_API_KEY` optional → Haiku backend). Summaries auto-run after upgrade (real
+subscription/token use); Classic view is the opt-out. See the README "v2" section.
