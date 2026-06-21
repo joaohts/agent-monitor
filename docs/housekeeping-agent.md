@@ -162,9 +162,13 @@ project / date in the filename + frontmatter, for a navigable vault:
   host: personal        # personal | work, from hostname
   projects: [agent-monitor]
   cwd: /Users/joaohts/fun/agent-monitor
+  branch: feat/housekeeping-agent   # app-captured (git rev-parse in cwd), not model-emitted
   started: <iso>
   updated: <iso>
   ```
+  `branch` is metadata the app reads from the session's `cwd` (not a fold output) —
+  it's a per-session field the v2 "Contexto amplo" dashboard wants (projeto · branch ·
+  último resumo · status).
   (`short-sid` = first 6 of the UUID, just to keep same-day/same-project files
   distinct in a listing.)
 
@@ -179,6 +183,26 @@ Settle while building, by eyeballing real output (not in the abstract):
 (Bounds settled: summary ≤ ~120 words; ledgers kept in full, no cap/rollover.)
 
 ---
+
+## Visualization (downstream)
+
+This agent is the **data layer** for the v2 "Contexto amplo" / orchestration view
+(`~/notes/jonathan/projects/agent-monitor-v2.md`). The per-session JSON state is what
+that dashboard renders.
+
+Surface split (the groundwork already exists in the code):
+- **Bubbles overlay** (`BubblesView` on the click-through `OverlayPanel`) = the ambient
+  quick-glance. Stays as-is.
+- **Main window** (`ContentView` on a normal resizable `NSWindow`) → grows into the
+  **dashboard**: per-agent cards showing summary + status + quick-facts, selectable
+  subset (filter by tag/project), live updates as folds land. Already a normal
+  resizable window — this is a `ContentView` evolution, not a re-plumb. Add
+  `collectionBehavior = [.fullScreenPrimary]` to enable native fullscreen / second
+  display.
+
+Built *after* the data layer (steps 2–3) — the dashboard just watches `summaryStateDir`
+(kqueue, same pattern used elsewhere) and loads each session's JSON into a published
+store the cards observe.
 
 ## Build order (proposed)
 

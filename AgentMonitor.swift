@@ -1003,6 +1003,241 @@ enum HousekeepingDelta {
     }
 }
 
+// MARK: - Housekeeping state + fold
+
+/// One project-tagged ledger line (feature / fix / decision).
+struct LedgerEntry: Codable, Equatable {
+    var project: String
+    var text: String
+}
+
+/// Accumulated, persisted per-session state — the source of truth for both the next
+/// fold (passed back in) and the dashboard. `summary`/`status` are rewritten each fold;
+/// the ledgers are append-only. `offset` is the housekeeping byte cursor into the
+/// transcript (how far we've already folded). Metadata is app-managed, not model-emitted.
+struct HousekeepingState: Codable {
+    var summary: String = ""
+    var status: String = ""
+    var projects: [String] = []      // global set
+    var sources: [String] = []       // global set
+    var features: [LedgerEntry] = []
+    var fixes: [LedgerEntry] = []
+    var decisions: [LedgerEntry] = []
+
+    var sessionId: String = ""
+    var host: String = ""
+    var cwd: String = ""
+    var branch: String = ""
+    var started: String = ""
+    var updated: String = ""
+
+    var offset: UInt64 = 0
+
+    /// Folds a model result in: rewrite summary/status, append-dedupe the ledgers.
+    mutating func merge(_ f: HousekeepingFold) {
+        summary = f.summary
+        status = f.status
+        for p in f.newProjects ?? [] where !projects.contains(p) { projects.append(p) }
+        for s in f.newSources ?? [] where !sources.contains(s) { sources.append(s) }
+        for e in f.newFeatures ?? [] where !features.contains(e) { features.append(e) }
+        for e in f.newFixes ?? [] where !fixes.contains(e) { fixes.append(e) }
+        for e in f.newDecisions ?? [] where !decisions.contains(e) { decisions.append(e) }
+    }
+}
+
+/// What a single fold returns: the rewritten summary/status plus only the *new* ledger
+/// entries (append model — the app merges/dedupes).
+struct HousekeepingFold: Codable {
+    var summary: String
+    var status: String
+    var newProjects: [String]?
+    var newSources: [String]?
+    var newFeatures: [LedgerEntry]?
+    var newFixes: [LedgerEntry]?
+    var newDecisions: [LedgerEntry]?
+}
+
+/// Shared prompt — same instruction for both backends so they behave alike.
+enum FoldPrompt {
+    static let system = """
+    You maintain a running summary of a single Claude Code coding session by folding in \
+    ONLY the new activity since the last update. Output STRICT JSON and nothing else — no \
+    prose, no markdown fences.
+
+    You are given the CURRENT state (summary, status, existing ledgers) and the NEW ACTIVITY \
+    as compact lines:
+      U: a user message
+      A: the assistant's prose
+      T: Tool(arg)  — a tool the assistant ran (file edited, command, query, ...)
+
+    Return JSON with this shape (omit or empty any array with nothing new):
+    {
+      "summary": string,   // REWRITE the whole running summary, <= 120 words. What the
+                           // session is doing / has done overall. Fold the new activity in
+                           // and keep it tight — it must grow far slower than the session.
+      "status":  string,   // one line: what's happening right now
+                           // (e.g. "implementing the provider", "awaiting permission to run
+                           //  the migration", "done — turn complete").
+      "newFeatures":  [{"project": string, "text": string}],
+      "newFixes":     [{"project": string, "text": string}],
+      "newDecisions": [{"project": string, "text": string}],
+      "newProjects":  [string],
+      "newSources":   [string]
+    }
+
+    Ledgers are append-only and PERMANENT. Be strict — when in doubt, LEAVE IT OUT; a wrong
+    entry can never be removed. Emit only entries NOT already present in the existing ledgers.
+    Inclusion tests:
+    - feature: a capability that now exists and didn't before. NOT refactors, NOT steps
+      toward one, NOT "improved X".
+      YES "added a manual refresh button"; NO "replaced the 1Hz poll with event-driven
+      reload" (internal — that's a decision).
+    - fix: a specific wrong behavior made right. NOT refactors / cleanups.
+      YES "fixed false away-flips during tool runs"; NO "renamed a function".
+    - decision: a choice between alternatives that constrains future work (architecture,
+      "use X not Y"). NOT mechanical picks.
+      YES "chose event-sourced single-path state mutation"; NO "used seekToEnd instead of
+      re-reading".
+    - source: a doc, note, or URL consulted for reference (API docs, a design note like
+      foo.md, a web page) — NOT the code files being edited.
+    - project: a repo / dir touched, repo level not file. `newProjects` must include
+      every project touched this update, including any name you use as a `project` tag
+      on a feature/fix/decision below.
+
+    Each feature/fix/decision carries the `project` it belongs to (a session may touch
+    several) — use the project name, not a path.
+    """
+
+    static func user(state: HousekeepingState, delta: [String]) -> String {
+        func entries(_ es: [LedgerEntry]) -> String {
+            es.isEmpty ? "(none)" : es.map { "- [\($0.project)] \($0.text)" }.joined(separator: "\n")
+        }
+        return """
+        CURRENT SUMMARY:
+        \(state.summary.isEmpty ? "(none yet)" : state.summary)
+
+        CURRENT STATUS: \(state.status.isEmpty ? "(none)" : state.status)
+        KNOWN PROJECTS: \(state.projects.isEmpty ? "(none)" : state.projects.joined(separator: ", "))
+        KNOWN SOURCES: \(state.sources.isEmpty ? "(none)" : state.sources.joined(separator: ", "))
+        EXISTING FEATURES:
+        \(entries(state.features))
+        EXISTING FIXES:
+        \(entries(state.fixes))
+        EXISTING DECISIONS:
+        \(entries(state.decisions))
+
+        NEW ACTIVITY (since last update):
+        \(delta.joined(separator: "\n"))
+        """
+    }
+
+    /// Pulls the first balanced top-level JSON object out of a model's text reply
+    /// (for the `claude -p` path, which can wrap JSON in prose or ``` fences).
+    static func extractJSON(_ raw: String) -> Data? {
+        guard let start = raw.firstIndex(of: "{"), let end = raw.lastIndex(of: "}"),
+              start < end else { return nil }
+        return String(raw[start...end]).data(using: .utf8)
+    }
+}
+
+// MARK: - Housekeeping providers
+
+protocol HousekeepingProvider: Sendable {
+    func fold(state: HousekeepingState, delta: [String]) async -> HousekeepingFold?
+}
+
+enum HousekeepingProviderKind: String { case auto, claudeP, haikuApi }
+
+enum HousekeepingProviders {
+    /// `auto` → Haiku API when `ANTHROPIC_API_KEY` is set (metered, minimize tokens),
+    /// else `claude -p` (flat-rate subscription, no key).
+    static func resolve(_ kind: HousekeepingProviderKind) -> HousekeepingProvider {
+        switch kind {
+        case .haikuApi: return HaikuAPIProvider()
+        case .claudeP:  return ClaudePProvider()
+        case .auto:
+            let key = ProcessInfo.processInfo.environment["ANTHROPIC_API_KEY"] ?? ""
+            return key.isEmpty ? ClaudePProvider() : HaikuAPIProvider()
+        }
+    }
+}
+
+/// Subscription path: shells out via the shared `ClaudeP` runner (Haiku, OAuth, no key),
+/// prompts for JSON, parses defensively.
+struct ClaudePProvider: HousekeepingProvider {
+    func fold(state: HousekeepingState, delta: [String]) async -> HousekeepingFold? {
+        let user = FoldPrompt.user(state: state, delta: delta)
+        guard let out = ClaudeP.run(prompt: user, model: "claude-haiku-4-5",
+                                    systemPrompt: FoldPrompt.system),
+              let data = FoldPrompt.extractJSON(out),
+              let fold = try? JSONDecoder().decode(HousekeepingFold.self, from: data)
+        else { return nil }
+        return fold
+    }
+}
+
+/// Metered path: a direct Haiku 4.5 Messages API call with structured output, so the
+/// schema is enforced. Needs `ANTHROPIC_API_KEY`.
+struct HaikuAPIProvider: HousekeepingProvider {
+    func fold(state: HousekeepingState, delta: [String]) async -> HousekeepingFold? {
+        guard let key = ProcessInfo.processInfo.environment["ANTHROPIC_API_KEY"],
+              !key.isEmpty else { return nil }
+
+        let body: [String: Any] = [
+            "model": "claude-haiku-4-5",
+            "max_tokens": 1500,
+            "system": FoldPrompt.system,
+            "messages": [["role": "user", "content": FoldPrompt.user(state: state, delta: delta)]],
+            "output_config": ["format": ["type": "json_schema", "schema": Self.schema]],
+        ]
+        guard let payload = try? JSONSerialization.data(withJSONObject: body) else { return nil }
+
+        var req = URLRequest(url: URL(string: "https://api.anthropic.com/v1/messages")!)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue(key, forHTTPHeaderField: "x-api-key")
+        req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        req.httpBody = payload
+
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              (resp as? HTTPURLResponse)?.statusCode == 200,
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let content = obj["content"] as? [[String: Any]],
+              let text = content.first(where: { ($0["type"] as? String) == "text" })?["text"] as? String,
+              let jsonData = FoldPrompt.extractJSON(text),
+              let fold = try? JSONDecoder().decode(HousekeepingFold.self, from: jsonData)
+        else { return nil }
+        return fold
+    }
+
+    /// Structured-output schema: summary/status required, ledger arrays optional.
+    /// additionalProperties:false everywhere (required by structured outputs).
+    private static let schema: [String: Any] = {
+        let entry: [String: Any] = [
+            "type": "object",
+            "properties": ["project": ["type": "string"], "text": ["type": "string"]],
+            "required": ["project", "text"],
+            "additionalProperties": false,
+        ]
+        let strArr: [String: Any] = ["type": "array", "items": ["type": "string"]]
+        let entryArr: [String: Any] = ["type": "array", "items": entry]
+        return [
+            "type": "object",
+            "properties": [
+                "summary": ["type": "string"],
+                "status": ["type": "string"],
+                "newProjects": strArr,
+                "newSources": strArr,
+                "newFeatures": entryArr,
+                "newFixes": entryArr,
+                "newDecisions": entryArr,
+            ],
+            "required": ["summary", "status"],
+            "additionalProperties": false,
+        ]
+    }()
+}
+
 // MARK: - Title generator (shells out to `claude -p` async)
 
 @MainActor
