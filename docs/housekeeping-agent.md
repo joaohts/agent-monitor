@@ -185,6 +185,28 @@ Settle while building, by eyeballing real output (not in the abstract):
 
 ---
 
+## Frontend v2 — workspace layout (in progress)
+
+Pivot from the compact window to an IDE-style full-screen workspace. Unifies the live
+list and the summaries dashboard into one screen.
+
+- **Near-fullscreen by default** on launch; sidebar visible; main shows the
+  most-recently-active agent.
+- **Right sidebar (collapsible)** — the full agent list, active + inactive merged into
+  one column, keeping all current row features (status, live status, title, tags,
+  Ghostty jump). Toggle to hide → panes take full width.
+- **Main area = tiling pane manager.** Each pane is a full `ReportView` of one agent
+  (summary · status · branch · fully-expanded ledgers · metadata · live activity).
+  - **Click** a sidebar agent → replaces the **focused** pane (or creates the first
+    pane when none).
+  - **Drag** a sidebar agent into the main area → **splits** (adds a pane).
+  - Auto-tile up to **4** panes (1 → full, 2 → side by side, 3–4 → 2×2); beyond 4 →
+    scroll. Per-pane close button.
+- **Grid tiling, not recursive splits** for v1 (recursive H/V split trees are a SwiftUI
+  rabbit hole; revisit only if genuinely missed).
+- The `SummaryCard` grows into the pane `ReportView`; the two-column `ContentView`
+  content is absorbed into the sidebar; the live/dashboard mode toggle is removed.
+
 ## Visualization (downstream)
 
 This agent is the **data layer** for the v2 "Contexto amplo" / orchestration view

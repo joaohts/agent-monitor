@@ -1768,9 +1768,37 @@ final class AgentStore: ObservableObject {
     private let liveStatusGenerator = LiveStatusGenerator()
     let housekeepingGenerator = HousekeepingGenerator()
 
-    // Dashboard: published per-session housekeeping states + the view-mode switch.
+    // Workspace: published per-session housekeeping states + the pane layout.
     @Published var housekeeping: [String: HousekeepingState] = [:]
-    @Published var dashboardMode = false
+    @Published var panes: [String] = []          // sessionIds tiled in the main area, ordered
+    @Published var focusedPane: String?           // plain sidebar-click replaces this pane
+    @Published var showSidebar = true
+
+    /// Sidebar click: focus an already-open pane, else replace the focused pane (or open
+    /// the first pane when none).
+    func selectPane(_ id: String) {
+        if panes.contains(id) { focusedPane = id; return }
+        if let f = focusedPane, let idx = panes.firstIndex(of: f) {
+            panes[idx] = id
+        } else if panes.isEmpty {
+            panes = [id]
+        } else {
+            panes[0] = id
+        }
+        focusedPane = id
+    }
+
+    /// Drag-drop from the sidebar: split — add a pane (no duplicates).
+    func addPane(_ id: String) {
+        guard !panes.contains(id) else { focusedPane = id; return }
+        panes.append(id)
+        focusedPane = id
+    }
+
+    func closePane(_ id: String) {
+        panes.removeAll { $0 == id }
+        if focusedPane == id { focusedPane = panes.last }
+    }
 
     // ── Incremental ingest state for agents.jsonl ──
     // byId is the live fold of the event log, advanced one delta at a time so a
@@ -2614,146 +2642,192 @@ final class AgentStore: ObservableObject {
 
 // MARK: - Views
 
-// MARK: - Dashboard (the v2 "Contexto amplo" view)
+// MARK: - Workspace (right sidebar + tiling report panes)
 
-/// Per-session summary cards reading the housekeeping state. Shows every recently-worked
-/// session (persisted state), with live status overlaid for the currently-active ones.
-struct DashboardView: View {
+/// Right sidebar: the full agent list (active + inactive, one column), reusing the
+/// existing row UI. Click selects a pane; drag splits a new pane.
+struct AgentSidebar: View {
     @EnvironmentObject var store: AgentStore
 
     var body: some View {
-        let agentsById = Dictionary(store.agents.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
-        let states = store.housekeeping.values.sorted { $0.updated > $1.updated }
+        VStack(spacing: 0) {
+            HStack {
+                Text("Agents").font(.caption.weight(.semibold)).foregroundStyle(.secondary).textCase(.uppercase)
+                Spacer()
+                Text("\(store.agents.count)").font(.caption2.monospacedDigit()).foregroundStyle(.tertiary)
+            }
+            .padding(.horizontal, 12).padding(.vertical, 6)
+            .background(.quaternary.opacity(0.4))
+            Divider().opacity(0.4)
+            if store.agents.isEmpty {
+                VStack { Spacer(); Text("No agents").foregroundStyle(.tertiary); Spacer() }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(store.agents) { agent in
+                            AgentRow(agent: agent)
+                                .background(store.panes.contains(agent.id) ? Color.accentColor.opacity(0.10) : .clear)
+                                .contentShape(Rectangle())
+                                .onTapGesture { store.selectPane(agent.id) }
+                                .onDrag { NSItemProvider(object: agent.id as NSString) }
+                            Divider().opacity(0.3)
+                        }
+                    }
+                }
+            }
+        }
+        .frame(width: 300)
+        .background(.quaternary.opacity(0.12))
+    }
+}
+
+/// Main area: tiles open panes (auto 1 / 2 / 2x2), scrolls beyond 4. A sidebar agent
+/// dropped here splits a new pane.
+struct PaneWorkspace: View {
+    @EnvironmentObject var store: AgentStore
+
+    var body: some View {
         Group {
-            if states.isEmpty {
+            if store.panes.isEmpty {
                 VStack(spacing: 8) {
                     Spacer()
-                    Image(systemName: "doc.text.magnifyingglass").font(.largeTitle).foregroundStyle(.tertiary)
-                    Text("No summaries yet").foregroundStyle(.secondary)
-                    Text("Summaries appear as sessions run and fold.")
+                    Image(systemName: "rectangle.split.2x2").font(.largeTitle).foregroundStyle(.tertiary)
+                    Text("Pick an agent").foregroundStyle(.secondary)
+                    Text("Click a session in the sidebar — or drag one here to split.")
                         .font(.caption2).foregroundStyle(.tertiary)
                     Spacer()
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                ScrollView {
-                    LazyVStack(spacing: 10) {
-                        ForEach(states, id: \.sessionId) { s in
-                            let live = agentsById[s.sessionId]
-                            SummaryCard(
-                                state: s,
-                                liveStatus: live?.status,
-                                onFold: live.map { a in { store.forceHousekeeping(a) } }
-                            )
+                GeometryReader { geo in
+                    let cols = store.panes.count == 1 ? 1 : 2
+                    let rows = Int(ceil(Double(store.panes.count) / Double(cols)))
+                    let fill = store.panes.count <= 4
+                    let paneH = fill ? max(220, (geo.size.height - CGFloat(rows + 1) * 8) / CGFloat(rows)) : 340
+                    ScrollView {
+                        LazyVGrid(
+                            columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: cols),
+                            spacing: 8
+                        ) {
+                            ForEach(store.panes, id: \.self) { id in
+                                ReportView(sessionId: id).frame(height: paneH)
+                            }
                         }
+                        .padding(8)
                     }
-                    .padding(12)
                 }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .onDrop(of: ["public.text"], isTargeted: nil) { providers in
+            guard let p = providers.first else { return false }
+            _ = p.loadObject(ofClass: NSString.self) { obj, _ in
+                if let id = obj as? String {
+                    Task { @MainActor in store.addPane(id) }
+                }
+            }
+            return true
+        }
     }
 }
 
-struct SummaryCard: View {
-    let state: HousekeepingState
-    let liveStatus: AgentStatus?
-    let onFold: (() -> Void)?
-    @State private var expanded = false
+/// One pane: the full report for a session (summary, status, branch, fully-expanded
+/// ledgers, metadata), with live agent status overlaid.
+struct ReportView: View {
+    let sessionId: String
+    @EnvironmentObject var store: AgentStore
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            // Title row: project · branch · live dot · fold button
-            HStack(spacing: 8) {
-                Circle().fill(dotColor).frame(width: 8, height: 8)
-                Text(state.projects.first ?? (state.cwd as NSString).lastPathComponent)
-                    .font(.headline)
-                if !state.branch.isEmpty {
-                    Label(state.branch, systemImage: "arrow.triangle.branch")
-                        .font(.caption).foregroundStyle(.secondary).labelStyle(.titleAndIcon)
-                }
-                Spacer()
-                Text(relative(state.updated)).font(.caption2).foregroundStyle(.tertiary)
-                if let onFold {
-                    Button(action: onFold) { Image(systemName: "arrow.clockwise") }
-                        .buttonStyle(.borderless).help("Fold now")
-                }
-            }
-
-            if !state.status.isEmpty {
-                Text(state.status).font(.caption).foregroundStyle(.secondary).italic()
-            }
-
-            Text(state.summary.isEmpty ? "(no summary yet)" : state.summary)
-                .font(.callout)
-                .fixedSize(horizontal: false, vertical: true)
-
-            // Quick-facts counts → expand to the ledgers
-            let counts = [
-                ("Features", state.features.count), ("Fixes", state.fixes.count),
-                ("Decisions", state.decisions.count), ("Sources", state.sources.count),
-                ("Projects", state.projects.count),
-            ].filter { $0.1 > 0 }
-            if !counts.isEmpty {
-                Button { withAnimation(.easeInOut(duration: 0.15)) { expanded.toggle() } } label: {
-                    HStack(spacing: 10) {
-                        ForEach(counts, id: \.0) { c in
-                            Text("\(c.0) \(c.1)").font(.caption2.monospacedDigit())
-                                .foregroundStyle(.secondary)
+        let s = store.housekeeping[sessionId]
+        let agent = store.agents.first { $0.id == sessionId }
+        let focused = store.focusedPane == sessionId
+        VStack(alignment: .leading, spacing: 0) {
+            header(state: s, agent: agent)
+            Divider()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 10) {
+                    if let s {
+                        if !s.status.isEmpty {
+                            Text(s.status).font(.callout).foregroundStyle(.secondary).italic()
                         }
-                        Image(systemName: expanded ? "chevron.up" : "chevron.down")
-                            .font(.caption2).foregroundStyle(.tertiary)
+                        Text(s.summary.isEmpty ? "(no summary yet)" : s.summary)
+                            .font(.body).fixedSize(horizontal: false, vertical: true)
+                        ledger("Features", s.features)
+                        ledger("Fixes", s.fixes)
+                        ledger("Decisions", s.decisions)
+                        if !s.sources.isEmpty { list("Sources", s.sources) }
+                        if !s.projects.isEmpty { list("Projects", s.projects) }
+                        Text("\(s.host) · \(s.cwd)")
+                            .font(.caption2.monospaced()).foregroundStyle(.tertiary).padding(.top, 4)
+                    } else {
+                        Text(agent?.liveStatus ?? "Summarizing…")
+                            .font(.callout).foregroundStyle(.secondary)
                     }
                 }
-                .buttonStyle(.plain)
-            }
-            if expanded {
-                ledger("Features", state.features)
-                ledger("Fixes", state.fixes)
-                ledger("Decisions", state.decisions)
-                if !state.sources.isEmpty {
-                    factGroup("Sources", state.sources.map { "• \($0)" })
-                }
+                .padding(12)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
-        .padding(12)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(RoundedRectangle(cornerRadius: 10).fill(.quaternary.opacity(0.3)))
+        .background(RoundedRectangle(cornerRadius: 10).fill(.quaternary.opacity(0.25)))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .strokeBorder(focused ? Color.accentColor.opacity(0.7) : Color.clear, lineWidth: 1.5)
+        )
+        .contentShape(Rectangle())
+        .onTapGesture { store.focusedPane = sessionId }
+    }
+
+    private func header(state s: HousekeepingState?, agent: Agent?) -> some View {
+        HStack(spacing: 8) {
+            Circle().fill(dotColor(agent?.status)).frame(width: 8, height: 8)
+            Text(s?.projects.first ?? agent?.generatedTitle ?? "session")
+                .font(.headline).lineLimit(1)
+            if let b = s?.branch, !b.isEmpty {
+                Label(b, systemImage: "arrow.triangle.branch")
+                    .font(.caption).foregroundStyle(.secondary).labelStyle(.titleAndIcon).lineLimit(1)
+            }
+            Spacer()
+            if let agent {
+                Button { store.forceHousekeeping(agent) } label: { Image(systemName: "arrow.clockwise") }
+                    .buttonStyle(.borderless).help("Fold now")
+            }
+            Button { store.closePane(sessionId) } label: { Image(systemName: "xmark") }
+                .buttonStyle(.borderless).help("Close pane")
+        }
+        .padding(.horizontal, 12).padding(.vertical, 8)
     }
 
     @ViewBuilder private func ledger(_ title: String, _ es: [LedgerEntry]) -> some View {
         if !es.isEmpty {
-            factGroup(title, es.map { "• [\($0.project)] \($0.text)" })
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title.uppercased()).font(.caption.weight(.semibold)).foregroundStyle(.tertiary)
+                ForEach(es.indices, id: \.self) { i in
+                    Text("• [\(es[i].project)] \(es[i].text)").font(.callout).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
         }
     }
 
-    private func factGroup(_ title: String, _ lines: [String]) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(title.uppercased()).font(.caption2.weight(.semibold)).foregroundStyle(.tertiary)
-            ForEach(lines, id: \.self) { Text($0).font(.caption).foregroundStyle(.secondary) }
+    private func list(_ title: String, _ xs: [String]) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title.uppercased()).font(.caption.weight(.semibold)).foregroundStyle(.tertiary)
+            ForEach(xs, id: \.self) { Text("• \($0)").font(.callout).foregroundStyle(.secondary) }
         }
-        .padding(.top, 2)
     }
 
-    private var dotColor: Color {
-        switch liveStatus {
+    private func dotColor(_ status: AgentStatus?) -> Color {
+        switch status {
         case .running: return .green
         case .away: return .yellow
         case .needsAttention: return .orange
         case .idle: return .blue
-        case .none, .some: return .gray   // inactive / not currently live
+        default: return .gray
         }
     }
-
-    private func relative(_ iso: String) -> String {
-        guard let d = ISO8601.formatter.date(from: iso) else { return "" }
-        let s = Int(Date().timeIntervalSince(d))
-        if s < 60 { return "\(s)s ago" }
-        if s < 3600 { return "\(s / 60)m ago" }
-        if s < 86400 { return "\(s / 3600)h ago" }
-        return "\(s / 86400)d ago"
-    }
 }
+
 
 struct ContentView: View {
     @EnvironmentObject var store: AgentStore
@@ -2763,29 +2837,16 @@ struct ContentView: View {
             VStack(spacing: 0) {
                 header
                 Divider()
-                if store.dashboardMode {
-                    DashboardView()
-                } else if store.agents.isEmpty {
-                    emptyState
-                } else {
-                    HStack(spacing: 0) {
-                        column(
-                            title: "Idle / Attention",
-                            agents: store.agents.filter {
-                                $0.status != .running && $0.status != .away
-                            }
-                        )
+                HStack(spacing: 0) {
+                    PaneWorkspace()
+                    if store.showSidebar {
                         Divider()
-                        column(
-                            title: "Running",
-                            agents: store.agents.filter {
-                                $0.status == .running || $0.status == .away
-                            }
-                        )
+                        AgentSidebar()
                     }
                 }
                 footer
             }
+            .onAppear(perform: seedDefaultPane)
             if store.statsOverlayOpen {
                 StatsView()
                     .background(.regularMaterial)
@@ -2800,6 +2861,17 @@ struct ContentView: View {
         .frame(minWidth: 520, minHeight: 260)
         .animation(.easeInOut(duration: 0.18), value: store.statsOverlayOpen)
         .animation(.easeInOut(duration: 0.18), value: store.settingsOverlayOpen)
+        .animation(.easeInOut(duration: 0.18), value: store.showSidebar)
+    }
+
+    /// On first appearance, open the most-recently-active agent in a pane.
+    private func seedDefaultPane() {
+        guard store.panes.isEmpty else { return }
+        if let first = store.agents.first {
+            store.selectPane(first.id)
+        } else if let recent = store.housekeeping.values.sorted(by: { $0.updated > $1.updated }).first {
+            store.selectPane(recent.sessionId)
+        }
     }
 
     private func column(title: String, agents: [Agent]) -> some View {
@@ -2865,13 +2937,13 @@ struct ContentView: View {
             .help("Toggle bubbles overlay (⌥⌘B)")
 
             Button {
-                store.dashboardMode.toggle()
+                store.showSidebar.toggle()
             } label: {
-                Image(systemName: store.dashboardMode ? "square.text.grid.1x2.fill" : "square.text.grid.1x2")
-                    .foregroundStyle(store.dashboardMode ? Color.accentColor : Color.secondary)
+                Image(systemName: "sidebar.right")
+                    .foregroundStyle(store.showSidebar ? Color.accentColor : Color.secondary)
             }
             .buttonStyle(.borderless)
-            .help(store.dashboardMode ? "Live sessions view" : "Summaries dashboard")
+            .help(store.showSidebar ? "Hide agent sidebar" : "Show agent sidebar")
 
             Button {
                 store.statsOverlayOpen.toggle()
@@ -3938,8 +4010,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // Regular, normal-level window — behaves like any app window (not pinned
     // on top, lives in its own Space).
     private func makeMainWindow() {
+        // Open near-fullscreen — the workspace wants room for the sidebar + panes.
+        let screen = (NSScreen.main ?? NSScreen.screens.first)?.visibleFrame
+            ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let inset = screen.insetBy(dx: screen.width * 0.04, dy: screen.height * 0.04)
         mainWindow = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 720, height: 480),
+            contentRect: inset,
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered, defer: false
         )
@@ -3947,12 +4023,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         mainWindow.titlebarAppearsTransparent = true
         mainWindow.isMovableByWindowBackground = true
         mainWindow.isReleasedWhenClosed = false
-        // Allow native fullscreen so the dashboard can fill a second display.
+        // Allow native fullscreen so the workspace can fill a second display.
         mainWindow.collectionBehavior.insert(.fullScreenPrimary)
         mainWindow.contentView = NSHostingView(
             rootView: ContentView().environmentObject(store)
         )
-        mainWindow.center()
+        mainWindow.setFrame(inset, display: true)
         mainWindow.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
