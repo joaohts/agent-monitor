@@ -1391,6 +1391,10 @@ final class LiveStatusGenerator {
 final class HousekeepingGenerator {
     private var states: [String: HousekeepingState] = [:]
     private var inFlight: Set<String> = []
+    // Depth-1 coalescing slot per session: a trigger that arrives while a fold is in
+    // flight is remembered (latest wins) and flushed exactly once when the fold finishes,
+    // so the tail of a burst (e.g. a Stop landing mid-fold) is never lost.
+    private var pending: [String: (path: String, cwd: String?, status: AgentStatus)] = [:]
     private var lastFoldAt: [String: Date] = [:]
     var onUpdated: ((String) -> Void)?
     var onFoldingChanged: ((String, Bool) -> Void)?   // (sessionId, isFolding)
@@ -1421,7 +1425,12 @@ final class HousekeepingGenerator {
     /// spawns the fold off-main. Cheap when there's nothing to do.
     func consider(sessionId: String, transcriptPath: String?, cwd: String?, status: AgentStatus, force: Bool = false) {
         guard enabled, let path = transcriptPath, !path.isEmpty else { return }
-        guard !inFlight.contains(sessionId) else { return }
+        // A fold is already running for this session — coalesce: remember the latest
+        // trigger and flush it once the current fold finishes (see finish()).
+        if inFlight.contains(sessionId) {
+            pending[sessionId] = (path, cwd, status)
+            return
+        }
 
         let state = states[sessionId] ?? loadOrInit(sessionId: sessionId, cwd: cwd)
 
@@ -1458,6 +1467,10 @@ final class HousekeepingGenerator {
     private func finish(sessionId: String, foldedOffset: UInt64, fold: HousekeepingFold?, branch: String?, exportMd: Bool) {
         inFlight.remove(sessionId)
         onFoldingChanged?(sessionId, false)
+        // Flush a coalesced trigger (if any) on the way out — on both success and the
+        // failure early-return below. It re-runs the normal gate, so it only re-folds
+        // when warranted (delta remaining + a stop boundary or due heartbeat).
+        defer { flushPending(sessionId) }
         // Only advance the cursor / record the fold time on success, so a failed provider
         // call simply retries the same delta on the next trigger.
         guard let fold = fold, var state = states[sessionId] else { return }
@@ -1470,6 +1483,13 @@ final class HousekeepingGenerator {
         save(state)
         if exportMd { exportMarkdown(state) }
         onUpdated?(sessionId)
+    }
+
+    /// Re-runs `consider` for a trigger that was coalesced while a fold was in flight.
+    /// Fires at most once per fold (the slot is consumed), so no overlap or runaway loop.
+    private func flushPending(_ sessionId: String) {
+        guard let p = pending.removeValue(forKey: sessionId) else { return }
+        consider(sessionId: sessionId, transcriptPath: p.path, cwd: p.cwd, status: p.status)
     }
 
     func snapshot(_ sessionId: String) -> HousekeepingState? { states[sessionId] }
