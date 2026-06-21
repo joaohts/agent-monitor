@@ -4,7 +4,8 @@ A side-car that maintains a slow-growing **working summary** + **quick facts** p
 Claude Code session, by folding each step's activity into a bounded running state
 instead of re-reading the whole transcript.
 
-Status: design in progress. Decisions below are settled unless under "Open".
+Status: **built** on `feat/housekeeping-agent` (projector → fold/provider → side-car →
+settings + dashboard), validated live. Decisions below are settled unless under "Open".
 
 ---
 
