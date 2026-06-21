@@ -1093,11 +1093,12 @@ enum FoldPrompt {
                            //  awaiting permission"). This is the most dynamic line; expect it to
                            // change every update and to reflect progress / timeliness.
       "summary": string,   // The DETAILED level: the CUMULATIVE summary of the WHOLE session,
-                           // written in MARKDOWN, structured TIMELY-FIRST — LEAD with the most
-                           // current / recent state, then the background below it. Use a few
-                           // short `##` subheaders (e.g. "## Now", "## Recently", "## Background"),
-                           // **bold** for key terms, and `-` bullet lists where they aid scanning.
-                           // Keep it to a handful of tight sections.
+                           // in MARKDOWN, structured TIMELY-FIRST. Prefer BULLET POINTS over
+                           // prose — avoid long paragraphs; most lines should be short `-`
+                           // bullets (one idea each). Group them under a few short `##`
+                           // subheaders ("## Now", "## Recently", "## Background"), each with a
+                           // handful of bullets. Use **bold** for key terms. Keep bullets tight
+                           // and scannable.
                            // CRITICAL — DO NOT LOSE THE LONG-TERM ARC. The
                            // CURRENT SUMMARY is your memory of everything before now: PRESERVE it
                            // and weave the recent work in. NEVER collapse it into only the latest
@@ -1486,7 +1487,12 @@ final class HousekeepingGenerator {
         Task.detached(priority: .utility) { [weak self] in
             // delta = only the new activity since the cursor → drives the ledgers.
             let (lines, newOffset) = HousekeepingDelta.project(path: path, from: fromOffset)
-            if lines.isEmpty {
+            // Only fold once the ASSISTANT has done something new. A lone user message (a
+            // turn just starting) isn't worth a fold — wait for the answer / heartbeat. We
+            // keep the cursor (fold:nil doesn't advance it), so the question folds together
+            // with the answer when it arrives.
+            let hasAssistantWork = lines.contains { $0.hasPrefix("A:") || $0.hasPrefix("T:") }
+            if lines.isEmpty || !hasAssistantWork {
                 await self?.finish(sessionId: sessionId, foldedOffset: newOffset, fold: nil, branch: nil, exportMd: false)
                 return
             }
