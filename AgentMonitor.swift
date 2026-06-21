@@ -899,6 +899,110 @@ final class TranscriptReader {
     }
 }
 
+// MARK: - Housekeeping delta projection
+
+/// Projects a transcript slice into the compact `U:/A:/T:` lines the housekeeping
+/// fold consumes. Independent of TranscriptReader's live `ParseState` (which trims
+/// its middle to bound memory) — housekeeping keeps its own byte cursor and reads
+/// only the bytes appended since the last fold. Tool-result bodies, thinking blocks,
+/// and `isMeta` injections are dropped; each `tool_use` collapses to `Tool(keyArg)`,
+/// where keyArg is the one field that matters (file touched, command, query, …) —
+/// the raw material for the projects/sources/fixes ledgers.
+enum HousekeepingDelta {
+    static let userCap = 500
+    static let asstCap = 1200
+    static let bashCap = 60
+
+    /// Reads complete lines appended past `offset` and returns the projection plus
+    /// the advanced offset (a trailing partial line is left unconsumed, re-read whole
+    /// next time — same append-only discipline as TranscriptReader.ingestNewBytes).
+    static func project(path: String, from offset: UInt64) -> (lines: [String], newOffset: UInt64) {
+        guard let handle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: path)) else {
+            return ([], offset)
+        }
+        defer { try? handle.close() }
+        let newData: Data
+        do {
+            try handle.seek(toOffset: offset)
+            newData = try handle.readToEnd() ?? Data()
+        } catch {
+            return ([], offset)
+        }
+        guard !newData.isEmpty, let lastNL = newData.lastIndex(of: 0x0A) else { return ([], offset) }
+        let completeCount = newData.distance(from: newData.startIndex, to: lastNL) + 1
+        let newOffset = offset + UInt64(completeCount)
+
+        var lines: [String] = []
+        for lineData in newData.prefix(completeCount).split(separator: 0x0A, omittingEmptySubsequences: true) {
+            guard let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] else { continue }
+            switch obj["type"] as? String ?? "" {
+            case "user":
+                if (obj["isMeta"] as? Bool) == true { break }      // hook/meta injection
+                if let t = extractText(obj["message"]) {            // skips tool_result-only turns
+                    lines.append("U: \(cap(t, userCap))")
+                }
+            case "assistant":
+                guard let msg = obj["message"] as? [String: Any],
+                      let content = msg["content"] as? [[String: Any]] else { break }
+                for item in content {
+                    switch item["type"] as? String ?? "" {
+                    case "text":
+                        if let t = item["text"] as? String, !t.isEmpty {
+                            lines.append("A: \(cap(t, asstCap))")
+                        }
+                    case "tool_use":
+                        let name = item["name"] as? String ?? "?"
+                        let arg = keyArg(name: name, input: item["input"] as? [String: Any] ?? [:])
+                        lines.append(arg.isEmpty ? "T: \(name)" : "T: \(name)(\(arg))")
+                    default: break  // thinking, etc.
+                    }
+                }
+            default: break  // summary, etc.
+            }
+        }
+        return (lines, newOffset)
+    }
+
+    /// The one field that captures what a tool call did — feeds the ledgers.
+    private static func keyArg(name: String, input: [String: Any]) -> String {
+        func str(_ k: String) -> String? { input[k] as? String }
+        switch name {
+        case "Edit", "Write", "Read", "NotebookEdit", "MultiEdit":
+            return str("file_path").map(basename) ?? ""
+        case "Bash":
+            return str("command").map { cap(firstLine($0), bashCap) } ?? ""
+        case "Grep", "Glob":
+            return str("pattern") ?? ""
+        case "WebFetch":
+            return str("url").map(host) ?? ""
+        case "WebSearch":
+            return str("query") ?? ""
+        case "Task":
+            return str("description") ?? (str("subagent_type") ?? "")
+        default:
+            return ""  // tool name only
+        }
+    }
+
+    private static func extractText(_ message: Any?) -> String? {
+        guard let msg = message as? [String: Any] else { return nil }
+        if let s = msg["content"] as? String, !s.isEmpty { return s }
+        if let arr = msg["content"] as? [[String: Any]] {
+            let pieces = arr.compactMap { ($0["type"] as? String) == "text" ? $0["text"] as? String : nil }
+                .filter { !$0.isEmpty }
+            return pieces.isEmpty ? nil : pieces.joined(separator: " ")
+        }
+        return nil
+    }
+
+    private static func basename(_ p: String) -> String { (p as NSString).lastPathComponent }
+    private static func host(_ u: String) -> String { URL(string: u)?.host ?? u }
+    private static func firstLine(_ s: String) -> String { s.split(separator: "\n").first.map(String.init) ?? s }
+    private static func cap(_ s: String, _ n: Int) -> String {
+        s.count <= n ? s : String(s.prefix(n)) + "…"
+    }
+}
+
 // MARK: - Title generator (shells out to `claude -p` async)
 
 @MainActor
