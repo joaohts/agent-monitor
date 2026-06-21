@@ -2914,7 +2914,7 @@ struct ReportView: View {
                         // Level 3: the detailed cumulative summary, rendered as Markdown.
                         if !s.summary.isEmpty, s.title != s.summary {
                             MarkdownText(text: s.summary, baseSize: 14.5 * scale)
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(.primary)
                         }
 
                         // Tag entries with their project only when the session spans more
