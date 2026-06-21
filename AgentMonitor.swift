@@ -1429,7 +1429,10 @@ final class HousekeepingGenerator {
     var onFoldingChanged: ((String, Bool) -> Void)?   // (sessionId, isFolding)
 
     // Config (UserDefaults; sensible defaults so it works with no setup).
-    private var enabled: Bool { UserDefaults.standard.object(forKey: "agentMonitor.housekeepingEnabled") as? Bool ?? true }
+    private var enabled: Bool {
+        if UserDefaults.standard.bool(forKey: "agentMonitor.classicView") { return false }  // classic = no summaries
+        return UserDefaults.standard.object(forKey: "agentMonitor.housekeepingEnabled") as? Bool ?? true
+    }
     private var heartbeat: TimeInterval {
         let v = UserDefaults.standard.double(forKey: "agentMonitor.housekeepingHeartbeatSec")
         return v > 0 ? v : 120
@@ -1852,6 +1855,11 @@ final class AgentStore: ObservableObject {
     @Published var focusedPane: String?           // plain sidebar-click replaces this pane
     @Published var showSidebar = true
     @Published var folding: Set<String> = []      // sessions with a summary fold in flight
+
+    // Classic view: the original two-column live list, no summaries (and no folds run).
+    @Published var classicView: Bool = UserDefaults.standard.bool(forKey: "agentMonitor.classicView") {
+        didSet { UserDefaults.standard.set(classicView, forKey: "agentMonitor.classicView") }
+    }
 
     // Report font scale — adjustable via header buttons / ⌘= ⌘- ; persisted.
     @Published var reportFontScale: Double = {
@@ -3087,11 +3095,15 @@ struct ContentView: View {
             VStack(spacing: 0) {
                 header
                 Divider()
-                HStack(spacing: 0) {
-                    PaneWorkspace()
-                    if store.showSidebar {
-                        Divider()
-                        AgentSidebar()
+                if store.classicView {
+                    classicLayout
+                } else {
+                    HStack(spacing: 0) {
+                        PaneWorkspace()
+                        if store.showSidebar {
+                            Divider()
+                            AgentSidebar()
+                        }
                     }
                 }
                 footer
@@ -3116,11 +3128,26 @@ struct ContentView: View {
 
     /// On first appearance, open the most-recently-active agent in a pane.
     private func seedDefaultPane() {
-        guard store.panes.isEmpty else { return }
+        guard !store.classicView, store.panes.isEmpty else { return }
         if let first = store.agents.first {
             store.selectPane(first.id)
         } else if let recent = store.housekeeping.values.sorted(by: { $0.updated > $1.updated }).first {
             store.selectPane(recent.sessionId)
+        }
+    }
+
+    /// The legacy two-column live list (no summaries).
+    @ViewBuilder private var classicLayout: some View {
+        if store.agents.isEmpty {
+            emptyState
+        } else {
+            HStack(spacing: 0) {
+                column(title: "Idle / Attention",
+                       agents: store.agents.filter { $0.status != .running && $0.status != .away })
+                Divider()
+                column(title: "Running",
+                       agents: store.agents.filter { $0.status == .running || $0.status == .away })
+            }
         }
     }
 
@@ -3186,24 +3213,36 @@ struct ContentView: View {
             .buttonStyle(.borderless)
             .help("Toggle bubbles overlay (⌥⌘B)")
 
+            // Workspace ⇄ Classic view.
             Button {
-                store.showSidebar.toggle()
+                store.classicView.toggle()
             } label: {
-                Image(systemName: "sidebar.right")
-                    .foregroundStyle(store.showSidebar ? Color.accentColor : Color.secondary)
+                Image(systemName: store.classicView ? "list.bullet.rectangle" : "rectangle.split.3x1")
+                    .foregroundStyle(.secondary)
             }
             .buttonStyle(.borderless)
-            .help(store.showSidebar ? "Hide agent sidebar" : "Show agent sidebar")
+            .help(store.classicView ? "Switch to workspace (summaries)" : "Switch to classic view (no summaries)")
 
-            // Report font size: buttons + ⌘- / ⌘= (and ⌘0 to reset).
-            Button { store.bumpReportFont(-0.1) } label: { Image(systemName: "textformat.size.smaller") }
-                .buttonStyle(.borderless).help("Smaller report text (⌘−)")
-                .keyboardShortcut("-", modifiers: .command)
-            Button { store.bumpReportFont(0.1) } label: { Image(systemName: "textformat.size.larger") }
-                .buttonStyle(.borderless).help("Larger report text (⌘=)")
-                .keyboardShortcut("=", modifiers: .command)
-            Button { store.reportFontScale = 1.0 } label: { EmptyView() }
-                .keyboardShortcut("0", modifiers: .command).frame(width: 0).opacity(0)
+            if !store.classicView {
+                Button {
+                    store.showSidebar.toggle()
+                } label: {
+                    Image(systemName: "sidebar.right")
+                        .foregroundStyle(store.showSidebar ? Color.accentColor : Color.secondary)
+                }
+                .buttonStyle(.borderless)
+                .help(store.showSidebar ? "Hide agent sidebar" : "Show agent sidebar")
+
+                // Report font size: buttons + ⌘- / ⌘= (and ⌘0 to reset).
+                Button { store.bumpReportFont(-0.1) } label: { Image(systemName: "textformat.size.smaller") }
+                    .buttonStyle(.borderless).help("Smaller report text (⌘−)")
+                    .keyboardShortcut("-", modifiers: .command)
+                Button { store.bumpReportFont(0.1) } label: { Image(systemName: "textformat.size.larger") }
+                    .buttonStyle(.borderless).help("Larger report text (⌘=)")
+                    .keyboardShortcut("=", modifiers: .command)
+                Button { store.reportFontScale = 1.0 } label: { EmptyView() }
+                    .keyboardShortcut("0", modifiers: .command).frame(width: 0).opacity(0)
+            }
 
             Button {
                 store.statsOverlayOpen.toggle()
@@ -3548,8 +3587,15 @@ struct SettingsView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
 
+                Section("Interface") {
+                    Toggle("Classic view (live list, no summaries)", isOn: $store.classicView)
+                    Text("Shows the original two-column list and disables the summary agent entirely (no folds, no token use).")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+
                 Section("Housekeeping") {
                     Toggle("Keep live session summaries", isOn: $hkEnabled)
+                        .disabled(store.classicView)
                     Picker("Backend", selection: $hkProvider) {
                         Text("Auto (key → Haiku, else claude -p)").tag("auto")
                         Text("claude -p (subscription)").tag("claudeP")
