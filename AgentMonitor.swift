@@ -1093,7 +1093,12 @@ enum FoldPrompt {
                            //  awaiting permission"). This is the most dynamic line; expect it to
                            // change every update and to reflect progress / timeliness.
       "summary": string,   // The DETAILED level: the CUMULATIVE summary of the WHOLE session,
-                           // 2-4 short paragraphs. CRITICAL — DO NOT LOSE THE LONG-TERM ARC. The
+                           // written in MARKDOWN, structured TIMELY-FIRST — LEAD with the most
+                           // current / recent state, then the background below it. Use a few
+                           // short `##` subheaders (e.g. "## Now", "## Recently", "## Background"),
+                           // **bold** for key terms, and `-` bullet lists where they aid scanning.
+                           // Keep it to a handful of tight sections.
+                           // CRITICAL — DO NOT LOSE THE LONG-TERM ARC. The
                            // CURRENT SUMMARY is your memory of everything before now: PRESERVE it
                            // and weave the recent work in. NEVER collapse it into only the latest
                            // step — the new work is an ADDITION, not a replacement. It grows
@@ -1841,6 +1846,17 @@ final class AgentStore: ObservableObject {
     @Published var focusedPane: String?           // plain sidebar-click replaces this pane
     @Published var showSidebar = true
     @Published var folding: Set<String> = []      // sessions with a summary fold in flight
+
+    // Report font scale — adjustable via header buttons / ⌘= ⌘- ; persisted.
+    @Published var reportFontScale: Double = {
+        let v = UserDefaults.standard.double(forKey: "agentMonitor.reportFontScale")
+        return v > 0 ? v : 1.0
+    }() {
+        didSet { UserDefaults.standard.set(reportFontScale, forKey: "agentMonitor.reportFontScale") }
+    }
+    func bumpReportFont(_ delta: Double) {
+        reportFontScale = min(2.4, max(0.8, reportFontScale + delta))
+    }
 
     /// Sidebar click: focus an already-open pane, else replace the focused pane (or open
     /// the first pane when none).
@@ -2805,10 +2821,70 @@ struct PaneWorkspace: View {
 
 /// One pane: the full report for a session (summary, status, branch, fully-expanded
 /// ledgers, metadata), with live agent status overlaid.
+/// Minimal block-level Markdown renderer (no external deps): `#`/`##`/`###` headers,
+/// `-`/`*` bullets, and paragraphs with inline markdown (**bold**, *italic*, `code`).
+struct MarkdownText: View {
+    let text: String
+    var baseSize: CGFloat = 14
+
+    private enum Block { case h(Int, String), bullet(String), para(String) }
+
+    var body: some View {
+        let blocks = parse()
+        VStack(alignment: .leading, spacing: 6) {
+            ForEach(blocks.indices, id: \.self) { i in row(blocks[i]) }
+        }
+    }
+
+    private func parse() -> [Block] {
+        var blocks: [Block] = []
+        var para: [String] = []
+        func flush() { if !para.isEmpty { blocks.append(.para(para.joined(separator: " "))); para = [] } }
+        for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = String(raw).trimmingCharacters(in: .whitespaces)
+            if line.isEmpty { flush(); continue }
+            if line.hasPrefix("### ") { flush(); blocks.append(.h(3, String(line.dropFirst(4)))) }
+            else if line.hasPrefix("## ") { flush(); blocks.append(.h(2, String(line.dropFirst(3)))) }
+            else if line.hasPrefix("# ") { flush(); blocks.append(.h(1, String(line.dropFirst(2)))) }
+            else if line.hasPrefix("- ") || line.hasPrefix("* ") { flush(); blocks.append(.bullet(String(line.dropFirst(2)))) }
+            else { para.append(line) }
+        }
+        flush()
+        return blocks
+    }
+
+    @ViewBuilder private func row(_ b: Block) -> some View {
+        switch b {
+        case .h(let lvl, let s):
+            inline(s)
+                .font(.system(size: baseSize * (lvl == 1 ? 1.35 : lvl == 2 ? 1.16 : 1.04), weight: .bold))
+                .padding(.top, 3)
+        case .bullet(let s):
+            HStack(alignment: .firstTextBaseline, spacing: 7) {
+                Text("•").foregroundStyle(.tertiary)
+                inline(s).font(.system(size: baseSize))
+            }
+        case .para(let s):
+            inline(s).font(.system(size: baseSize)).lineSpacing(4)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func inline(_ s: String) -> Text {
+        if let attr = try? AttributedString(
+            markdown: s, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        ) {
+            return Text(attr)
+        }
+        return Text(s)
+    }
+}
+
 struct ReportView: View {
     let sessionId: String
     @EnvironmentObject var store: AgentStore
     private let accent = Color.orange   // the one highlight; everything else is secondary
+    private var scale: CGFloat { CGFloat(store.reportFontScale) }
 
     var body: some View {
         let s = store.housekeeping[sessionId]
@@ -2824,23 +2900,20 @@ struct ReportView: View {
                         // subtitle tucked right beneath it.
                         VStack(alignment: .leading, spacing: 4) {
                             Text(titleText(s))
-                                .font(.system(size: 21, weight: .semibold))
+                                .font(.system(size: 21 * scale, weight: .semibold))
                                 .lineSpacing(2)
                                 .fixedSize(horizontal: false, vertical: true)
                             if !s.subtitle.isEmpty {
                                 Text(s.subtitle)
-                                    .font(.system(size: 13, weight: .medium))
+                                    .font(.system(size: 13 * scale, weight: .medium))
                                     .foregroundStyle(accent)
                                     .fixedSize(horizontal: false, vertical: true)
                             }
                         }
-                        // Level 3: the detailed cumulative summary.
+                        // Level 3: the detailed cumulative summary, rendered as Markdown.
                         if !s.summary.isEmpty, s.title != s.summary {
-                            Text(s.summary)
-                                .font(.system(size: 14))
+                            MarkdownText(text: s.summary, baseSize: 14.5 * scale)
                                 .foregroundStyle(.secondary)
-                                .lineSpacing(4)
-                                .fixedSize(horizontal: false, vertical: true)
                         }
 
                         // Tag entries with their project only when the session spans more
@@ -2916,7 +2989,7 @@ struct ReportView: View {
             RoundedRectangle(cornerRadius: 2).fill(.secondary.opacity(0.3)).frame(width: 3)
             VStack(alignment: .leading, spacing: 6) {
                 Label(title.uppercased(), systemImage: icon)
-                    .font(.caption.weight(.bold)).tracking(0.5)
+                    .font(.system(size: 11 * scale, weight: .bold)).tracking(0.5)
                     .foregroundStyle(.secondary).labelStyle(.titleAndIcon).imageScale(.small)
                 content()
             }
@@ -2950,7 +3023,7 @@ struct ReportView: View {
     private func bullet<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 7) {
             Text("•").foregroundStyle(.tertiary)
-            content().font(.callout).fixedSize(horizontal: false, vertical: true)
+            content().font(.system(size: 13.5 * scale)).fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -3095,6 +3168,16 @@ struct ContentView: View {
             }
             .buttonStyle(.borderless)
             .help(store.showSidebar ? "Hide agent sidebar" : "Show agent sidebar")
+
+            // Report font size: buttons + ⌘- / ⌘= (and ⌘0 to reset).
+            Button { store.bumpReportFont(-0.1) } label: { Image(systemName: "textformat.size.smaller") }
+                .buttonStyle(.borderless).help("Smaller report text (⌘−)")
+                .keyboardShortcut("-", modifiers: .command)
+            Button { store.bumpReportFont(0.1) } label: { Image(systemName: "textformat.size.larger") }
+                .buttonStyle(.borderless).help("Larger report text (⌘=)")
+                .keyboardShortcut("=", modifiers: .command)
+            Button { store.reportFontScale = 1.0 } label: { EmptyView() }
+                .keyboardShortcut("0", modifiers: .command).frame(width: 0).opacity(0)
 
             Button {
                 store.statsOverlayOpen.toggle()
@@ -4172,7 +4255,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         mainWindow.title = "Agent Monitor"
         mainWindow.titlebarAppearsTransparent = true
-        mainWindow.isMovableByWindowBackground = true
+        // Background-drag moves the window and swallows SwiftUI .onDrag (sidebar → pane
+        // split) when not fullscreen. Drag the window by its title bar instead.
+        mainWindow.isMovableByWindowBackground = false
         mainWindow.isReleasedWhenClosed = false
         // Allow native fullscreen so the workspace can fill a second display.
         mainWindow.collectionBehavior.insert(.fullScreenPrimary)
