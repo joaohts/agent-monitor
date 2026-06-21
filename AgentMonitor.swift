@@ -1016,7 +1016,8 @@ struct LedgerEntry: Codable, Equatable {
 /// the ledgers are append-only. `offset` is the housekeeping byte cursor into the
 /// transcript (how far we've already folded). Metadata is app-managed, not model-emitted.
 struct HousekeepingState: Codable {
-    var summary: String = ""
+    var headline: String = ""        // one-sentence gist
+    var summary: String = ""         // detailed
     var status: String = ""
     var projects: [String] = []      // global set
     var sources: [String] = []       // global set
@@ -1035,6 +1036,7 @@ struct HousekeepingState: Codable {
 
     /// Folds a model result in: rewrite summary/status, append-dedupe the ledgers.
     mutating func merge(_ f: HousekeepingFold) {
+        headline = f.headline
         summary = f.summary
         status = f.status
         for p in f.newProjects ?? [] where !projects.contains(p) { projects.append(p) }
@@ -1048,6 +1050,7 @@ struct HousekeepingState: Codable {
 /// What a single fold returns: the rewritten summary/status plus only the *new* ledger
 /// entries (append model — the app merges/dedupes).
 struct HousekeepingFold: Codable {
+    var headline: String
     var summary: String
     var status: String
     var newProjects: [String]?
@@ -1072,9 +1075,12 @@ enum FoldPrompt {
 
     Return JSON with this shape (omit or empty any array with nothing new):
     {
-      "summary": string,   // REWRITE the whole running summary, <= 120 words. What the
-                           // session is doing / has done overall. Fold the new activity in
-                           // and keep it tight — it must grow far slower than the session.
+      "headline": string,  // ONE sentence (<= 20 words) — what this session is about at a
+                           // glance, a title someone reads to instantly get the gist.
+      "summary": string,   // REWRITE the running summary as 2-4 short paragraphs: what has
+                           // been done, the current state, and the key context / why. Fold
+                           // the new activity in. It grows slower than the session but should
+                           // be genuinely informative and detailed, not terse.
       "status":  string,   // one line: what's happening right now
                            // (e.g. "implementing the provider", "awaiting permission to run
                            //  the migration", "done — turn complete").
@@ -1113,6 +1119,7 @@ enum FoldPrompt {
             es.isEmpty ? "(none)" : es.map { "- [\($0.project)] \($0.text)" }.joined(separator: "\n")
         }
         return """
+        CURRENT HEADLINE: \(state.headline.isEmpty ? "(none)" : state.headline)
         CURRENT SUMMARY:
         \(state.summary.isEmpty ? "(none yet)" : state.summary)
 
@@ -1224,6 +1231,7 @@ struct HaikuAPIProvider: HousekeepingProvider {
         return [
             "type": "object",
             "properties": [
+                "headline": ["type": "string"],
                 "summary": ["type": "string"],
                 "status": ["type": "string"],
                 "newProjects": strArr,
@@ -1232,7 +1240,7 @@ struct HaikuAPIProvider: HousekeepingProvider {
                 "newFixes": entryArr,
                 "newDecisions": entryArr,
             ],
-            "required": ["summary", "status"],
+            "required": ["headline", "summary", "status"],
             "additionalProperties": false,
         ]
     }()
@@ -1385,6 +1393,7 @@ final class HousekeepingGenerator {
     private var inFlight: Set<String> = []
     private var lastFoldAt: [String: Date] = [:]
     var onUpdated: ((String) -> Void)?
+    var onFoldingChanged: ((String, Bool) -> Void)?   // (sessionId, isFolding)
 
     // Config (UserDefaults; sensible defaults so it works with no setup).
     private var enabled: Bool { UserDefaults.standard.object(forKey: "agentMonitor.housekeepingEnabled") as? Bool ?? true }
@@ -1429,6 +1438,7 @@ final class HousekeepingGenerator {
 
         states[sessionId] = state
         inFlight.insert(sessionId)
+        onFoldingChanged?(sessionId, true)
         let fromOffset = state.offset
         let snapshot = state
         let kind = providerKind
@@ -1447,6 +1457,7 @@ final class HousekeepingGenerator {
 
     private func finish(sessionId: String, foldedOffset: UInt64, fold: HousekeepingFold?, branch: String?, exportMd: Bool) {
         inFlight.remove(sessionId)
+        onFoldingChanged?(sessionId, false)
         // Only advance the cursor / record the fold time on success, so a failed provider
         // call simply retries the same delta on the next trigger.
         guard let fold = fold, var state = states[sessionId] else { return }
@@ -1773,6 +1784,7 @@ final class AgentStore: ObservableObject {
     @Published var panes: [String] = []          // sessionIds tiled in the main area, ordered
     @Published var focusedPane: String?           // plain sidebar-click replaces this pane
     @Published var showSidebar = true
+    @Published var folding: Set<String> = []      // sessions with a summary fold in flight
 
     /// Sidebar click: focus an already-open pane, else replace the focused pane (or open
     /// the first pane when none).
@@ -1843,6 +1855,9 @@ final class AgentStore: ObservableObject {
         housekeepingGenerator.onUpdated = { [weak self] sid in
             guard let self, let s = self.housekeepingGenerator.snapshot(sid) else { return }
             self.housekeeping[sid] = s
+        }
+        housekeepingGenerator.onFoldingChanged = { [weak self] sid, folding in
+            if folding { self?.folding.insert(sid) } else { self?.folding.remove(sid) }
         }
         // Forward the nested notifier's published changes so toolbar toggles
         // re-render (nested ObservableObjects don't propagate automatically).
@@ -2737,6 +2752,7 @@ struct PaneWorkspace: View {
 struct ReportView: View {
     let sessionId: String
     @EnvironmentObject var store: AgentStore
+    private let accent = Color.orange   // the one highlight; everything else is secondary
 
     var body: some View {
         let s = store.housekeeping[sessionId]
@@ -2746,33 +2762,41 @@ struct ReportView: View {
             header(state: s, agent: agent)
             Divider()
             ScrollView {
-                VStack(alignment: .leading, spacing: 20) {
+                VStack(alignment: .leading, spacing: 16) {
                     if let s {
-                        // Status — small kicker above the summary.
+                        // Status — small orange kicker (the one live highlight).
                         if !s.status.isEmpty {
                             Text(s.status.uppercased())
-                                .font(.caption.weight(.semibold)).tracking(0.4)
-                                .foregroundStyle(dotColor(agent?.status))
+                                .font(.caption.weight(.bold)).tracking(0.5)
+                                .foregroundStyle(accent)
                         }
-                        // Summary — the headline; biggest, where the eye lands first.
-                        Text(s.summary.isEmpty ? "(no summary yet)" : s.summary)
-                            .font(.system(size: 17, weight: .regular))
-                            .lineSpacing(4)
+                        // Headline — one sentence, the focal point your eye lands on.
+                        Text(headlineText(s))
+                            .font(.system(size: 21, weight: .semibold))
+                            .lineSpacing(2)
                             .fixedSize(horizontal: false, vertical: true)
+                        // Detailed summary — the deeper read.
+                        if !s.summary.isEmpty, s.headline != s.summary {
+                            Text(s.summary)
+                                .font(.system(size: 14))
+                                .foregroundStyle(.secondary)
+                                .lineSpacing(4)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
 
                         // Tag entries with their project only when the session spans more
                         // than one — otherwise the header already says which project it is.
                         let multiProject = s.projects.count > 1
-                        ledgerSection("Features", "sparkles", .green, s.features, tag: multiProject)
-                        ledgerSection("Fixes", "wrench.and.screwdriver", .orange, s.fixes, tag: multiProject)
-                        ledgerSection("Decisions", "signpost.right", .purple, s.decisions, tag: multiProject)
-                        listSection("Sources", "book", .blue, s.sources)
-                        listSection("Projects", "folder", .teal, s.projects)
+                        ledgerSection("Features", "sparkles", s.features, tag: multiProject)
+                        ledgerSection("Fixes", "wrench.and.screwdriver", s.fixes, tag: multiProject)
+                        ledgerSection("Decisions", "signpost.right", s.decisions, tag: multiProject)
+                        listSection("Sources", "book", s.sources)
+                        listSection("Projects", "folder", s.projects)
 
                         Text("\(s.host) · \(s.cwd)")
                             .font(.caption.monospaced()).foregroundStyle(.tertiary).padding(.top, 6)
                     } else {
-                        Text(agent?.liveStatus ?? "Summarizing…")
+                        Label("Generating summary…", systemImage: "sparkles")
                             .font(.title3).foregroundStyle(.secondary)
                     }
                 }
@@ -2783,10 +2807,16 @@ struct ReportView: View {
         .background(RoundedRectangle(cornerRadius: 12).fill(.quaternary.opacity(0.22)))
         .overlay(
             RoundedRectangle(cornerRadius: 12)
-                .strokeBorder(focused ? Color.accentColor.opacity(0.7) : Color.clear, lineWidth: 2)
+                .strokeBorder(focused ? accent.opacity(0.8) : Color.clear, lineWidth: 2)
         )
         .contentShape(Rectangle())
         .onTapGesture { store.focusedPane = sessionId }
+    }
+
+    private func headlineText(_ s: HousekeepingState) -> String {
+        if !s.headline.isEmpty { return s.headline }
+        if !s.summary.isEmpty { return s.summary }   // pre-headline states
+        return "(no summary yet)"
     }
 
     private func header(state s: HousekeepingState?, agent: Agent?) -> some View {
@@ -2801,6 +2831,12 @@ struct ReportView: View {
                     .padding(.horizontal, 7).padding(.vertical, 2)
                     .background(Capsule().fill(.secondary.opacity(0.15)))
             }
+            if store.folding.contains(sessionId) {
+                HStack(spacing: 5) {
+                    ProgressView().controlSize(.small)
+                    Text("generating…").font(.caption2.weight(.medium)).foregroundStyle(accent)
+                }
+            }
             Spacer()
             if let agent {
                 Button { store.forceHousekeeping(agent) } label: { Image(systemName: "arrow.clockwise") }
@@ -2812,43 +2848,50 @@ struct ReportView: View {
         .padding(.horizontal, 14).padding(.vertical, 10)
     }
 
-    /// A titled section: a colored accent bar + icon + label, with the content aligned
-    /// to one shared left margin so the eye runs straight down the report.
-    @ViewBuilder private func sectionFrame<Content: View>(
-        _ title: String, _ icon: String, _ color: Color, @ViewBuilder _ content: () -> Content
+    /// A titled section: a muted accent bar + icon + caps label, content aligned to one
+    /// shared left margin so the eye runs straight down the report. Single accent palette.
+    private func sectionFrame<Content: View>(
+        _ title: String, _ icon: String, @ViewBuilder _ content: () -> Content
     ) -> some View {
         HStack(alignment: .top, spacing: 12) {
-            RoundedRectangle(cornerRadius: 2).fill(color.opacity(0.65)).frame(width: 3)
-            VStack(alignment: .leading, spacing: 7) {
+            RoundedRectangle(cornerRadius: 2).fill(.secondary.opacity(0.3)).frame(width: 3)
+            VStack(alignment: .leading, spacing: 6) {
                 Label(title.uppercased(), systemImage: icon)
                     .font(.caption.weight(.bold)).tracking(0.5)
-                    .foregroundStyle(color).labelStyle(.titleAndIcon)
+                    .foregroundStyle(.secondary).labelStyle(.titleAndIcon).imageScale(.small)
                 content()
             }
         }
     }
 
-    @ViewBuilder private func ledgerSection(_ title: String, _ icon: String, _ color: Color, _ es: [LedgerEntry], tag: Bool) -> some View {
+    @ViewBuilder private func ledgerSection(_ title: String, _ icon: String, _ es: [LedgerEntry], tag: Bool) -> some View {
         if !es.isEmpty {
-            sectionFrame(title, icon, color) {
+            sectionFrame(title, icon) {
                 ForEach(es.indices, id: \.self) { i in
-                    HStack(alignment: .firstTextBaseline, spacing: 8) {
-                        if tag { ProjectTag(project: es[i].project) }
-                        Text(es[i].text).font(.callout).fixedSize(horizontal: false, vertical: true)
+                    bullet {
+                        HStack(alignment: .firstTextBaseline, spacing: 6) {
+                            if tag { ProjectTag(project: es[i].project) }
+                            Text(es[i].text)
+                        }
                     }
                 }
             }
         }
     }
 
-    @ViewBuilder private func listSection(_ title: String, _ icon: String, _ color: Color, _ xs: [String]) -> some View {
+    @ViewBuilder private func listSection(_ title: String, _ icon: String, _ xs: [String]) -> some View {
         if !xs.isEmpty {
-            sectionFrame(title, icon, color) {
-                ForEach(xs, id: \.self) { x in
-                    Text(x).font(.callout).foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
+            sectionFrame(title, icon) {
+                ForEach(xs, id: \.self) { x in bullet { Text(x).foregroundStyle(.secondary) } }
             }
+        }
+    }
+
+    /// A bullet row with a hanging indent.
+    private func bullet<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 7) {
+            Text("•").foregroundStyle(.tertiary)
+            content().font(.callout).fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -2863,27 +2906,17 @@ struct ReportView: View {
     }
 }
 
-/// A small colored capsule for a project tag — deterministic color per project name,
-/// so the same project reads the same everywhere.
+/// A small muted capsule for a project tag (shown only in multi-project sessions to
+/// disambiguate — single accent palette, no rainbow).
 struct ProjectTag: View {
     let project: String
     var body: some View {
-        let c = Self.color(for: project)
         Text(project)
             .font(.caption2.weight(.semibold))
-            .foregroundStyle(c)
-            .padding(.horizontal, 7).padding(.vertical, 2)
-            .background(Capsule().fill(c.opacity(0.16)))
-            .overlay(Capsule().strokeBorder(c.opacity(0.35), lineWidth: 0.5))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 6).padding(.vertical, 1)
+            .background(Capsule().fill(.secondary.opacity(0.15)))
             .fixedSize()
-    }
-
-    static func color(for s: String) -> Color {
-        let palette: [Color] = [.blue, .green, .orange, .purple, .pink, .teal, .indigo, .red, .mint, .cyan]
-        var h = 5381
-        for b in s.utf8 { h = (h &* 33) &+ Int(b) }
-        let n = palette.count
-        return palette[((h % n) + n) % n]
     }
 }
 
