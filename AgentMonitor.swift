@@ -1372,6 +1372,174 @@ final class LiveStatusGenerator {
     }
 }
 
+// MARK: - Housekeeping generator (per-session running summary + facts)
+
+/// Side-car that maintains a slow-growing summary + quick-facts per session by folding
+/// only the new transcript delta on each trigger (Stop / permission / heartbeat / manual).
+/// Mirrors the title/live-status generators: gates cheaply on the main actor, runs the
+/// projection + provider call on a detached task, hops back to persist. JSON state is the
+/// source of truth; a markdown view is exported (throttled) for the Obsidian vault.
+@MainActor
+final class HousekeepingGenerator {
+    private var states: [String: HousekeepingState] = [:]
+    private var inFlight: Set<String> = []
+    private var lastFoldAt: [String: Date] = [:]
+    var onUpdated: ((String) -> Void)?
+
+    // Config (UserDefaults; sensible defaults so it works with no setup).
+    private var enabled: Bool { UserDefaults.standard.object(forKey: "agentMonitor.housekeepingEnabled") as? Bool ?? true }
+    private var heartbeat: TimeInterval {
+        let v = UserDefaults.standard.double(forKey: "agentMonitor.housekeepingHeartbeatSec")
+        return v > 0 ? v : 120
+    }
+    private var stateDir: URL {
+        if let custom = UserDefaults.standard.string(forKey: "agentMonitor.housekeepingStateDir"), !custom.isEmpty {
+            return URL(fileURLWithPath: (custom as NSString).expandingTildeInPath, isDirectory: true)
+        }
+        return FileManager.default.homeDirectoryForCurrentUser.appending(path: ".claude/agent-monitor-summaries")
+    }
+    private var markdownDir: URL? {
+        guard let p = UserDefaults.standard.string(forKey: "agentMonitor.housekeepingMarkdownDir"), !p.isEmpty
+        else { return nil }
+        return URL(fileURLWithPath: (p as NSString).expandingTildeInPath, isDirectory: true)
+    }
+    private var providerKind: HousekeepingProviderKind {
+        HousekeepingProviderKind(rawValue: UserDefaults.standard.string(forKey: "agentMonitor.housekeepingProvider") ?? "") ?? .auto
+    }
+
+    /// Called per-rebuild for every top-level session. Decides whether this is a fold
+    /// boundary (Stop / permission / due heartbeat / forced) with new delta, and if so
+    /// spawns the fold off-main. Cheap when there's nothing to do.
+    func consider(sessionId: String, transcriptPath: String?, cwd: String?, status: AgentStatus, force: Bool = false) {
+        guard enabled, let path = transcriptPath, !path.isEmpty else { return }
+        guard !inFlight.contains(sessionId) else { return }
+
+        let state = states[sessionId] ?? loadOrInit(sessionId: sessionId, cwd: cwd)
+
+        // Cheap "is there new delta?" via file size vs cursor — no full read on main.
+        let attrs = (try? FileManager.default.attributesOfItem(atPath: path)) ?? [:]
+        let size = (attrs[.size] as? NSNumber)?.uint64Value ?? 0
+        guard size > state.offset else { states[sessionId] = state; return }
+
+        // Trigger gate. Stop / permission boundaries fold immediately; running/away fold
+        // on the heartbeat cadence; manual forces regardless.
+        let isStopBoundary = (status == .idle || status == .inactive || status == .needsAttention)
+        let heartbeatDue = Date().timeIntervalSince(lastFoldAt[sessionId] ?? .distantPast) >= heartbeat
+        guard force || isStopBoundary || heartbeatDue else { states[sessionId] = state; return }
+
+        states[sessionId] = state
+        inFlight.insert(sessionId)
+        let fromOffset = state.offset
+        let snapshot = state
+        let kind = providerKind
+        let exportMd = (status == .idle || status == .inactive)  // throttle markdown to turn boundaries
+        Task.detached(priority: .utility) { [weak self] in
+            let (lines, newOffset) = HousekeepingDelta.project(path: path, from: fromOffset)
+            if lines.isEmpty {
+                await self?.finish(sessionId: sessionId, foldedOffset: newOffset, fold: nil, branch: nil, exportMd: false)
+                return
+            }
+            let branch = Self.gitBranch(cwd: snapshot.cwd)
+            let fold = await HousekeepingProviders.resolve(kind).fold(state: snapshot, delta: lines)
+            await self?.finish(sessionId: sessionId, foldedOffset: newOffset, fold: fold, branch: branch, exportMd: exportMd)
+        }
+    }
+
+    private func finish(sessionId: String, foldedOffset: UInt64, fold: HousekeepingFold?, branch: String?, exportMd: Bool) {
+        inFlight.remove(sessionId)
+        // Only advance the cursor / record the fold time on success, so a failed provider
+        // call simply retries the same delta on the next trigger.
+        guard let fold = fold, var state = states[sessionId] else { return }
+        state.offset = foldedOffset
+        if let b = branch, !b.isEmpty { state.branch = b }
+        state.updated = ISO8601.formatter.string(from: Date())
+        state.merge(fold)
+        states[sessionId] = state
+        lastFoldAt[sessionId] = Date()
+        save(state)
+        if exportMd { exportMarkdown(state) }
+        onUpdated?(sessionId)
+    }
+
+    func snapshot(_ sessionId: String) -> HousekeepingState? { states[sessionId] }
+
+    // MARK: persistence
+
+    private func loadOrInit(sessionId: String, cwd: String?) -> HousekeepingState {
+        let url = stateDir.appendingPathComponent("\(sessionId).json")
+        if let data = try? Data(contentsOf: url),
+           let s = try? JSONDecoder().decode(HousekeepingState.self, from: data) {
+            return s
+        }
+        var s = HousekeepingState()
+        s.sessionId = sessionId
+        s.cwd = cwd ?? ""
+        s.host = ProcessInfo.processInfo.hostName
+        s.started = ISO8601.formatter.string(from: Date())
+        return s
+    }
+
+    private func save(_ state: HousekeepingState) {
+        try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
+        let url = stateDir.appendingPathComponent("\(state.sessionId).json")
+        let enc = JSONEncoder()
+        enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+        if let data = try? enc.encode(state) { try? data.write(to: url) }
+    }
+
+    private func exportMarkdown(_ s: HousekeepingState) {
+        guard let dir = markdownDir else { return }
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let day = String(s.started.prefix(10))
+        let host = s.host.split(separator: ".").first.map(String.init) ?? s.host
+        let project = s.projects.first ?? (s.cwd as NSString).lastPathComponent
+        let shortSid = String(s.sessionId.prefix(6))
+        let name = "\(day)-\(host)-\(project)-\(shortSid).md".replacingOccurrences(of: "/", with: "-")
+        let url = dir.appendingPathComponent(name)
+        if let data = Self.markdown(s).data(using: .utf8) { try? data.write(to: url) }
+    }
+
+    private static func markdown(_ s: HousekeepingState) -> String {
+        func ledger(_ title: String, _ es: [LedgerEntry]) -> String {
+            es.isEmpty ? "" : "\n## \(title)\n" + es.map { "- [\($0.project)] \($0.text)" }.joined(separator: "\n") + "\n"
+        }
+        func list(_ title: String, _ xs: [String]) -> String {
+            xs.isEmpty ? "" : "\n## \(title)\n" + xs.map { "- \($0)" }.joined(separator: "\n") + "\n"
+        }
+        return """
+        ---
+        session_id: \(s.sessionId)
+        host: \(s.host)
+        projects: [\(s.projects.joined(separator: ", "))]
+        cwd: \(s.cwd)
+        branch: \(s.branch)
+        started: \(s.started)
+        updated: \(s.updated)
+        ---
+
+        # \(s.projects.first ?? "session") — \(s.status)
+
+        \(s.summary)
+        \(list("Projects", s.projects))\(list("Sources", s.sources))\(ledger("Features", s.features))\(ledger("Fixes", s.fixes))\(ledger("Decisions", s.decisions))
+        """
+    }
+
+    nonisolated private static func gitBranch(cwd: String) -> String {
+        guard !cwd.isEmpty else { return "" }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        p.arguments = ["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"]
+        let out = Pipe(); p.standardOutput = out; p.standardError = FileHandle.nullDevice
+        p.standardInput = FileHandle.nullDevice
+        do { try p.run(); p.waitUntilExit() } catch { return "" }
+        guard p.terminationStatus == 0,
+              let s = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
+        else { return "" }
+        let b = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        return b == "HEAD" ? "" : b   // detached HEAD → blank
+    }
+}
+
 // MARK: - Floating bubbles overlay placement
 
 enum BubbleCorner: CaseIterable, Identifiable {
@@ -1588,6 +1756,7 @@ final class AgentStore: ObservableObject {
     private let transcriptReader = TranscriptReader()
     private let titleGenerator = TitleGenerator()
     private let liveStatusGenerator = LiveStatusGenerator()
+    let housekeepingGenerator = HousekeepingGenerator()
 
     // ── Incremental ingest state for agents.jsonl ──
     // byId is the live fold of the event log, advanced one delta at a time so a
@@ -2311,8 +2480,26 @@ final class AgentStore: ObservableObject {
                     }
                 }
             }
+
+            // Housekeeping fold — top-level sessions only (subagents share the parent's
+            // transcript). Gates internally on trigger + new delta; cheap when idle.
+            if a.parentSessionId == nil, a.agentType == nil {
+                housekeepingGenerator.consider(
+                    sessionId: a.id, transcriptPath: a.transcriptPath,
+                    cwd: a.cwd, status: a.status
+                )
+            }
             return copy
         }
+    }
+
+    /// Manual housekeeping trigger (from the row button) — folds on demand regardless
+    /// of the heartbeat/stop gate.
+    func forceHousekeeping(_ agent: Agent) {
+        housekeepingGenerator.consider(
+            sessionId: agent.id, transcriptPath: agent.transcriptPath,
+            cwd: agent.cwd, status: agent.status, force: true
+        )
     }
 
     /// Reorders the list so each subagent appears immediately after its

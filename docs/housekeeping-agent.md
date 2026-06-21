@@ -206,10 +206,13 @@ store the cards observe.
 
 ## Build order (proposed)
 
-1. **Delta extractor** — `ingestLine` tweak + standalone projector; dump to debug log
-   and eyeball against a real session. Isolated, testable, off the live path.
-2. **Provider** — protocol + `ClaudeP` and `HaikuAPI` impls.
-3. **Side-car + persistence** — queue, per-session cursor, triggers, fold, write.
+1. **Delta extractor** — ✅ `HousekeepingDelta` projector (own cursor, U/A/T lines).
+2. **Provider** — ✅ `HousekeepingProvider` + `ClaudeP`/`Haiku` impls + fold prompt.
+3. **Side-car + persistence** — ✅ `HousekeepingGenerator`: per-session state/cursor,
+   triggers wired in `enrichWithTranscripts` (Stop/permission/heartbeat), JSON + markdown
+   export, git branch + metadata. Validated live against a real session.
+4. **Dashboard** (next) — main window → cards reading the JSON state; manual fold button;
+   settings toggle for enable/provider/paths.
 
 Rough size: ~500–700 lines net in the single Swift file; no new deps, no threading
 risk (another async side-car). Cost is breadth, not difficulty.
