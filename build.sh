@@ -53,7 +53,7 @@ fi
 swiftc AgentMonitor.swift \
     -o "$BIN_DIR/$APP_NAME" \
     -parse-as-library \
-    -framework SwiftUI -framework AppKit \
+    -framework SwiftUI -framework AppKit -framework Carbon -framework UserNotifications \
     $OPT_FLAGS
 
 cat > "$APP_DIR/Contents/Info.plist" <<'EOF'
@@ -71,9 +71,41 @@ cat > "$APP_DIR/Contents/Info.plist" <<'EOF'
     <key>LSMinimumSystemVersion</key><string>13.0</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>CFBundleIconFile</key><string>AppIcon</string>
+    <key>NSAppleEventsUsageDescription</key><string>Focus the Ghostty terminal tab running a selected agent session.</string>
 </dict>
 </plist>
 EOF
+
+# Code signature. Prefer the stable self-signed identity created by install.sh
+# (a dedicated keychain) so macOS notification + Automation grants persist across
+# rebuilds. Fall back to ad-hoc ("-") if it isn't set up, keeping the repo
+# portable for anyone who skips signing setup.
+SIGN_IDENTITY="Agent Monitor Local"
+SIGN_KC="$HOME/Library/Keychains/agent-monitor-signing.keychain-db"
+SIGN_PW_FILE="$HOME/.config/agent-monitor/signing-keychain.pw"
+
+sign_stable() {
+    [ -f "$SIGN_KC" ] && [ -f "$SIGN_PW_FILE" ] || return 1
+    security unlock-keychain -p "$(cat "$SIGN_PW_FILE")" "$SIGN_KC" 2>/dev/null || true
+    # codesign finds the self-signed identity by hash only if our keychain is in
+    # the search list (survives reboots/other tools resetting it).
+    if ! security list-keychains -d user | grep -q "agent-monitor-signing"; then
+        local EXISTING
+        EXISTING="$(security list-keychains -d user | sed -e 's/^[[:space:]]*"//' -e 's/"[[:space:]]*$//')"
+        security list-keychains -d user -s "$SIGN_KC" $EXISTING >/dev/null 2>&1
+    fi
+    local HASH
+    HASH="$(security find-identity -p codesigning "$SIGN_KC" 2>/dev/null | awk '/'"$SIGN_IDENTITY"'/{print $2; exit}')"
+    [ -n "$HASH" ] || return 1
+    codesign --force --sign "$HASH" "$APP_DIR" 2>/dev/null
+}
+
+if sign_stable; then
+    echo "→ signed with stable identity '$SIGN_IDENTITY'"
+else
+    echo "→ ad-hoc signing (run ./install.sh for a persistent identity)"
+    codesign --force --sign - "$APP_DIR"
+fi
 
 echo "→ launching $APP_DIR"
 open "$APP_DIR"

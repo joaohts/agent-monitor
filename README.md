@@ -4,6 +4,8 @@ A native macOS floating window that shows live status of every running Claude Co
 
 Built in a single Swift file with no external dependencies (no Xcode project, no Swift Package Manager). Compiles to a `.app` bundle in ~3 seconds.
 
+> **New:** floating bubbles overlay, jump-to-session hotkeys (Ghostty), custom + AI-generated tags, and native macOS notifications. See **[docs/features-and-setup.md](docs/features-and-setup.md)** for the full feature map, portability tiers (what works without Ghostty), and the guided setup wizard.
+
 ---
 
 ## What it does
@@ -17,6 +19,12 @@ Built in a single Swift file with no external dependencies (no Xcode project, no
 - **Push notifications to your phone** (optional) via the jsplayground MCP
 - **Stats overlay** with daily / weekly / monthly / all-time tabs: sessions, steps, time totals, per-step averages, concurrency duration, top-3 projects, hour-of-day histogram
 - Two-column layout: things that need you on the left, active sessions on the right
+- **Floating bubbles overlay** (`⌥⌘B`): an ambient, click-through, always-on-top view that floats over fullscreen apps — one colored bubble per session
+- **Jump to a session** (`⌥1`–`⌥9`, `` ⌥` ``): focus the exact Ghostty tab running an agent, from anywhere *(Ghostty only)*
+- **Custom + AI-generated tags**: name any agent freeform, or let Haiku tag it (`tag · project #N`)
+- **Native macOS notification banners** (optional) on needs-attention / turn-end
+
+See **[docs/features-and-setup.md](docs/features-and-setup.md)** for details on these and how they degrade without Ghostty.
 
 All state lives in `~/.claude/agents.jsonl`. Claude Code hooks append events; the app reads and renders. State transitions that aren't fired by hooks (`.away`, `.inactive`, post-permission resume) are detected by transcript-mtime polling and persisted as synthetic events so the log captures the full timeline.
 
@@ -88,6 +96,7 @@ cd /path/to/agent-monitor
 
 This script:
 - Verifies prereqs (`swiftc`, `jq`, `claude` CLI) and prints install hints if any are missing
+- **Sets up a stable self-signed code-signing identity** (a dedicated keychain it owns — zero clicks, no login password) so macOS notification + Automation grants persist across rebuilds; idempotent, and `build.sh` falls back to ad-hoc if it's absent
 - Builds `AgentMonitor.app` via `build.sh`
 - Smoke-tests the hook script with sample input
 - **Idempotent merge** of hook entries into `~/.claude/settings.json` via `jq`:
@@ -95,7 +104,8 @@ This script:
   - Re-running won't duplicate our entries (detects our hook path is already registered)
   - Backup of `settings.json` saved as `settings.json.bak.YYYYMMDD_HHMMSS` before any change
   - If `jq` produces invalid JSON, the original is left untouched and the script exits non-zero
-- Prints next-step instructions for TCC prompts
+- **Ghostty integration wizard** (only if Ghostty is installed): prompts to enable jump-to-tab + agent-monitor-owned tab titles, optionally setting `CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1` and adding `shell-integration-features = no-title` to your ghostty config (both with backups). Skips cleanly when Ghostty is absent. Prompts read from `/dev/tty` and fall back to defaults with no terminal, so piped/CI installs never hang.
+- Prints next-step instructions for TCC prompts (Automation on first jump; Notifications when first enabled)
 
 ### Uninstall
 
@@ -156,28 +166,37 @@ Run `./build.sh` once. From then on the app sits in your menu/dock and the float
 
 ### Window behavior
 
-- **Floating** (`.windowLevel = .floating`) — stays above non-floating windows
-- **Visible on all Spaces** (`canJoinAllSpaces` collection behavior)
-- **Movable by background** — drag from anywhere in the window
-- Standard traffic-light buttons: minimize, close, zoom
+- **Main window** is a regular, normal-level window — movable by background, standard traffic-light buttons, lives in its own Space like any app window.
+- **Bubbles overlay** is the always-on-top one: a separate non-activating, click-through panel (`canJoinAllSpaces` + `fullScreenAuxiliary`, screen-saver level) that floats over other apps including fullscreen Spaces. Toggle it with the header button or `⌥⌘B`. The two coexist.
 - **Spotlight-launchable** — installer symlinks `AgentMonitor.app` into `~/Applications`, so `Cmd+Space → "Agent Monitor"` works
 - **Custom dock/Spotlight icon** generated from `assets/icon.png` on every build (auto-padded to square + scaled to all 10 required iconset sizes)
 
 ### Header bar
 
+Trimmed to the essentials — everything configurable now lives in the Settings page (⚙️).
+
 | Icon | Function |
 |---|---|
 | Count badge | Total agents in the list |
-| ✨ sparkles | Toggle AI title + live-status generation (saves tokens when off) |
-| 🔔 bell | Toggle push notifications to phone (disabled if jsplayground not configured) |
-| 🔊 / 🔇 speaker | Mute / unmute transition sounds |
+| ▦ grid | Toggle the bubbles overlay (`⌥⌘B`) |
+| 📊 chart | Toggle the stats overlay |
+| ⚙️ gear | Open the **Settings** page |
 | ↻ arrow | Force reload from `agents.jsonl` |
+
+### Settings page (⚙️)
+
+A grouped overlay with independent sections:
+
+- **Bubbles** — show overlay · include inactive sessions · corner picker
+- **Notifications** — sound alerts · macOS banners · push to phone (auto-disabled with a hint when the jsplayground MCP isn't configured)
+- **AI** — toggle AI session-title generation (tags are generated on demand via ✨ when naming an agent)
+- **Shortcuts** — reference list; jump shortcuts (`⌥1…9`, `` ⌥` ``) are shown only when Ghostty is detected
 
 ### Per-row interaction
 
 - **Hover** — row highlights, X button becomes opaque
 - **Click X** — appends a `cleared` event, removes the agent
-- **Right-click** — context menu: *Dismiss session* / *Copy session ID*
+- **Right-click** — context menu: *Name this agent…* (manual or ✨ AI tag) / *Clear name* / *Dismiss session* / *Copy session ID*
 
 ---
 
@@ -499,7 +518,7 @@ static let summaryCharCap     = 1200                // truncate auto-summary if 
 - **Persistent settings** — sound mute and AI toggle reset on every app launch (not saved to UserDefaults). Could add ~10 LOC.
 - **Instant interrupt detection** — no clean way without Anthropic adding an Interrupt hook. The `.away` heuristic is the best we can do externally.
 - **Window position persistence** — opens at the same place each launch.
-- **Code signing / notarization** — local personal app only.
+- **Notarization / distribution signing** — local personal app. `install.sh` *does* create a self-signed code-signing identity (so macOS notification + Automation grants persist across rebuilds; `build.sh` falls back to ad-hoc if absent), but the app isn't notarized for distribution to others.
 - **Log rotation** — `agents.jsonl` grows forever. Manual: `: > ~/.claude/agents.jsonl` to truncate.
 - **Session resumption tracking** — when an `.away` agent's transcript starts updating, it flips back to `.running` automatically, but the timer reflects total elapsed since `started` (including the away gap).
 
@@ -508,7 +527,7 @@ static let summaryCharCap     = 1200                // truncate auto-summary if 
 ## Caveats
 
 - **macOS TCC may prompt for Full Disk Access** the first time the app reads transcripts. Granting helps with AI titles; denying just disables them.
-- **Photo Library / Desktop prompts** can fire even though we don't touch them — false positives from macOS being aggressive about unsigned apps. Click *Don't Allow* every time; the app keeps working.
+- **Photo Library / Desktop prompts** can fire even though we don't touch them — false positives from macOS being aggressive about locally-signed apps. Click *Don't Allow* every time; the app keeps working.
 - **AI generation depends on `claude` CLI being authed.** If `claude -p` fails (network, auth), titles silently don't update; check `~/.claude/agent-monitor-debug.log`.
 - **Non-Anthropic Claude Code clients are not supported** — the hook payload format and transcript schema are specific to Claude Code.
 

@@ -1,6 +1,8 @@
 import SwiftUI
 import AppKit
 import Combine
+import Carbon.HIToolbox
+import UserNotifications
 
 // MARK: - Shared ISO8601 formatter
 
@@ -44,6 +46,9 @@ struct AgentEvent: Codable {
     // top-level session that spawned it.
     var agentType: String? = nil
     var parentSessionId: String? = nil
+    // Stable Ghostty terminal id, captured by the hook from the focused terminal
+    // at SessionStart / UserPromptSubmit (when the user is in that exact tab).
+    var terminalId: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case event
@@ -54,6 +59,7 @@ struct AgentEvent: Codable {
         case transcriptPath = "transcript_path"
         case agentType = "agent_type"
         case parentSessionId = "parent_session_id"
+        case terminalId = "terminal_id"
     }
 }
 
@@ -86,6 +92,8 @@ struct Agent: Identifiable {
     // parent in the list. Both nil for top-level sessions.
     var agentType: String? = nil
     var parentSessionId: String? = nil
+    // Authoritative Ghostty terminal id, reported by the hook (overrides heuristics).
+    var terminalId: String? = nil
     // Runtime tracking: ticks while .running, frozen when .needsAttention or .stopped
     var accumulatedSeconds: Double = 0
     var runStartedAt: Date? = nil
@@ -460,6 +468,71 @@ final class PushNotifier: ObservableObject {
     }
 }
 
+// MARK: - Native macOS notifications (Notification Center banners)
+
+/// Posts local UNUserNotification banners on the same transitions the push
+/// notifier fires on. Requires the .app to be (ad-hoc) code-signed — the OS
+/// won't grant notification authorization to an unsigned bundle.
+@MainActor
+final class LocalNotifier: NSObject, ObservableObject, UNUserNotificationCenterDelegate {
+    @Published var enabled: Bool {
+        didSet {
+            UserDefaults.standard.set(enabled, forKey: "agentMonitor.nativeNotifyEnabled")
+            if enabled { requestAuthorization() }
+        }
+    }
+
+    override init() {
+        self.enabled = UserDefaults.standard.bool(forKey: "agentMonitor.nativeNotifyEnabled")
+        super.init()
+        UNUserNotificationCenter.current().delegate = self
+    }
+
+    func requestAuthorization() {
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, err in
+            Self.log("requestAuthorization granted=\(granted) err=\(err.map { "\($0)" } ?? "nil")")
+        }
+    }
+
+    func notify(title: String, body: String) {
+        guard enabled else { Self.log("notify skipped (toggle off): \(title)"); return }
+        deliver(title: title, body: body, sound: false, tag: "event")
+    }
+
+    /// On-demand test from Settings — always fires (ignores the toggle) and logs
+    /// the current notification settings so we can see exactly what macOS allows.
+    func sendTest() {
+        deliver(title: "Agent Monitor", body: "Test notification — if you see this, banners work.",
+                sound: true, tag: "test")
+    }
+
+    private func deliver(title: String, body: String, sound: Bool, tag: String) {
+        let center = UNUserNotificationCenter.current()
+        center.getNotificationSettings { s in
+            Self.log("\(tag): auth=\(s.authorizationStatus.rawValue) alert=\(s.alertSetting.rawValue) center=\(s.notificationCenterSetting.rawValue) lock=\(s.lockScreenSetting.rawValue)")
+        }
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        if sound { content.sound = .default }
+        let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        center.add(req) { err in
+            Self.log("\(tag) add: \(err.map { "ERROR \($0)" } ?? "ok") — \(title)")
+        }
+    }
+
+    nonisolated static func log(_ m: String) { PushNotifier.debugLog("native: \(m)") }
+
+    // Show banners even when Agent Monitor is the frontmost app.
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([.banner])
+    }
+}
+
 // MARK: - Shared `claude -p` runner
 
 enum ClaudeP {
@@ -622,6 +695,45 @@ final class TranscriptReader {
         let info = buildInfo(from: state, lastModified: date)
         cache[path] = CacheEntry(mtime: mtime, state: state, info: info)
         return info
+    }
+
+    /// Reads the ENTIRE transcript fresh (bypassing the incremental ~102-turn
+    /// cap) and returns as much conversation as fits in `maxChars` — every
+    /// user/assistant *text* turn plus the auto-summary. Tool dumps are excluded
+    /// (extractText only pulls message text). Drops the middle if oversized.
+    /// On-demand only (tag generation), so the full re-read is fine.
+    func fullContext(path: String, maxChars: Int = 120_000) -> String {
+        guard !path.isEmpty,
+              let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else { return "" }
+        var turns: [(role: String, text: String)] = []
+        var summary: String?
+        for lineData in data.split(separator: 0x0A, omittingEmptySubsequences: true) {
+            guard let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] else { continue }
+            switch obj["type"] as? String ?? "" {
+            case "user":
+                if (obj["isMeta"] as? Bool) == true { break }
+                if let txt = extractText(obj["message"]) { turns.append(("User", txt)) }
+            case "assistant":
+                if let txt = extractText(obj["message"]) { turns.append(("Assistant", txt)) }
+            case "summary":
+                if let s = obj["summary"] as? String, !s.isEmpty { summary = s }
+            default: break
+            }
+        }
+        func trim(_ s: String, _ cap: Int) -> String {
+            s.count <= cap ? s : String(s[..<s.index(s.startIndex, offsetBy: cap)]) + "…"
+        }
+        var lines: [String] = []
+        if let s = summary { lines.append("Auto-summary:"); lines.append(trim(s, 2500)); lines.append("") }
+        for t in turns { lines.append("\(t.role): \(trim(t.text, 2500))") }
+        var joined = lines.joined(separator: "\n")
+        if joined.count > maxChars {
+            let half = maxChars / 2
+            let headEnd = joined.index(joined.startIndex, offsetBy: half)
+            let tailStart = joined.index(joined.endIndex, offsetBy: -half)
+            joined = String(joined[..<headEnd]) + "\n\n[… middle omitted …]\n\n" + String(joined[tailStart...])
+        }
+        return joined
     }
 
     /// Reads the bytes appended past `state.offset` and folds the new complete
@@ -921,11 +1033,188 @@ final class LiveStatusGenerator {
     }
 }
 
+// MARK: - Floating bubbles overlay placement
+
+enum BubbleCorner: CaseIterable, Identifiable {
+    case topLeft, topRight, bottomLeft, bottomRight
+
+    var id: Self { self }
+
+    var label: String {
+        switch self {
+        case .topLeft:     return "Top left"
+        case .topRight:    return "Top right"
+        case .bottomLeft:  return "Bottom left"
+        case .bottomRight: return "Bottom right"
+        }
+    }
+
+    var alignment: Alignment {
+        switch self {
+        case .topLeft:     return .topLeading
+        case .topRight:    return .topTrailing
+        case .bottomLeft:  return .bottomLeading
+        case .bottomRight: return .bottomTrailing
+        }
+    }
+
+    var horizontalAlignment: HorizontalAlignment {
+        switch self {
+        case .topLeft, .bottomLeft:   return .leading
+        case .topRight, .bottomRight: return .trailing
+        }
+    }
+}
+
 // MARK: - Store
 
 @MainActor
 final class AgentStore: ObservableObject {
     @Published var agents: [Agent] = []
+    // Floating-bubbles overlay: a separate always-on-top, click-through window
+    // that coexists with the regular (normal-level) main window.
+    @Published var bubblesVisible: Bool = false
+    @Published var bubbleCorner: BubbleCorner = .topRight
+    // "Expand": also show inactive sessions in the overlay (dimmed + smaller).
+    @Published var showInactive: Bool = false
+    // User-assigned display names (per session). Shown in the bubble + main
+    // window only — the Ghostty tab title is left alone. Persisted.
+    @Published private(set) var customNames: [String: String] = [:]
+
+    func customName(for id: String) -> String? {
+        guard let n = customNames[id], !n.isEmpty else { return nil }
+        return n
+    }
+
+    func setCustomName(_ name: String?, for id: String) {
+        let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if trimmed.isEmpty { customNames.removeValue(forKey: id) }
+        else { customNames[id] = trimmed }
+        persistCustomNames()
+    }
+
+    /// Asks Haiku for a short identifier-style tag (1-3 words) describing the
+    /// agent, from its task/transcript context. Returns nil on failure.
+    func generateTag(for agent: Agent) async -> String? {
+        // Send as much context as possible: the full conversation transcript,
+        // plus a couple of headers for quick orientation.
+        var ctx = ""
+        ctx += "Project: \((agent.cwd as NSString?)?.lastPathComponent ?? "unknown")\n"
+        if let g = agent.generatedTitle, !g.isEmpty { ctx += "Working title: \(g)\n" }
+        ctx += "\n"
+        if let path = agent.transcriptPath, !path.isEmpty {
+            ctx += transcriptReader.fullContext(path: path)
+        } else {
+            if let t = agent.initialTask, !t.isEmpty { ctx += "Initial task: \(t)\n" }
+            if let s = agent.latestSummary, !s.isEmpty { ctx += "Recent summary: \(s)\n" }
+        }
+        let ctxCopy = ctx
+        return await Task.detached(priority: .userInitiated) {
+            Self.runTagClaude(context: ctxCopy)
+        }.value
+    }
+
+    nonisolated private static func runTagClaude(context: String) -> String? {
+        let systemPrompt = """
+        You are a tag generator. You output ONLY a short tag and nothing else — \
+        no explanation, no quotes, no punctuation. You never use tools.
+        """
+        let prompt = """
+        From the agent session context below, produce a SHORT TAG that identifies \
+        this session at a glance — like a label or nickname, not a sentence.
+
+        Rules:
+        - 1 to 3 words MAX (prefer 1 or 2).
+        - Name the concrete thing being worked on (feature/area/file), not generic \
+          words like "task", "work", "session", "fix".
+        - Lowercase, words separated by single spaces. No punctuation, no quotes.
+
+        Output exactly the tag on one line.
+
+        --- CONTEXT ---
+        \(context)
+        --- END ---
+        """
+        guard let raw = ClaudeP.run(prompt: prompt, systemPrompt: systemPrompt),
+              let phrase = ClaudeP.sanitizeShortPhrase(raw) else { return nil }
+        // Hard-cap to 3 words.
+        return phrase.split(separator: " ").prefix(3).joined(separator: " ")
+    }
+
+    func toggleBubbles() {
+        bubblesVisible.toggle()
+    }
+
+    /// Expand/collapse inactive sessions in the overlay. Turning it on also
+    /// shows the overlay so the hotkey is useful from anywhere.
+    func toggleInactive() {
+        showInactive.toggle()
+        if showInactive { bubblesVisible = true }
+    }
+
+    func cycleBubbleCorner() {
+        // Showing the overlay if hidden, so the hotkey is useful from anywhere.
+        if !bubblesVisible { bubblesVisible = true }
+        let all = BubbleCorner.allCases
+        let i = all.firstIndex(of: bubbleCorner) ?? 0
+        bubbleCorner = all[(i + 1) % all.count]
+    }
+
+    // ── Jump-to-session ──
+    // The ordered list shown in the bubbles overlay. The hotkeys (⌥1…9) and
+    // the bubble number badges both index into THIS exact ordering, so the
+    // number you see is the key you press.
+    var bubbleAgents: [Agent] {
+        agents
+            .filter { showInactive || $0.status != .inactive }
+            .sorted { a, b in
+                let pa = bubblePriority(a.status), pb = bubblePriority(b.status)
+                if pa != pb { return pa < pb }
+                return a.firstSeen < b.firstSeen
+            }
+    }
+
+    private var cycleCursor = 0
+
+    func focusBubble(at index: Int) {
+        let list = bubbleAgents
+        guard index >= 0, index < list.count else { return }
+        focus(agent: list[index])
+    }
+
+    /// ⌥` — bounce to the next session, wrapping around (mirrors ⌘` window cycle).
+    func focusNextSession() {
+        let list = bubbleAgents
+        guard !list.isEmpty else { return }
+        if cycleCursor >= list.count { cycleCursor = 0 }
+        let agent = list[cycleCursor]
+        cycleCursor = (cycleCursor + 1) % list.count
+        focus(agent: agent)
+    }
+
+    func focus(agent: Agent) {
+        guard let cwd = agent.cwd, !cwd.isEmpty else { return }
+        // Subagents share the parent's terminal. Prefer the hook-reported id
+        // (authoritative), then the heuristic map, then occurrence-th tab.
+        let key = agent.parentSessionId ?? agent.id
+        let tid = agent.terminalId ?? parentTerminalId(of: agent) ?? sessionTerminal[key]
+        Ghostty.focus(terminalId: tid, cwd: cwd, occurrence: agent.siblingIndex ?? 1)
+    }
+
+    private func parentTerminalId(of agent: Agent) -> String? {
+        guard let pid = agent.parentSessionId else { return nil }
+        return agents.first(where: { $0.id == pid })?.terminalId
+    }
+
+    // ── Ghostty session↔terminal mapping ──
+    // sessionId → stable Ghostty terminal id. Locked when a session first
+    // appears (usually unambiguous: one new session + one new terminal in a
+    // cwd) and persisted so app restarts don't re-derive it.
+    private var sessionTerminal: [String: String] = [:]
+    private var appliedTitles: [String: String] = [:]   // terminal id → last title we set
+    private var knownTerminalIds: Set<String> = []       // to detect newly-opened tabs
+    private var lastGhosttyReconcile: Date = .distantPast
+
     @Published var stats: StatsBundle = .empty
     @Published var statsOverlayOpen: Bool = false {
         didSet {
@@ -946,11 +1235,14 @@ final class AgentStore: ObservableObject {
             }
         }
     }
+    @Published var settingsOverlayOpen: Bool = false
     @Published var fileURL: URL
     @Published var soundEnabled: Bool = true
     @Published var titleGenerationEnabled: Bool = true
     @Published var pushNotifier = PushNotifier()
+    @Published var localNotifier = LocalNotifier()
 
+    private var cancellables: Set<AnyCancellable> = []
     private var fileSource: DispatchSourceFileSystemObject?
     private var previousStatuses: [String: AgentStatus] = [:]
     private var hasLoadedInitial = false
@@ -995,9 +1287,139 @@ final class AgentStore: ObservableObject {
         liveStatusGenerator.onUpdated = { [weak self] _, _ in
             self?.rebuildView()
         }
+        // Forward the nested notifier's published changes so toolbar toggles
+        // re-render (nested ObservableObjects don't propagate automatically).
+        localNotifier.objectWillChange
+            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .store(in: &cancellables)
+        loadGhosttyMap()
+        loadCustomNames()
         ingestAgentsFile()
         rebuildView()
         startWatching()
+    }
+
+    private var ghosttyMapURL: URL {
+        fileURL.deletingLastPathComponent().appendingPathComponent("agent-monitor-ghostty-map.json")
+    }
+
+    private var customNamesURL: URL {
+        fileURL.deletingLastPathComponent().appendingPathComponent("agent-monitor-names.json")
+    }
+
+    private func loadCustomNames() {
+        guard let data = try? Data(contentsOf: customNamesURL),
+              let m = try? JSONDecoder().decode([String: String].self, from: data) else { return }
+        customNames = m
+    }
+
+    private func persistCustomNames() {
+        if let data = try? JSONEncoder().encode(customNames) {
+            try? data.write(to: customNamesURL)
+        }
+    }
+
+    private func loadGhosttyMap() {
+        guard let data = try? Data(contentsOf: ghosttyMapURL),
+              let m = try? JSONDecoder().decode([String: String].self, from: data) else { return }
+        sessionTerminal = m
+    }
+
+    private func persistGhosttyMap() {
+        if let data = try? JSONEncoder().encode(sessionTerminal) {
+            try? data.write(to: ghosttyMapURL)
+        }
+    }
+
+    /// Locks live sessions to their Ghostty terminal id and pushes "project #N"
+    /// titles. Cheap-exits unless there's a session to map or a title to update;
+    /// throttled so a session that never matches a Ghostty tab can't spin.
+    private func reconcileGhostty() {
+        guard Ghostty.isInstalled else { return }
+        let live = agents.filter { $0.parentSessionId == nil && $0.status != .inactive }
+        let liveIds = Set(live.map(\.id))
+        var desiredTitle: [String: String] = [:]
+        for a in live { desiredTitle[a.id] = a.bubbleTitle }
+
+        // Prune dead sessions from the map.
+        for sid in sessionTerminal.keys where !liveIds.contains(sid) {
+            sessionTerminal.removeValue(forKey: sid)
+        }
+
+        // Apply hook-reported terminal ids (authoritative). Corrects mis-mappings
+        // and evicts any other session wrongly holding the same terminal.
+        for a in live {
+            guard let tid = a.terminalId, !tid.isEmpty, sessionTerminal[a.id] != tid else { continue }
+            for (sid, t) in sessionTerminal where t == tid && sid != a.id {
+                sessionTerminal.removeValue(forKey: sid)
+            }
+            if let old = sessionTerminal[a.id] { appliedTitles.removeValue(forKey: old) }
+            appliedTitles.removeValue(forKey: tid)   // force re-title of the correct tab
+            sessionTerminal[a.id] = tid
+        }
+
+        let needMapping = live.contains { sessionTerminal[$0.id] == nil && !($0.cwd ?? "").isEmpty }
+        let titleWork = live.contains { a in
+            guard let tid = sessionTerminal[a.id] else { return false }
+            return appliedTitles[tid] != desiredTitle[a.id]
+        }
+        guard needMapping || titleWork else { return }
+
+        let now = Date()
+        guard now.timeIntervalSince(lastGhosttyReconcile) >= 1.5 else { return }
+        lastGhosttyReconcile = now
+
+        let terminals = Ghostty.listTerminals()
+        guard !terminals.isEmpty else { return }
+        let existingIds = Set(terminals.map(\.id))
+
+        // Drop mappings whose terminal vanished (e.g. tab/Ghostty closed).
+        for (sid, tid) in sessionTerminal where !existingIds.contains(tid) {
+            sessionTerminal.removeValue(forKey: sid)
+            appliedTitles.removeValue(forKey: tid)
+        }
+
+        // Map unmapped sessions to free terminals by cwd. Prefer a terminal that
+        // newly appeared since the last reconcile (the tab the user just opened
+        // for this session) — that's the precise, unambiguous signal. Only when
+        // no new tab is identifiable do we fall back to firstSeen ↔ tab order
+        // (cold start). `knownTerminalIds` empty on the very first pass, so the
+        // first reconcile is treated as cold start, not "everything is new".
+        let coldStart = knownTerminalIds.isEmpty
+        let mappedTids = Set(sessionTerminal.values)
+        var freshByCwd: [String: [String]] = [:]   // newly-appeared free tabs
+        var oldByCwd: [String: [String]] = [:]      // pre-existing free tabs
+        for t in terminals where !mappedTids.contains(t.id) {
+            if !coldStart && !knownTerminalIds.contains(t.id) {
+                freshByCwd[t.cwd, default: []].append(t.id)
+            } else {
+                oldByCwd[t.cwd, default: []].append(t.id)
+            }
+        }
+        for a in live.filter({ sessionTerminal[$0.id] == nil }).sorted(by: { $0.firstSeen < $1.firstSeen }) {
+            guard let cwd = a.cwd, !cwd.isEmpty else { continue }
+            if var fresh = freshByCwd[cwd], !fresh.isEmpty {
+                sessionTerminal[a.id] = fresh.removeFirst()
+                freshByCwd[cwd] = fresh
+            } else if var old = oldByCwd[cwd], !old.isEmpty {
+                sessionTerminal[a.id] = old.removeFirst()
+                oldByCwd[cwd] = old
+            }
+        }
+        knownTerminalIds = existingIds
+
+        // Apply changed titles in one pass.
+        var toSet: [String: String] = [:]
+        for a in live {
+            guard let tid = sessionTerminal[a.id], let title = desiredTitle[a.id] else { continue }
+            if appliedTitles[tid] != title {
+                toSet[tid] = title
+                appliedTitles[tid] = title
+            }
+        }
+        if !toSet.isEmpty { Ghostty.setTitles(toSet) }
+
+        persistGhosttyMap()
     }
 
     private func ensureFileExists() {
@@ -1093,6 +1515,7 @@ final class AgentStore: ObservableObject {
         if statsOverlayOpen { recomputeStats() }
         reconcileTranscriptWatchers(newAgents)
         rescheduleDeadline(newAgents)
+        reconcileGhostty()
     }
 
     /// Full-history stats pass. Deliberately reads the entire log — only ever
@@ -1325,20 +1748,17 @@ final class AgentStore: ObservableObject {
         switch new {
         case .needsAttention:
             let msg = agent.lastMessage ?? (detail.isEmpty ? "Permission required" : detail)
-            pushNotifier.send(
-                title: "🟠 \(project) needs attention",
-                message: msg,
-                category: "urgent"
-            )
+            let title = "🟠 \(project) needs attention"
+            pushNotifier.send(title: title, message: msg, category: "urgent")
+            localNotifier.notify(title: title, body: msg)
         case .idle:
             // Only on real turn-completion (running/away/needsAttention → idle).
             // Skip nil → idle (new session) and inactive → idle (we don't currently re-enter idle from inactive).
             guard old == .running || old == .away || old == .needsAttention else { return }
-            pushNotifier.send(
-                title: "🔵 \(project) idle",
-                message: detail.isEmpty ? "Turn complete" : detail,
-                category: "urgent"
-            )
+            let title = "🔵 \(project) idle"
+            let body = detail.isEmpty ? "Turn complete" : detail
+            pushNotifier.send(title: title, message: body, category: "urgent")
+            localNotifier.notify(title: title, body: body)
         default:
             return
         }
@@ -1387,6 +1807,15 @@ final class AgentStore: ObservableObject {
 
     private func apply(_ rec: AgentEvent, into byId: inout [String: Agent]) {
         let recDate = Self.iso8601.date(from: rec.ts) ?? Date()
+
+        defer {
+            // Whenever the hook reports the focused terminal id, trust it — this
+            // corrects any earlier mis-mapping the moment the user acts in the tab.
+            if let tid = rec.terminalId, !tid.isEmpty, var a = byId[rec.sessionId] {
+                a.terminalId = tid
+                byId[rec.sessionId] = a
+            }
+        }
 
         switch rec.event {
         case .idle:
@@ -1672,9 +2101,15 @@ struct ContentView: View {
                     .background(.regularMaterial)
                     .transition(.opacity)
             }
+            if store.settingsOverlayOpen {
+                SettingsView()
+                    .background(.regularMaterial)
+                    .transition(.opacity)
+            }
         }
         .frame(minWidth: 520, minHeight: 260)
         .animation(.easeInOut(duration: 0.18), value: store.statsOverlayOpen)
+        .animation(.easeInOut(duration: 0.18), value: store.settingsOverlayOpen)
     }
 
     private func column(title: String, agents: [Agent]) -> some View {
@@ -1731,6 +2166,15 @@ struct ContentView: View {
                 .padding(.vertical, 2)
                 .background(Capsule().fill(.secondary.opacity(0.15)))
             Button {
+                store.toggleBubbles()
+            } label: {
+                Image(systemName: store.bubblesVisible ? "circle.grid.2x2.fill" : "circle.grid.2x2")
+                    .foregroundStyle(store.bubblesVisible ? Color.accentColor : Color.secondary)
+            }
+            .buttonStyle(.borderless)
+            .help("Toggle bubbles overlay (⌥⌘B)")
+
+            Button {
                 store.statsOverlayOpen.toggle()
             } label: {
                 Image(systemName: "chart.bar.xaxis")
@@ -1740,34 +2184,14 @@ struct ContentView: View {
             .help(store.statsOverlayOpen ? "Close stats" : "Open stats")
 
             Button {
-                store.titleGenerationEnabled.toggle()
+                store.settingsOverlayOpen.toggle()
             } label: {
-                Image(systemName: "sparkles")
-                    .foregroundStyle(store.titleGenerationEnabled ? Color.accentColor : Color.secondary)
-                    .opacity(store.titleGenerationEnabled ? 1.0 : 0.4)
+                Image(systemName: "gearshape")
+                    .foregroundStyle(store.settingsOverlayOpen ? Color.accentColor : Color.secondary)
             }
             .buttonStyle(.borderless)
-            .help(store.titleGenerationEnabled
-                  ? "Disable AI-generated titles (saves tokens)"
-                  : "Enable AI-generated titles (uses Claude Haiku)")
+            .help(store.settingsOverlayOpen ? "Close settings" : "Settings")
 
-            Button {
-                store.pushNotifier.enabled.toggle()
-            } label: {
-                Image(systemName: store.pushNotifier.enabled ? "bell.badge.fill" : "bell")
-                    .foregroundStyle(pushIconColor)
-                    .opacity(pushIconOpacity)
-            }
-            .buttonStyle(.borderless)
-            .disabled(!store.pushNotifier.isAvailable)
-            .help(pushHelpText)
-            Button {
-                store.soundEnabled.toggle()
-            } label: {
-                Image(systemName: store.soundEnabled ? "speaker.wave.2" : "speaker.slash")
-            }
-            .buttonStyle(.borderless)
-            .help(store.soundEnabled ? "Mute sounds" : "Unmute sounds")
             Button {
                 store.reload()
             } label: {
@@ -1779,25 +2203,6 @@ struct ContentView: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .background(.ultraThinMaterial)
-    }
-
-    private var pushIconColor: Color {
-        if !store.pushNotifier.isAvailable { return .secondary }
-        return store.pushNotifier.enabled ? Color.accentColor : Color.secondary
-    }
-
-    private var pushIconOpacity: Double {
-        if !store.pushNotifier.isAvailable { return 0.3 }
-        return store.pushNotifier.enabled ? 1.0 : 0.4
-    }
-
-    private var pushHelpText: String {
-        if !store.pushNotifier.isAvailable {
-            return "Push disabled — configure jsplayground MCP in ~/.claude.json to enable"
-        }
-        return store.pushNotifier.enabled
-            ? "Disable push notifications on .needsAttention / turn end"
-            : "Enable push notifications on .needsAttention / turn end"
     }
 
     private var emptyState: some View {
@@ -1836,6 +2241,9 @@ struct AgentRow: View {
     @EnvironmentObject var store: AgentStore
     let agent: Agent
     @State private var hovering = false
+    @State private var showRename = false
+    @State private var nameDraft = ""
+    @State private var isGenerating = false
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
@@ -1846,10 +2254,17 @@ struct AgentRow: View {
                 .shadow(color: statusColor.opacity(0.6), radius: 3)
 
             VStack(alignment: .leading, spacing: 3) {
-                Text(displayName)
-                    .font(.system(.body, design: .monospaced))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                HStack(spacing: 5) {
+                    if customName != nil {
+                        Image(systemName: "tag.fill")
+                            .font(.caption2)
+                            .foregroundStyle(.tint)
+                    }
+                    rowTitleText
+                        .font(.system(.body, design: .monospaced))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
 
                 HStack(spacing: 6) {
                     durationLabel
@@ -1890,12 +2305,80 @@ struct AgentRow: View {
         .background(hovering ? Color.primary.opacity(0.04) : Color.clear)
         .onHover { hovering = $0 }
         .contextMenu {
+            Button(customName == nil ? "Name this agent…" : "Rename…") {
+                nameDraft = customName ?? ""
+                showRename = true
+            }
+            if customName != nil {
+                Button("Clear name") { store.setCustomName(nil, for: agent.id) }
+            }
+            Divider()
             Button("Dismiss session") { store.dismiss(agent.id) }
             Button("Copy session ID") {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(agent.id, forType: .string)
             }
         }
+        .popover(isPresented: $showRename, arrowEdge: .leading) {
+            renamePopover
+        }
+    }
+
+    private var renamePopover: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Tag this agent")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+            HStack(spacing: 6) {
+                TextField("tag", text: $nameDraft)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 170)
+                    .onSubmit { saveRename() }
+                Button {
+                    Task { await generateTag() }
+                } label: {
+                    if isGenerating {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Image(systemName: "sparkles").foregroundStyle(.tint)
+                    }
+                }
+                .buttonStyle(.borderless)
+                .disabled(isGenerating)
+                .help("Auto-generate a tag with AI (Haiku)")
+            }
+            HStack {
+                Spacer()
+                Button("Cancel") { showRename = false }
+                Button("Save") { saveRename() }
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(12)
+        .frame(width: 250)
+    }
+
+    private func saveRename() {
+        store.setCustomName(nameDraft, for: agent.id)
+        showRename = false
+    }
+
+    private func generateTag() async {
+        isGenerating = true
+        let tag = await store.generateTag(for: agent)
+        isGenerating = false
+        if let tag = tag, !tag.isEmpty { nameDraft = tag }
+    }
+
+    private var customName: String? { store.customName(for: agent.id) }
+
+    // Tag name (if any) followed by the project label as dimmed context.
+    private var rowTitleText: Text {
+        if let customName, !customName.isEmpty {
+            return Text(customName)
+                 + Text("  ·  \(displayName)").foregroundColor(.primary.opacity(0.65))
+        }
+        return Text(displayName)
     }
 
     private var subtitle: String? {
@@ -1979,6 +2462,98 @@ struct AgentRow: View {
         case .idle:           return .blue
         case .inactive:       return .gray
         }
+    }
+}
+
+// MARK: - Settings overlay
+
+struct SettingsView: View {
+    @EnvironmentObject var store: AgentStore
+
+    private var nativeBanners: Binding<Bool> {
+        Binding(get: { store.localNotifier.enabled },
+                set: { store.localNotifier.enabled = $0 })
+    }
+    private var pushEnabled: Binding<Bool> {
+        Binding(get: { store.pushNotifier.enabled },
+                set: { store.pushNotifier.enabled = $0 })
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+            Divider()
+            Form {
+                Section("Bubbles") {
+                    Toggle("Show bubbles overlay", isOn: $store.bubblesVisible)
+                    Toggle("Include inactive sessions", isOn: $store.showInactive)
+                    Picker("Corner", selection: $store.bubbleCorner) {
+                        ForEach(BubbleCorner.allCases) { Text($0.label).tag($0) }
+                    }
+                }
+
+                Section("Notifications") {
+                    Toggle("Sound alerts", isOn: $store.soundEnabled)
+                    Toggle("macOS banners", isOn: nativeBanners)
+                    Toggle("Push to phone", isOn: pushEnabled)
+                        .disabled(!store.pushNotifier.isAvailable)
+                    if !store.pushNotifier.isAvailable {
+                        Text("Push needs the jsplayground MCP configured in ~/.claude.json")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Button("Send test banner") { store.localNotifier.sendTest() }
+                        .help("Fires a macOS banner now to verify delivery")
+                }
+
+                Section("AI") {
+                    Toggle("Generate session titles (Haiku)", isOn: $store.titleGenerationEnabled)
+                    Text("Tags are generated on demand via the ✨ button when you name an agent.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+
+                Section("Shortcuts") {
+                    shortcut("⌥⌘B", "Toggle bubbles overlay")
+                    shortcut("⌥⌘C", "Move overlay to next corner")
+                    shortcut("⌥⌘E", "Expand / collapse inactive")
+                    if Ghostty.isInstalled {
+                        shortcut("⌥1…9", "Jump to that bubble's Ghostty tab")
+                        shortcut("⌥`", "Cycle to next session")
+                    } else {
+                        Text("Jump shortcuts (⌥1…9, ⌥`) require Ghostty — not detected.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .formStyle(.grouped)
+        }
+    }
+
+    private func shortcut(_ keys: String, _ desc: String) -> some View {
+        HStack {
+            Text(desc)
+            Spacer()
+            Text(keys)
+                .font(.caption.monospaced())
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var header: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "gearshape").foregroundStyle(.tint)
+            Text("Settings").font(.headline)
+            Spacer()
+            Button {
+                store.settingsOverlayOpen = false
+            } label: {
+                Image(systemName: "xmark.circle.fill").foregroundStyle(.tertiary)
+            }
+            .buttonStyle(.borderless)
+            .help("Close settings")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(.ultraThinMaterial)
     }
 }
 
@@ -2201,42 +2776,510 @@ struct StatsView: View {
     }
 }
 
-// MARK: - Window setup (always on top, all spaces, movable by background)
+// MARK: - Shared status presentation helpers
 
-struct WindowAccessor: NSViewRepresentable {
-    let configure: (NSWindow) -> Void
+func statusColor(_ s: AgentStatus) -> Color {
+    switch s {
+    case .running:        return .green
+    case .away:           return .yellow
+    case .needsAttention: return .orange
+    case .idle:           return .blue
+    case .inactive:       return .gray
+    }
+}
 
-    func makeNSView(context: Context) -> NSView {
-        let view = NSView()
-        DispatchQueue.main.async {
-            if let win = view.window {
-                configure(win)
-            }
+/// Sort/visibility priority for the bubbles overlay (most urgent first).
+func bubblePriority(_ s: AgentStatus) -> Int {
+    switch s {
+    case .needsAttention: return 0
+    case .running:        return 1
+    case .away:           return 2
+    case .idle:           return 3
+    case .inactive:       return 4
+    }
+}
+
+func formatClock(_ seconds: Double) -> String {
+    let total = max(0, Int(seconds))
+    let h = total / 3600
+    let m = (total % 3600) / 60
+    let s = total % 60
+    if h > 0 { return String(format: "%d:%02d:%02d", h, m, s) }
+    return String(format: "%d:%02d", m, s)
+}
+
+extension Agent {
+    /// One-line label for a bubble: the project (cwd) name plus its sibling
+    /// number, with a subagent-type qualifier when present.
+    var bubbleTitle: String {
+        let base: String
+        if let cwd = cwd, !cwd.isEmpty {
+            base = (cwd as NSString).lastPathComponent
+        } else {
+            base = String(id.prefix(8))
         }
-        return view
+        var name = base
+        if let idx = siblingIndex { name = "\(base) #\(idx)" }
+        if let type = agentType, !type.isEmpty { return "\(name) ↳ \(type)" }
+        return name
+    }
+}
+
+// MARK: - Ghostty bridge (AppleScript)
+
+/// Talks to Ghostty over its AppleScript dictionary. Terminals carry a stable
+/// `id`, so once a session is locked to a terminal id, focus + title-setting
+/// are exact regardless of tab order or what else writes the title.
+enum Ghostty {
+    /// Whether Ghostty is installed at all. Gates the jump hotkeys, reconcile,
+    /// and title-setting so non-Ghostty users don't lose ⌥-digit keys or run
+    /// pointless AppleScript. Computed once.
+    static let isInstalled: Bool = {
+        NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.mitchellh.ghostty") != nil
+    }()
+
+    private static func runScript(_ source: String) -> String? {
+        var err: NSDictionary?
+        let result = NSAppleScript(source: source)?.executeAndReturnError(&err)
+        if let err = err {
+            // -600 = app not running; not worth logging as an error.
+            if (err[NSAppleScript.errorNumber] as? Int) != -600 {
+                PushNotifier.debugLog("ghostty applescript: \(err)")
+            }
+            return nil
+        }
+        return result?.stringValue
     }
 
-    func updateNSView(_ nsView: NSView, context: Context) {}
+    private static func esc(_ s: String) -> String {
+        s.replacingOccurrences(of: "\\", with: "\\\\")
+         .replacingOccurrences(of: "\"", with: "\\\"")
+    }
+
+    /// Returns (terminalId, cwd) for every tab's focused terminal, in window→tab
+    /// order. Empty if Ghostty isn't running.
+    static func listTerminals() -> [(id: String, cwd: String)] {
+        let script = """
+        tell application "Ghostty"
+            if it is not running then return ""
+            set out to ""
+            repeat with w in windows
+                repeat with tb in tabs of w
+                    try
+                        set t to focused terminal of tb
+                        set out to out & (id of t) & "\\t" & (working directory of t) & "\\n"
+                    end try
+                end repeat
+            end repeat
+            return out
+        end tell
+        """
+        guard let raw = runScript(script), !raw.isEmpty else { return [] }
+        return raw.split(separator: "\n").compactMap { line in
+            let parts = line.components(separatedBy: "\t")
+            guard parts.count == 2 else { return nil }
+            return (id: parts[0], cwd: parts[1])
+        }
+    }
+
+    /// Sets tab titles in one pass: a dictionary of terminalId → title.
+    static func setTitles(_ titles: [String: String]) {
+        guard !titles.isEmpty else { return }
+        var branches = ""
+        for (tid, title) in titles {
+            branches += """
+                if tid is "\(esc(tid))" then perform action "set_surface_title:\(esc(title))" on t
+
+            """
+        }
+        let script = """
+        tell application "Ghostty"
+            if it is not running then return
+            repeat with w in windows
+                repeat with tb in tabs of w
+                    try
+                        set t to focused terminal of tb
+                        set tid to id of t
+        \(branches)
+                    end try
+                end repeat
+            end repeat
+        end tell
+        """
+        _ = runScript(script)
+    }
+
+    /// Focuses a terminal by stable id, falling back to the `occurrence`-th tab
+    /// matching `cwd` if the id isn't found.
+    static func focus(terminalId: String?, cwd: String, occurrence: Int) {
+        let tid = terminalId ?? ""
+        let occ = max(1, occurrence)
+        let script = """
+        tell application "Ghostty"
+            if it is not running then return
+            repeat with w in windows
+                repeat with tb in tabs of w
+                    try
+                        set t to focused terminal of tb
+                        if (id of t) is "\(esc(tid))" then
+                            focus t
+                            activate
+                            return
+                        end if
+                    end try
+                end repeat
+            end repeat
+            set n to 0
+            repeat with w in windows
+                repeat with tb in tabs of w
+                    try
+                        set t to focused terminal of tb
+                        if (working directory of t) is "\(esc(cwd))" then
+                            set n to n + 1
+                            if n is \(occ) then
+                                focus t
+                                activate
+                                return
+                            end if
+                        end if
+                    end try
+                end repeat
+            end repeat
+        end tell
+        """
+        _ = runScript(script)
+    }
+}
+
+// MARK: - Floating bubbles overlay
+
+struct BubblesView: View {
+    @EnvironmentObject var store: AgentStore
+
+    var body: some View {
+        let bubbles = store.bubbleAgents
+        ZStack(alignment: store.bubbleCorner.alignment) {
+            Color.clear
+            VStack(alignment: store.bubbleCorner.horizontalAlignment, spacing: 9) {
+                ForEach(Array(bubbles.enumerated()), id: \.element.id) { idx, agent in
+                    // 1-based number; only the first 9 get a ⌥N hotkey.
+                    BubbleView(agent: agent,
+                               number: idx < 9 ? idx + 1 : nil,
+                               customName: store.customName(for: agent.id))
+                        .transition(.scale(scale: 0.85).combined(with: .opacity))
+                }
+            }
+            .padding(20)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .animation(.spring(response: 0.4, dampingFraction: 0.82), value: store.bubbleCorner)
+        .animation(.easeInOut(duration: 0.25), value: bubbles.map(\.id))
+    }
+}
+
+struct BubbleView: View {
+    let agent: Agent
+    var number: Int? = nil
+    var customName: String? = nil
+    @State private var pulse = false
+
+    private var color: Color { statusColor(agent.status) }
+
+    // Expanded inactive sessions render smaller + dimmer (a quieter tier).
+    private var compact: Bool { agent.status == .inactive }
+    private var dotInner: CGFloat { compact ? 8 : 10 }
+    private var dotOuter: CGFloat { compact ? 13 : 16 }
+
+    // Custom name is a tag; the project label always trails as dimmed context.
+    private var titleText: Text {
+        if let customName, !customName.isEmpty {
+            return Text(customName).foregroundColor(.white)
+                 + Text("  ·  \(agent.bubbleTitle)").foregroundColor(.white.opacity(0.72))
+        }
+        return Text(agent.bubbleTitle).foregroundColor(.white)
+    }
+
+    // Idle and away bubbles read as neutral gray; active states keep their color.
+    private var tint: LinearGradient {
+        let isGray = (agent.status == .idle || agent.status == .away)
+        let colors: [Color] = isGray
+            ? [Color(white: 0.30).opacity(0.9), Color(white: 0.22).opacity(0.9)]
+            : [color.opacity(0.32), color.opacity(0.16)]
+        return LinearGradient(colors: colors, startPoint: .topLeading, endPoint: .bottomTrailing)
+    }
+
+    var body: some View {
+        HStack(spacing: compact ? 7 : 9) {
+            if let number {
+                Text("\(number)")
+                    .font(.system(size: compact ? 9 : 11, weight: .bold, design: .rounded))
+                    .foregroundStyle(.white)
+                    .frame(width: compact ? 15 : 18, height: compact ? 15 : 18)
+                    .background(Circle().fill(Color.white.opacity(0.16)))
+                    .overlay(Circle().strokeBorder(Color.white.opacity(0.5), lineWidth: 1))
+            }
+            dot
+            titleText
+                .font(.system(size: compact ? 11 : 13, weight: .semibold, design: .rounded))
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .frame(maxWidth: compact ? 190 : 230, alignment: .leading)
+            elapsed
+        }
+        .padding(.horizontal, compact ? 10 : 13)
+        .padding(.vertical, compact ? 6 : 9)
+        .background(
+            ZStack {
+                Capsule(style: .continuous).fill(.ultraThinMaterial)
+                Capsule(style: .continuous).fill(tint)
+                Capsule(style: .continuous).strokeBorder(Color.white.opacity(0.85), lineWidth: 1)
+            }
+        )
+        .shadow(color: .black.opacity(0.3), radius: 6, y: 2)
+        .opacity(compact ? 0.55 : 1)
+        .fixedSize()
+    }
+
+    private var dot: some View {
+        ZStack {
+            // Pulsing ring while actively running.
+            if agent.status == .running {
+                Circle()
+                    .stroke(color, lineWidth: 2)
+                    .frame(width: 10, height: 10)
+                    .scaleEffect(pulse ? 2.3 : 1)
+                    .opacity(pulse ? 0 : 0.85)
+            }
+            Circle()
+                .fill(color)
+                .frame(width: dotInner, height: dotInner)
+                .shadow(color: color, radius: 4)
+        }
+        .frame(width: dotOuter, height: dotOuter)
+        .onAppear {
+            guard agent.status == .running else { return }
+            withAnimation(.easeOut(duration: 1.3).repeatForever(autoreverses: false)) {
+                pulse = true
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var elapsed: some View {
+        if agent.runStartedAt != nil {
+            TimelineView(.periodic(from: .now, by: 1.0)) { ctx in
+                timeText(agent.elapsedSeconds(at: ctx.date))
+            }
+        } else {
+            timeText(agent.elapsedSeconds(at: Date()))
+        }
+    }
+
+    private func timeText(_ seconds: Double) -> some View {
+        Text(formatClock(seconds))
+            .font(.system(size: compact ? 9.5 : 11, weight: .medium, design: .monospaced))
+            .foregroundStyle(.white.opacity(0.7))
+    }
+}
+
+// MARK: - Global hotkeys (Carbon — works while other apps are fullscreen,
+// requires no Accessibility / Input Monitoring permission)
+
+@MainActor
+final class HotKeyManager {
+    private weak var store: AgentStore?
+    private var refs: [EventHotKeyRef?] = []
+    private var handler: EventHandlerRef?
+
+    private static let toggleID: UInt32 = 1
+    private static let cornerID: UInt32 = 2
+    private static let cycleID: UInt32 = 3
+    private static let expandID: UInt32 = 4
+    // ⌥1…9 jump to bubble N. IDs 11…19 so they don't collide with the above.
+    private static let jumpBaseID: UInt32 = 11
+
+    init(store: AgentStore) {
+        self.store = store
+        install()
+    }
+
+    private func install() {
+        var spec = EventTypeSpec(
+            eventClass: OSType(kEventClassKeyboard),
+            eventKind: OSType(kEventHotKeyPressed)
+        )
+        let selfPtr = Unmanaged.passUnretained(self).toOpaque()
+        InstallEventHandler(GetApplicationEventTarget(), { _, event, userData -> OSStatus in
+            guard let event = event, let userData = userData else { return noErr }
+            var hkID = EventHotKeyID()
+            GetEventParameter(
+                event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID),
+                nil, MemoryLayout<EventHotKeyID>.size, nil, &hkID
+            )
+            let mgr = Unmanaged<HotKeyManager>.fromOpaque(userData).takeUnretainedValue()
+            let id = hkID.id
+            Task { @MainActor in mgr.handle(id: id) }
+            return noErr
+        }, 1, &spec, selfPtr, &handler)
+
+        // Toggle / corner keep ⌥⌘ (infrequent). Jumps + cycle use bare ⌥ so
+        // they're one-handed; the only cost is typing ⌥-digit special glyphs.
+        let cmdOpt = UInt32(cmdKey | optionKey)
+        let opt = UInt32(optionKey)
+        register(id: Self.toggleID, keyCode: UInt32(kVK_ANSI_B), mods: cmdOpt)
+        register(id: Self.cornerID, keyCode: UInt32(kVK_ANSI_C), mods: cmdOpt)
+        register(id: Self.expandID, keyCode: UInt32(kVK_ANSI_E), mods: cmdOpt)
+
+        // Jump/cycle only make sense with Ghostty. Don't claim ⌥-digit / ⌥`
+        // globally on machines without it (would steal keys for no benefit).
+        guard Ghostty.isInstalled else { return }
+        register(id: Self.cycleID,  keyCode: UInt32(kVK_ANSI_Grave), mods: opt)
+        let numberKeys = [
+            kVK_ANSI_1, kVK_ANSI_2, kVK_ANSI_3, kVK_ANSI_4, kVK_ANSI_5,
+            kVK_ANSI_6, kVK_ANSI_7, kVK_ANSI_8, kVK_ANSI_9,
+        ]
+        for (i, key) in numberKeys.enumerated() {
+            register(id: Self.jumpBaseID + UInt32(i), keyCode: UInt32(key), mods: opt)
+        }
+    }
+
+    private func register(id: UInt32, keyCode: UInt32, mods: UInt32) {
+        var ref: EventHotKeyRef?
+        let hkID = EventHotKeyID(signature: OSType(0x41474D54 /* 'AGMT' */), id: id)
+        RegisterEventHotKey(keyCode, mods, hkID, GetApplicationEventTarget(), 0, &ref)
+        refs.append(ref)
+    }
+
+    private func handle(id: UInt32) {
+        guard let store = store else { return }
+        switch id {
+        case Self.toggleID: store.toggleBubbles()
+        case Self.cornerID: store.cycleBubbleCorner()
+        case Self.expandID: store.toggleInactive()
+        case Self.cycleID:  store.focusNextSession()
+        case Self.jumpBaseID..<(Self.jumpBaseID + 9):
+            store.focusBubble(at: Int(id - Self.jumpBaseID))
+        default: break
+        }
+    }
+}
+
+// MARK: - Overlay panel
+
+/// A non-activating, click-through panel for the bubbles overlay: it floats
+/// over other apps (including their fullscreen Spaces) without stealing focus.
+final class OverlayPanel: NSPanel {
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
 }
 
 // MARK: - App
 
-@main
-struct AgentMonitorApp: App {
-    @StateObject private var store = AgentStore()
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    let store = AgentStore()
+    private var mainWindow: NSWindow!
+    private var bubblePanel: OverlayPanel!
+    private var hotKeys: HotKeyManager?
+    private var cancellables: Set<AnyCancellable> = []
 
-    var body: some Scene {
-        WindowGroup("Agent Monitor") {
-            ContentView()
-                .environmentObject(store)
-                .background(WindowAccessor { win in
-                    win.level = .floating
-                    win.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-                    win.titlebarAppearsTransparent = true
-                    win.isMovableByWindowBackground = true
-                    win.styleMask.insert(.fullSizeContentView)
-                })
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.setActivationPolicy(.regular)
+
+        makeMainWindow()
+        makeBubblePanel()
+
+        // The overlay is an independent window: show/hide it without touching
+        // the regular main window, so the two coexist.
+        store.$bubblesVisible
+            .removeDuplicates()
+            .sink { [weak self] visible in self?.setBubbles(visible) }
+            .store(in: &cancellables)
+        store.$bubbleCorner
+            .sink { [weak self] _ in self?.repositionBubblePanel() }
+            .store(in: &cancellables)
+
+        setBubbles(store.bubblesVisible)
+        hotKeys = HotKeyManager(store: store)
+
+        // If native notifications were left enabled, re-confirm authorization
+        // (didSet doesn't run for the value restored in LocalNotifier.init).
+        if store.localNotifier.enabled {
+            store.localNotifier.requestAuthorization()
         }
-        .windowResizability(.contentSize)
+    }
+
+    // Regular, normal-level window — behaves like any app window (not pinned
+    // on top, lives in its own Space).
+    private func makeMainWindow() {
+        mainWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 560, height: 360),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+            backing: .buffered, defer: false
+        )
+        mainWindow.title = "Agent Monitor"
+        mainWindow.titlebarAppearsTransparent = true
+        mainWindow.isMovableByWindowBackground = true
+        mainWindow.isReleasedWhenClosed = false
+        mainWindow.contentView = NSHostingView(
+            rootView: ContentView().environmentObject(store)
+        )
+        mainWindow.center()
+        mainWindow.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func makeBubblePanel() {
+        let frame = (NSScreen.main ?? NSScreen.screens.first)?.visibleFrame
+            ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        bubblePanel = OverlayPanel(
+            contentRect: frame,
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered, defer: false
+        )
+        bubblePanel.isOpaque = false
+        bubblePanel.backgroundColor = .clear
+        bubblePanel.hasShadow = false
+        bubblePanel.ignoresMouseEvents = true   // click-through: purely ambient
+        bubblePanel.level = .screenSaver         // float above fullscreen apps
+        bubblePanel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        bubblePanel.hidesOnDeactivate = false
+        bubblePanel.isReleasedWhenClosed = false
+        bubblePanel.contentView = NSHostingView(
+            rootView: BubblesView().environmentObject(store)
+        )
+    }
+
+    private func repositionBubblePanel() {
+        guard bubblePanel != nil, store.bubblesVisible else { return }
+        if let screen = NSScreen.main ?? NSScreen.screens.first {
+            bubblePanel.setFrame(screen.visibleFrame, display: true)
+        }
+    }
+
+    private func setBubbles(_ visible: Bool) {
+        guard let panel = bubblePanel else { return }
+        if visible {
+            repositionBubblePanel()
+            panel.orderFrontRegardless()
+        } else {
+            panel.orderOut(nil)
+        }
+    }
+
+    // Re-show the main window when the dock icon is clicked after it was closed.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        mainWindow.makeKeyAndOrderFront(nil)
+        return true
+    }
+}
+
+@main
+struct Main {
+    static func main() {
+        let app = NSApplication.shared
+        let delegate = AppDelegate()
+        app.delegate = delegate
+        app.run()
     }
 }

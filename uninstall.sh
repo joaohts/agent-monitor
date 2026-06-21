@@ -22,7 +22,11 @@ SETTINGS="$HOME/.claude/settings.json"
 APP_LINK="$HOME/Applications/AgentMonitor.app"
 EVENTS_LOG="$HOME/.claude/agents.jsonl"
 DEBUG_LOG="$HOME/.claude/agent-monitor-debug.log"
+GHOSTTY_MAP="$HOME/.claude/agent-monitor-ghostty-map.json"
+NAMES_MAP="$HOME/.claude/agent-monitor-names.json"
 APP_BUNDLE="$REPO_DIR/AgentMonitor.app"
+SIGN_KC="$HOME/Library/Keychains/agent-monitor-signing.keychain-db"
+SIGN_PW_FILE="$HOME/.config/agent-monitor/signing-keychain.pw"
 
 echo "==> Agent Monitor uninstaller"
 echo "    repo:    $REPO_DIR"
@@ -117,7 +121,7 @@ echo
 if [ $KEEP_DATA -eq 1 ]; then
     echo "==> Skipping user data deletion (--keep-data was passed)"
 else
-    for f in "$EVENTS_LOG" "$DEBUG_LOG"; do
+    for f in "$EVENTS_LOG" "$DEBUG_LOG" "$GHOSTTY_MAP" "$NAMES_MAP"; do
         if [ -f "$f" ]; then
             echo "==> Removing $f..."
             rm -f "$f"
@@ -125,6 +129,15 @@ else
         fi
     done
 fi
+echo
+
+# ── 5b. Remove the stable code-signing keychain + password ──────────────────
+if [ -f "$SIGN_KC" ]; then
+    echo "==> Removing signing keychain $SIGN_KC..."
+    security delete-keychain "$SIGN_KC" 2>/dev/null || rm -f "$SIGN_KC"
+    echo "    ✓ removed"
+fi
+rm -f "$SIGN_PW_FILE" 2>/dev/null || true
 echo
 
 # ── 6. Done ─────────────────────────────────────────────────────────────────
