@@ -1016,9 +1016,9 @@ struct LedgerEntry: Codable, Equatable {
 /// the ledgers are append-only. `offset` is the housekeeping byte cursor into the
 /// transcript (how far we've already folded). Metadata is app-managed, not model-emitted.
 struct HousekeepingState: Codable {
-    var headline: String = ""        // one-sentence gist
-    var summary: String = ""         // detailed
-    var status: String = ""
+    var title: String = ""           // PR-title concise, stable (changes only on a focus shift)
+    var subtitle: String = ""        // live, phase-aware, timely
+    var summary: String = ""         // detailed cumulative
     var projects: [String] = []      // global set
     var sources: [String] = []       // global set
     var features: [LedgerEntry] = []
@@ -1036,9 +1036,9 @@ struct HousekeepingState: Codable {
 
     /// Folds a model result in: rewrite summary/status, append-dedupe the ledgers.
     mutating func merge(_ f: HousekeepingFold) {
-        headline = f.headline
+        title = f.title
+        subtitle = f.subtitle
         summary = f.summary
-        status = f.status
         for p in f.newProjects ?? [] where !projects.contains(p) { projects.append(p) }
         for s in f.newSources ?? [] where !sources.contains(s) { sources.append(s) }
         for e in f.newFeatures ?? [] where !features.contains(e) { features.append(e) }
@@ -1050,9 +1050,9 @@ struct HousekeepingState: Codable {
 /// What a single fold returns: the rewritten summary/status plus only the *new* ledger
 /// entries (append model — the app merges/dedupes).
 struct HousekeepingFold: Codable {
-    var headline: String
+    var title: String
+    var subtitle: String
     var summary: String
-    var status: String
     var newProjects: [String]?
     var newSources: [String]?
     var newFeatures: [LedgerEntry]?
@@ -1077,22 +1077,29 @@ enum FoldPrompt {
     Activity lines are compact:
       U: a user message    A: the assistant's prose    T: Tool(arg) — a tool the assistant ran
 
-    Return JSON with this shape (omit or empty any array with nothing new):
+    Return JSON with this shape — THREE levels of conciseness (title → subtitle → summary),
+    plus the ledgers (omit or empty any array with nothing new):
     {
-      "headline": string,  // ONE sentence (<= 20 words) — what the session is about OVERALL:
-                           // its goal and arc, NOT just the latest action.
-      "summary": string,   // The CUMULATIVE summary of the WHOLE session, 2-4 short paragraphs.
-                           // CRITICAL — DO NOT LOSE THE LONG-TERM ARC. The CURRENT SUMMARY is
-                           // your memory of everything before now: PRESERVE it and weave the
-                           // recent work into it. NEVER collapse the summary into a description
-                           // of only the latest step or message — the new work is an ADDITION
-                           // to the story, not a replacement. It grows slower than the session,
-                           // but only by compressing older detail, never by dropping the
-                           // earlier arc. A reader should still understand how the session began
-                           // and everything significant it has done, not just what just happened.
-      "status":  string,   // one line: what's happening right now
-                           // (e.g. "implementing the provider", "awaiting permission to run
-                           //  the migration", "done — turn complete").
+      "title":   string,   // The MOST concise level: a PR-title-style line (<= 12 words) — the
+                           // single best one-liner for what this session is/does. It must be
+                           // STABLE: you are given the CURRENT TITLE; keep it essentially the
+                           // same across updates. Only rewrite it if the session's focus has
+                           // changed substantially. Small wording tweaks are fine; drastic
+                           // rewrites only on a drastic change of what the session is about.
+      "subtitle": string,  // The LIVE level: a short line (<= 14 words) about the current PHASE
+                           // of the session — what's happening now and roughly where in the arc
+                           // (e.g. "wrapping up the dashboard polish", "debugging the fold
+                           //  pipeline", "just started — exploring the codebase", "blocked,
+                           //  awaiting permission"). This is the most dynamic line; expect it to
+                           // change every update and to reflect progress / timeliness.
+      "summary": string,   // The DETAILED level: the CUMULATIVE summary of the WHOLE session,
+                           // 2-4 short paragraphs. CRITICAL — DO NOT LOSE THE LONG-TERM ARC. The
+                           // CURRENT SUMMARY is your memory of everything before now: PRESERVE it
+                           // and weave the recent work in. NEVER collapse it into only the latest
+                           // step — the new work is an ADDITION, not a replacement. It grows
+                           // slower than the session, but only by compressing older detail, never
+                           // by dropping the earlier arc. A reader should still understand how the
+                           // session began and everything significant it has done.
       "newFeatures":  [{"project": string, "text": string}],
       "newFixes":     [{"project": string, "text": string}],
       "newDecisions": [{"project": string, "text": string}],
@@ -1129,11 +1136,11 @@ enum FoldPrompt {
             es.isEmpty ? "(none)" : es.map { "- [\($0.project)] \($0.text)" }.joined(separator: "\n")
         }
         return """
-        CURRENT HEADLINE: \(state.headline.isEmpty ? "(none)" : state.headline)
+        CURRENT TITLE (keep stable — only rewrite on a substantial focus change): \(state.title.isEmpty ? "(none)" : state.title)
+        CURRENT SUBTITLE: \(state.subtitle.isEmpty ? "(none)" : state.subtitle)
         CURRENT SUMMARY (the long-term record — preserve and extend, do not replace):
         \(state.summary.isEmpty ? "(none yet)" : state.summary)
 
-        CURRENT STATUS: \(state.status.isEmpty ? "(none)" : state.status)
         KNOWN PROJECTS: \(state.projects.isEmpty ? "(none)" : state.projects.joined(separator: ", "))
         KNOWN SOURCES: \(state.sources.isEmpty ? "(none)" : state.sources.joined(separator: ", "))
         EXISTING FEATURES:
@@ -1247,16 +1254,16 @@ struct HaikuAPIProvider: HousekeepingProvider {
         return [
             "type": "object",
             "properties": [
-                "headline": ["type": "string"],
+                "title": ["type": "string"],
+                "subtitle": ["type": "string"],
                 "summary": ["type": "string"],
-                "status": ["type": "string"],
                 "newProjects": strArr,
                 "newSources": strArr,
                 "newFeatures": entryArr,
                 "newFixes": entryArr,
                 "newDecisions": entryArr,
             ],
-            "required": ["headline", "summary", "status"],
+            "required": ["title", "subtitle", "summary"],
             "additionalProperties": false,
         ]
     }()
@@ -1586,7 +1593,8 @@ final class HousekeepingGenerator {
         updated: \(s.updated)
         ---
 
-        # \(s.projects.first ?? "session") — \(s.status)
+        # \(s.title.isEmpty ? (s.projects.first ?? "session") : s.title)
+        *\(s.subtitle)*
 
         \(s.summary)
         \(list("Projects", s.projects))\(list("Sources", s.sources))\(ledger("Features", s.features))\(ledger("Fixes", s.fixes))\(ledger("Decisions", s.decisions))
@@ -2812,19 +2820,22 @@ struct ReportView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     if let s {
-                        // Status — small orange kicker (the one live highlight).
-                        if !s.status.isEmpty {
-                            Text(s.status.uppercased())
-                                .font(.caption.weight(.bold)).tracking(0.5)
-                                .foregroundStyle(accent)
+                        // Level 1+2: title (concise, stable, the focal point) with the live
+                        // subtitle tucked right beneath it.
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(titleText(s))
+                                .font(.system(size: 21, weight: .semibold))
+                                .lineSpacing(2)
+                                .fixedSize(horizontal: false, vertical: true)
+                            if !s.subtitle.isEmpty {
+                                Text(s.subtitle)
+                                    .font(.system(size: 13, weight: .medium))
+                                    .foregroundStyle(accent)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
                         }
-                        // Headline — one sentence, the focal point your eye lands on.
-                        Text(headlineText(s))
-                            .font(.system(size: 21, weight: .semibold))
-                            .lineSpacing(2)
-                            .fixedSize(horizontal: false, vertical: true)
-                        // Detailed summary — the deeper read.
-                        if !s.summary.isEmpty, s.headline != s.summary {
+                        // Level 3: the detailed cumulative summary.
+                        if !s.summary.isEmpty, s.title != s.summary {
                             Text(s.summary)
                                 .font(.system(size: 14))
                                 .foregroundStyle(.secondary)
@@ -2861,9 +2872,9 @@ struct ReportView: View {
         .onTapGesture { store.focusedPane = sessionId }
     }
 
-    private func headlineText(_ s: HousekeepingState) -> String {
-        if !s.headline.isEmpty { return s.headline }
-        if !s.summary.isEmpty { return s.summary }   // pre-headline states
+    private func titleText(_ s: HousekeepingState) -> String {
+        if !s.title.isEmpty { return s.title }
+        if !s.summary.isEmpty { return s.summary }   // pre-title states
         return "(no summary yet)"
     }
 
