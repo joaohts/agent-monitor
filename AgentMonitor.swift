@@ -1063,24 +1063,33 @@ struct HousekeepingFold: Codable {
 /// Shared prompt — same instruction for both backends so they behave alike.
 enum FoldPrompt {
     static let system = """
-    You maintain a running summary of a single Claude Code coding session by folding in \
-    ONLY the new activity since the last update. Output STRICT JSON and nothing else — no \
-    prose, no markdown fences.
+    You maintain a long-lived, CUMULATIVE summary of a single Claude Code coding session.
+    Output STRICT JSON and nothing else — no prose, no markdown fences.
 
-    You are given the CURRENT state (summary, status, existing ledgers) and the NEW ACTIVITY \
-    as compact lines:
-      U: a user message
-      A: the assistant's prose
-      T: Tool(arg)  — a tool the assistant ran (file edited, command, query, ...)
+    You are given:
+      - CURRENT SUMMARY: the running record of the WHOLE session so far. This is the
+        session's long-term memory — authoritative for everything that happened before now.
+      - CURRENT STATUS and the existing ledgers (features / fixes / decisions / sources /
+        projects).
+      - RECENT CONTEXT: the last several turns, to flesh out the summary with detail so it
+        isn't anchored to just the most recent message.
+      - NEW ACTIVITY: only what happened since the last update — use this for the LEDGERS.
+    Activity lines are compact:
+      U: a user message    A: the assistant's prose    T: Tool(arg) — a tool the assistant ran
 
     Return JSON with this shape (omit or empty any array with nothing new):
     {
-      "headline": string,  // ONE sentence (<= 20 words) — what this session is about at a
-                           // glance, a title someone reads to instantly get the gist.
-      "summary": string,   // REWRITE the running summary as 2-4 short paragraphs: what has
-                           // been done, the current state, and the key context / why. Fold
-                           // the new activity in. It grows slower than the session but should
-                           // be genuinely informative and detailed, not terse.
+      "headline": string,  // ONE sentence (<= 20 words) — what the session is about OVERALL:
+                           // its goal and arc, NOT just the latest action.
+      "summary": string,   // The CUMULATIVE summary of the WHOLE session, 2-4 short paragraphs.
+                           // CRITICAL — DO NOT LOSE THE LONG-TERM ARC. The CURRENT SUMMARY is
+                           // your memory of everything before now: PRESERVE it and weave the
+                           // recent work into it. NEVER collapse the summary into a description
+                           // of only the latest step or message — the new work is an ADDITION
+                           // to the story, not a replacement. It grows slower than the session,
+                           // but only by compressing older detail, never by dropping the
+                           // earlier arc. A reader should still understand how the session began
+                           // and everything significant it has done, not just what just happened.
       "status":  string,   // one line: what's happening right now
                            // (e.g. "implementing the provider", "awaiting permission to run
                            //  the migration", "done — turn complete").
@@ -1091,8 +1100,9 @@ enum FoldPrompt {
       "newSources":   [string]
     }
 
-    Ledgers are append-only and PERMANENT. Be strict — when in doubt, LEAVE IT OUT; a wrong
-    entry can never be removed. Emit only entries NOT already present in the existing ledgers.
+    Ledgers are append-only and PERMANENT, drawn from the NEW ACTIVITY. Be strict — when in
+    doubt, LEAVE IT OUT; a wrong entry can never be removed. Emit only entries NOT already
+    present in the existing ledgers.
     Inclusion tests:
     - feature: a capability that now exists and didn't before. NOT refactors, NOT steps
       toward one, NOT "improved X".
@@ -1114,13 +1124,13 @@ enum FoldPrompt {
     several) — use the project name, not a path.
     """
 
-    static func user(state: HousekeepingState, delta: [String]) -> String {
+    static func user(state: HousekeepingState, delta: [String], recent: [String]) -> String {
         func entries(_ es: [LedgerEntry]) -> String {
             es.isEmpty ? "(none)" : es.map { "- [\($0.project)] \($0.text)" }.joined(separator: "\n")
         }
         return """
         CURRENT HEADLINE: \(state.headline.isEmpty ? "(none)" : state.headline)
-        CURRENT SUMMARY:
+        CURRENT SUMMARY (the long-term record — preserve and extend, do not replace):
         \(state.summary.isEmpty ? "(none yet)" : state.summary)
 
         CURRENT STATUS: \(state.status.isEmpty ? "(none)" : state.status)
@@ -1133,7 +1143,10 @@ enum FoldPrompt {
         EXISTING DECISIONS:
         \(entries(state.decisions))
 
-        NEW ACTIVITY (since last update):
+        RECENT CONTEXT (last several turns — for fleshing out the summary, NOT for ledgers):
+        \(recent.joined(separator: "\n"))
+
+        NEW ACTIVITY (since last update — use for the ledgers):
         \(delta.joined(separator: "\n"))
         """
     }
@@ -1150,7 +1163,10 @@ enum FoldPrompt {
 // MARK: - Housekeeping providers
 
 protocol HousekeepingProvider: Sendable {
-    func fold(state: HousekeepingState, delta: [String]) async -> HousekeepingFold?
+    /// `delta` = only the new activity since the last fold (drives the ledgers).
+    /// `recent` = a wider window of the last several turns (context for the summary, so it
+    /// isn't anchored to just the latest message).
+    func fold(state: HousekeepingState, delta: [String], recent: [String]) async -> HousekeepingFold?
 }
 
 enum HousekeepingProviderKind: String { case auto, claudeP, haikuApi }
@@ -1172,8 +1188,8 @@ enum HousekeepingProviders {
 /// Subscription path: shells out via the shared `ClaudeP` runner (Haiku, OAuth, no key),
 /// prompts for JSON, parses defensively.
 struct ClaudePProvider: HousekeepingProvider {
-    func fold(state: HousekeepingState, delta: [String]) async -> HousekeepingFold? {
-        let user = FoldPrompt.user(state: state, delta: delta)
+    func fold(state: HousekeepingState, delta: [String], recent: [String]) async -> HousekeepingFold? {
+        let user = FoldPrompt.user(state: state, delta: delta, recent: recent)
         guard let out = ClaudeP.run(prompt: user, model: "claude-haiku-4-5",
                                     systemPrompt: FoldPrompt.system),
               let data = FoldPrompt.extractJSON(out),
@@ -1186,7 +1202,7 @@ struct ClaudePProvider: HousekeepingProvider {
 /// Metered path: a direct Haiku 4.5 Messages API call with structured output, so the
 /// schema is enforced. Needs `ANTHROPIC_API_KEY`.
 struct HaikuAPIProvider: HousekeepingProvider {
-    func fold(state: HousekeepingState, delta: [String]) async -> HousekeepingFold? {
+    func fold(state: HousekeepingState, delta: [String], recent: [String]) async -> HousekeepingFold? {
         guard let key = ProcessInfo.processInfo.environment["ANTHROPIC_API_KEY"],
               !key.isEmpty else { return nil }
 
@@ -1194,7 +1210,7 @@ struct HaikuAPIProvider: HousekeepingProvider {
             "model": "claude-haiku-4-5",
             "max_tokens": 1500,
             "system": FoldPrompt.system,
-            "messages": [["role": "user", "content": FoldPrompt.user(state: state, delta: delta)]],
+            "messages": [["role": "user", "content": FoldPrompt.user(state: state, delta: delta, recent: recent)]],
             "output_config": ["format": ["type": "json_schema", "schema": Self.schema]],
         ]
         guard let payload = try? JSONSerialization.data(withJSONObject: body) else { return nil }
@@ -1452,17 +1468,29 @@ final class HousekeepingGenerator {
         let snapshot = state
         let kind = providerKind
         let exportMd = (status == .idle || status == .inactive)  // throttle markdown to turn boundaries
+        let fileSize = size
+        let recentBytes = Self.recentWindowBytes
+        let recentMax = Self.recentWindowMaxLines
         Task.detached(priority: .utility) { [weak self] in
+            // delta = only the new activity since the cursor → drives the ledgers.
             let (lines, newOffset) = HousekeepingDelta.project(path: path, from: fromOffset)
             if lines.isEmpty {
                 await self?.finish(sessionId: sessionId, foldedOffset: newOffset, fold: nil, branch: nil, exportMd: false)
                 return
             }
+            // recent = a wider window (last several turns) → context for the summary, so it
+            // isn't anchored to just the latest message. Independent of the cursor.
+            let recentStart = fileSize > recentBytes ? fileSize - recentBytes : 0
+            let recent = Array(HousekeepingDelta.project(path: path, from: recentStart).lines.suffix(recentMax))
             let branch = Self.gitBranch(cwd: snapshot.cwd)
-            let fold = await HousekeepingProviders.resolve(kind).fold(state: snapshot, delta: lines)
+            let fold = await HousekeepingProviders.resolve(kind).fold(state: snapshot, delta: lines, recent: recent)
             await self?.finish(sessionId: sessionId, foldedOffset: newOffset, fold: fold, branch: branch, exportMd: exportMd)
         }
     }
+
+    // Recent-context window for the summary (independent of the fold cursor).
+    static let recentWindowBytes: UInt64 = 40_000
+    static let recentWindowMaxLines = 60
 
     private func finish(sessionId: String, foldedOffset: UInt64, fold: HousekeepingFold?, branch: String?, exportMd: Bool) {
         inFlight.remove(sessionId)
