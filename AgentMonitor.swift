@@ -2777,7 +2777,7 @@ struct ReportView: View {
     var body: some View {
         let s = store.housekeeping[sessionId]
         let agent = store.agents.first { $0.id == sessionId }
-        let focused = store.focusedPane == sessionId
+        let generating = store.folding.contains(sessionId)
         VStack(alignment: .leading, spacing: 0) {
             header(state: s, agent: agent)
             Divider()
@@ -2827,7 +2827,7 @@ struct ReportView: View {
         .background(RoundedRectangle(cornerRadius: 12).fill(.quaternary.opacity(0.22)))
         .overlay(
             RoundedRectangle(cornerRadius: 12)
-                .strokeBorder(focused ? accent.opacity(0.8) : Color.clear, lineWidth: 2)
+                .strokeBorder(generating ? accent.opacity(0.85) : Color.clear, lineWidth: 2)
         )
         .contentShape(Rectangle())
         .onTapGesture { store.focusedPane = sessionId }
