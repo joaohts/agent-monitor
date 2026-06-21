@@ -2746,46 +2746,60 @@ struct ReportView: View {
             header(state: s, agent: agent)
             Divider()
             ScrollView {
-                VStack(alignment: .leading, spacing: 10) {
+                VStack(alignment: .leading, spacing: 20) {
                     if let s {
+                        // Status — small kicker above the summary.
                         if !s.status.isEmpty {
-                            Text(s.status).font(.callout).foregroundStyle(.secondary).italic()
+                            Text(s.status.uppercased())
+                                .font(.caption.weight(.semibold)).tracking(0.4)
+                                .foregroundStyle(dotColor(agent?.status))
                         }
+                        // Summary — the headline; biggest, where the eye lands first.
                         Text(s.summary.isEmpty ? "(no summary yet)" : s.summary)
-                            .font(.body).fixedSize(horizontal: false, vertical: true)
-                        ledger("Features", s.features)
-                        ledger("Fixes", s.fixes)
-                        ledger("Decisions", s.decisions)
-                        if !s.sources.isEmpty { list("Sources", s.sources) }
-                        if !s.projects.isEmpty { list("Projects", s.projects) }
+                            .font(.system(size: 17, weight: .regular))
+                            .lineSpacing(4)
+                            .fixedSize(horizontal: false, vertical: true)
+
+                        // Tag entries with their project only when the session spans more
+                        // than one — otherwise the header already says which project it is.
+                        let multiProject = s.projects.count > 1
+                        ledgerSection("Features", "sparkles", .green, s.features, tag: multiProject)
+                        ledgerSection("Fixes", "wrench.and.screwdriver", .orange, s.fixes, tag: multiProject)
+                        ledgerSection("Decisions", "signpost.right", .purple, s.decisions, tag: multiProject)
+                        listSection("Sources", "book", .blue, s.sources)
+                        listSection("Projects", "folder", .teal, s.projects)
+
                         Text("\(s.host) · \(s.cwd)")
-                            .font(.caption2.monospaced()).foregroundStyle(.tertiary).padding(.top, 4)
+                            .font(.caption.monospaced()).foregroundStyle(.tertiary).padding(.top, 6)
                     } else {
                         Text(agent?.liveStatus ?? "Summarizing…")
-                            .font(.callout).foregroundStyle(.secondary)
+                            .font(.title3).foregroundStyle(.secondary)
                     }
                 }
-                .padding(12)
+                .padding(18)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
-        .background(RoundedRectangle(cornerRadius: 10).fill(.quaternary.opacity(0.25)))
+        .background(RoundedRectangle(cornerRadius: 12).fill(.quaternary.opacity(0.22)))
         .overlay(
-            RoundedRectangle(cornerRadius: 10)
-                .strokeBorder(focused ? Color.accentColor.opacity(0.7) : Color.clear, lineWidth: 1.5)
+            RoundedRectangle(cornerRadius: 12)
+                .strokeBorder(focused ? Color.accentColor.opacity(0.7) : Color.clear, lineWidth: 2)
         )
         .contentShape(Rectangle())
         .onTapGesture { store.focusedPane = sessionId }
     }
 
     private func header(state s: HousekeepingState?, agent: Agent?) -> some View {
-        HStack(spacing: 8) {
-            Circle().fill(dotColor(agent?.status)).frame(width: 8, height: 8)
+        HStack(spacing: 10) {
+            Circle().fill(dotColor(agent?.status)).frame(width: 10, height: 10)
             Text(s?.projects.first ?? agent?.generatedTitle ?? "session")
-                .font(.headline).lineLimit(1)
+                .font(.title3.weight(.bold)).lineLimit(1)
             if let b = s?.branch, !b.isEmpty {
                 Label(b, systemImage: "arrow.triangle.branch")
-                    .font(.caption).foregroundStyle(.secondary).labelStyle(.titleAndIcon).lineLimit(1)
+                    .font(.caption.weight(.medium)).foregroundStyle(.secondary)
+                    .labelStyle(.titleAndIcon).lineLimit(1)
+                    .padding(.horizontal, 7).padding(.vertical, 2)
+                    .background(Capsule().fill(.secondary.opacity(0.15)))
             }
             Spacer()
             if let agent {
@@ -2795,25 +2809,46 @@ struct ReportView: View {
             Button { store.closePane(sessionId) } label: { Image(systemName: "xmark") }
                 .buttonStyle(.borderless).help("Close pane")
         }
-        .padding(.horizontal, 12).padding(.vertical, 8)
+        .padding(.horizontal, 14).padding(.vertical, 10)
     }
 
-    @ViewBuilder private func ledger(_ title: String, _ es: [LedgerEntry]) -> some View {
+    /// A titled section: a colored accent bar + icon + label, with the content aligned
+    /// to one shared left margin so the eye runs straight down the report.
+    @ViewBuilder private func sectionFrame<Content: View>(
+        _ title: String, _ icon: String, _ color: Color, @ViewBuilder _ content: () -> Content
+    ) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            RoundedRectangle(cornerRadius: 2).fill(color.opacity(0.65)).frame(width: 3)
+            VStack(alignment: .leading, spacing: 7) {
+                Label(title.uppercased(), systemImage: icon)
+                    .font(.caption.weight(.bold)).tracking(0.5)
+                    .foregroundStyle(color).labelStyle(.titleAndIcon)
+                content()
+            }
+        }
+    }
+
+    @ViewBuilder private func ledgerSection(_ title: String, _ icon: String, _ color: Color, _ es: [LedgerEntry], tag: Bool) -> some View {
         if !es.isEmpty {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(title.uppercased()).font(.caption.weight(.semibold)).foregroundStyle(.tertiary)
+            sectionFrame(title, icon, color) {
                 ForEach(es.indices, id: \.self) { i in
-                    Text("• [\(es[i].project)] \(es[i].text)").font(.callout).foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        if tag { ProjectTag(project: es[i].project) }
+                        Text(es[i].text).font(.callout).fixedSize(horizontal: false, vertical: true)
+                    }
                 }
             }
         }
     }
 
-    private func list(_ title: String, _ xs: [String]) -> some View {
-        VStack(alignment: .leading, spacing: 3) {
-            Text(title.uppercased()).font(.caption.weight(.semibold)).foregroundStyle(.tertiary)
-            ForEach(xs, id: \.self) { Text("• \($0)").font(.callout).foregroundStyle(.secondary) }
+    @ViewBuilder private func listSection(_ title: String, _ icon: String, _ color: Color, _ xs: [String]) -> some View {
+        if !xs.isEmpty {
+            sectionFrame(title, icon, color) {
+                ForEach(xs, id: \.self) { x in
+                    Text(x).font(.callout).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
         }
     }
 
@@ -2825,6 +2860,30 @@ struct ReportView: View {
         case .idle: return .blue
         default: return .gray
         }
+    }
+}
+
+/// A small colored capsule for a project tag — deterministic color per project name,
+/// so the same project reads the same everywhere.
+struct ProjectTag: View {
+    let project: String
+    var body: some View {
+        let c = Self.color(for: project)
+        Text(project)
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(c)
+            .padding(.horizontal, 7).padding(.vertical, 2)
+            .background(Capsule().fill(c.opacity(0.16)))
+            .overlay(Capsule().strokeBorder(c.opacity(0.35), lineWidth: 0.5))
+            .fixedSize()
+    }
+
+    static func color(for s: String) -> Color {
+        let palette: [Color] = [.blue, .green, .orange, .purple, .pink, .teal, .indigo, .red, .mint, .cyan]
+        var h = 5381
+        for b in s.utf8 { h = (h &* 33) &+ Int(b) }
+        let n = palette.count
+        return palette[((h % n) + n) % n]
     }
 }
 
