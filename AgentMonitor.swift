@@ -3608,10 +3608,19 @@ struct SettingsView: View {
                         Text("\(Int(hkHeartbeat))s").foregroundStyle(.secondary)
                     }
                     Slider(value: $hkHeartbeat, in: 30...600, step: 30).disabled(!hkEnabled)
-                    TextField("Markdown export dir (optional)", text: $hkMarkdownDir)
-                        .textFieldStyle(.roundedBorder)
-                        .disabled(!hkEnabled)
-                    Text("Folds a running summary + facts per session into ~/.claude/agent-monitor-summaries/. Set a markdown dir (e.g. ~/notes/jonathan/claude-sessions) to also export a note on turn boundaries.")
+                    HStack {
+                        Text("Markdown export")
+                        Spacer()
+                        Text(hkMarkdownDir.isEmpty ? "off"
+                             : hkMarkdownDir.replacingOccurrences(of: NSHomeDirectory(), with: "~"))
+                            .font(.caption).foregroundStyle(.secondary)
+                            .lineLimit(1).truncationMode(.middle)
+                        if !hkMarkdownDir.isEmpty {
+                            Button("Clear") { hkMarkdownDir = "" }.disabled(!hkEnabled)
+                        }
+                        Button("Choose…") { chooseMarkdownDir() }.disabled(!hkEnabled)
+                    }
+                    Text("Folds a running summary + facts per session into ~/.claude/agent-monitor-summaries/. Pick a folder (e.g. an Obsidian vault) to also export a markdown note on turn boundaries.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
 
@@ -3629,6 +3638,21 @@ struct SettingsView: View {
                 }
             }
             .formStyle(.grouped)
+        }
+    }
+
+    private func chooseMarkdownDir() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Choose"
+        panel.message = "Choose a folder for markdown summary exports"
+        if !hkMarkdownDir.isEmpty {
+            panel.directoryURL = URL(fileURLWithPath: (hkMarkdownDir as NSString).expandingTildeInPath)
+        }
+        if panel.runModal() == .OK, let url = panel.url {
+            hkMarkdownDir = url.path
         }
     }
 
