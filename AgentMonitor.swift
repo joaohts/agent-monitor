@@ -1463,6 +1463,16 @@ final class HousekeepingGenerator {
 
     func snapshot(_ sessionId: String) -> HousekeepingState? { states[sessionId] }
 
+    /// All persisted session states on disk — used to seed the dashboard at launch so
+    /// it shows recently-worked sessions, not only the currently-active ones.
+    func allPersisted() -> [HousekeepingState] {
+        guard let urls = try? FileManager.default.contentsOfDirectory(
+            at: stateDir, includingPropertiesForKeys: nil) else { return [] }
+        let dec = JSONDecoder()
+        return urls.filter { $0.pathExtension == "json" }
+            .compactMap { (try? Data(contentsOf: $0)).flatMap { try? dec.decode(HousekeepingState.self, from: $0) } }
+    }
+
     // MARK: persistence
 
     private func loadOrInit(sessionId: String, cwd: String?) -> HousekeepingState {
@@ -1758,6 +1768,10 @@ final class AgentStore: ObservableObject {
     private let liveStatusGenerator = LiveStatusGenerator()
     let housekeepingGenerator = HousekeepingGenerator()
 
+    // Dashboard: published per-session housekeeping states + the view-mode switch.
+    @Published var housekeeping: [String: HousekeepingState] = [:]
+    @Published var dashboardMode = false
+
     // ── Incremental ingest state for agents.jsonl ──
     // byId is the live fold of the event log, advanced one delta at a time so a
     // reload costs O(new lines) instead of O(whole file). offset/inode mirror
@@ -1794,6 +1808,13 @@ final class AgentStore: ObservableObject {
         }
         liveStatusGenerator.onUpdated = { [weak self] _, _ in
             self?.rebuildView()
+        }
+        // Seed the dashboard with persisted states; refresh a session's card each fold.
+        housekeeping = Dictionary(housekeepingGenerator.allPersisted().map { ($0.sessionId, $0) },
+                                  uniquingKeysWith: { a, _ in a })
+        housekeepingGenerator.onUpdated = { [weak self] sid in
+            guard let self, let s = self.housekeepingGenerator.snapshot(sid) else { return }
+            self.housekeeping[sid] = s
         }
         // Forward the nested notifier's published changes so toolbar toggles
         // re-render (nested ObservableObjects don't propagate automatically).
@@ -2593,6 +2614,147 @@ final class AgentStore: ObservableObject {
 
 // MARK: - Views
 
+// MARK: - Dashboard (the v2 "Contexto amplo" view)
+
+/// Per-session summary cards reading the housekeeping state. Shows every recently-worked
+/// session (persisted state), with live status overlaid for the currently-active ones.
+struct DashboardView: View {
+    @EnvironmentObject var store: AgentStore
+
+    var body: some View {
+        let agentsById = Dictionary(store.agents.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        let states = store.housekeeping.values.sorted { $0.updated > $1.updated }
+        Group {
+            if states.isEmpty {
+                VStack(spacing: 8) {
+                    Spacer()
+                    Image(systemName: "doc.text.magnifyingglass").font(.largeTitle).foregroundStyle(.tertiary)
+                    Text("No summaries yet").foregroundStyle(.secondary)
+                    Text("Summaries appear as sessions run and fold.")
+                        .font(.caption2).foregroundStyle(.tertiary)
+                    Spacer()
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 10) {
+                        ForEach(states, id: \.sessionId) { s in
+                            let live = agentsById[s.sessionId]
+                            SummaryCard(
+                                state: s,
+                                liveStatus: live?.status,
+                                onFold: live.map { a in { store.forceHousekeeping(a) } }
+                            )
+                        }
+                    }
+                    .padding(12)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+struct SummaryCard: View {
+    let state: HousekeepingState
+    let liveStatus: AgentStatus?
+    let onFold: (() -> Void)?
+    @State private var expanded = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            // Title row: project · branch · live dot · fold button
+            HStack(spacing: 8) {
+                Circle().fill(dotColor).frame(width: 8, height: 8)
+                Text(state.projects.first ?? (state.cwd as NSString).lastPathComponent)
+                    .font(.headline)
+                if !state.branch.isEmpty {
+                    Label(state.branch, systemImage: "arrow.triangle.branch")
+                        .font(.caption).foregroundStyle(.secondary).labelStyle(.titleAndIcon)
+                }
+                Spacer()
+                Text(relative(state.updated)).font(.caption2).foregroundStyle(.tertiary)
+                if let onFold {
+                    Button(action: onFold) { Image(systemName: "arrow.clockwise") }
+                        .buttonStyle(.borderless).help("Fold now")
+                }
+            }
+
+            if !state.status.isEmpty {
+                Text(state.status).font(.caption).foregroundStyle(.secondary).italic()
+            }
+
+            Text(state.summary.isEmpty ? "(no summary yet)" : state.summary)
+                .font(.callout)
+                .fixedSize(horizontal: false, vertical: true)
+
+            // Quick-facts counts → expand to the ledgers
+            let counts = [
+                ("Features", state.features.count), ("Fixes", state.fixes.count),
+                ("Decisions", state.decisions.count), ("Sources", state.sources.count),
+                ("Projects", state.projects.count),
+            ].filter { $0.1 > 0 }
+            if !counts.isEmpty {
+                Button { withAnimation(.easeInOut(duration: 0.15)) { expanded.toggle() } } label: {
+                    HStack(spacing: 10) {
+                        ForEach(counts, id: \.0) { c in
+                            Text("\(c.0) \(c.1)").font(.caption2.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                        }
+                        Image(systemName: expanded ? "chevron.up" : "chevron.down")
+                            .font(.caption2).foregroundStyle(.tertiary)
+                    }
+                }
+                .buttonStyle(.plain)
+            }
+            if expanded {
+                ledger("Features", state.features)
+                ledger("Fixes", state.fixes)
+                ledger("Decisions", state.decisions)
+                if !state.sources.isEmpty {
+                    factGroup("Sources", state.sources.map { "• \($0)" })
+                }
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 10).fill(.quaternary.opacity(0.3)))
+    }
+
+    @ViewBuilder private func ledger(_ title: String, _ es: [LedgerEntry]) -> some View {
+        if !es.isEmpty {
+            factGroup(title, es.map { "• [\($0.project)] \($0.text)" })
+        }
+    }
+
+    private func factGroup(_ title: String, _ lines: [String]) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title.uppercased()).font(.caption2.weight(.semibold)).foregroundStyle(.tertiary)
+            ForEach(lines, id: \.self) { Text($0).font(.caption).foregroundStyle(.secondary) }
+        }
+        .padding(.top, 2)
+    }
+
+    private var dotColor: Color {
+        switch liveStatus {
+        case .running: return .green
+        case .away: return .yellow
+        case .needsAttention: return .orange
+        case .idle: return .blue
+        case .none, .some: return .gray   // inactive / not currently live
+        }
+    }
+
+    private func relative(_ iso: String) -> String {
+        guard let d = ISO8601.formatter.date(from: iso) else { return "" }
+        let s = Int(Date().timeIntervalSince(d))
+        if s < 60 { return "\(s)s ago" }
+        if s < 3600 { return "\(s / 60)m ago" }
+        if s < 86400 { return "\(s / 3600)h ago" }
+        return "\(s / 86400)d ago"
+    }
+}
+
 struct ContentView: View {
     @EnvironmentObject var store: AgentStore
 
@@ -2601,7 +2763,9 @@ struct ContentView: View {
             VStack(spacing: 0) {
                 header
                 Divider()
-                if store.agents.isEmpty {
+                if store.dashboardMode {
+                    DashboardView()
+                } else if store.agents.isEmpty {
                     emptyState
                 } else {
                     HStack(spacing: 0) {
@@ -2699,6 +2863,15 @@ struct ContentView: View {
             }
             .buttonStyle(.borderless)
             .help("Toggle bubbles overlay (⌥⌘B)")
+
+            Button {
+                store.dashboardMode.toggle()
+            } label: {
+                Image(systemName: store.dashboardMode ? "square.text.grid.1x2.fill" : "square.text.grid.1x2")
+                    .foregroundStyle(store.dashboardMode ? Color.accentColor : Color.secondary)
+            }
+            .buttonStyle(.borderless)
+            .help(store.dashboardMode ? "Live sessions view" : "Summaries dashboard")
 
             Button {
                 store.statsOverlayOpen.toggle()
@@ -2996,6 +3169,12 @@ struct AgentRow: View {
 struct SettingsView: View {
     @EnvironmentObject var store: AgentStore
 
+    // Housekeeping config — same UserDefaults keys HousekeepingGenerator reads.
+    @AppStorage("agentMonitor.housekeepingEnabled") private var hkEnabled = true
+    @AppStorage("agentMonitor.housekeepingProvider") private var hkProvider = "auto"
+    @AppStorage("agentMonitor.housekeepingHeartbeatSec") private var hkHeartbeat = 120.0
+    @AppStorage("agentMonitor.housekeepingMarkdownDir") private var hkMarkdownDir = ""
+
     private var nativeBanners: Binding<Bool> {
         Binding(get: { store.localNotifier.enabled },
                 set: { store.localNotifier.enabled = $0 })
@@ -3034,6 +3213,27 @@ struct SettingsView: View {
                 Section("AI") {
                     Toggle("Generate session titles (Haiku)", isOn: $store.titleGenerationEnabled)
                     Text("Tags are generated on demand via the ✨ button when you name an agent.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+
+                Section("Housekeeping") {
+                    Toggle("Keep live session summaries", isOn: $hkEnabled)
+                    Picker("Backend", selection: $hkProvider) {
+                        Text("Auto (key → Haiku, else claude -p)").tag("auto")
+                        Text("claude -p (subscription)").tag("claudeP")
+                        Text("Haiku API (needs API key)").tag("haikuApi")
+                    }
+                    .disabled(!hkEnabled)
+                    HStack {
+                        Text("Heartbeat")
+                        Spacer()
+                        Text("\(Int(hkHeartbeat))s").foregroundStyle(.secondary)
+                    }
+                    Slider(value: $hkHeartbeat, in: 30...600, step: 30).disabled(!hkEnabled)
+                    TextField("Markdown export dir (optional)", text: $hkMarkdownDir)
+                        .textFieldStyle(.roundedBorder)
+                        .disabled(!hkEnabled)
+                    Text("Folds a running summary + facts per session into ~/.claude/agent-monitor-summaries/. Set a markdown dir (e.g. ~/notes/jonathan/claude-sessions) to also export a note on turn boundaries.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
 
@@ -3739,7 +3939,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // on top, lives in its own Space).
     private func makeMainWindow() {
         mainWindow = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 560, height: 360),
+            contentRect: NSRect(x: 0, y: 0, width: 720, height: 480),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered, defer: false
         )
@@ -3747,6 +3947,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         mainWindow.titlebarAppearsTransparent = true
         mainWindow.isMovableByWindowBackground = true
         mainWindow.isReleasedWhenClosed = false
+        // Allow native fullscreen so the dashboard can fill a second display.
+        mainWindow.collectionBehavior.insert(.fullScreenPrimary)
         mainWindow.contentView = NSHostingView(
             rootView: ContentView().environmentObject(store)
         )
