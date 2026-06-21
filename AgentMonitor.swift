@@ -2885,6 +2885,7 @@ struct ReportView: View {
     @EnvironmentObject var store: AgentStore
     private let accent = Color.orange   // the one highlight; everything else is secondary
     private var scale: CGFloat { CGFloat(store.reportFontScale) }
+    @State private var expanded: Set<String> = []   // collapsible sections; default all collapsed
 
     var body: some View {
         let s = store.housekeeping[sessionId]
@@ -2982,23 +2983,42 @@ struct ReportView: View {
 
     /// A titled section: a muted accent bar + icon + caps label, content aligned to one
     /// shared left margin so the eye runs straight down the report. Single accent palette.
+    /// A collapsible titled section (default collapsed): a muted accent bar + a header
+    /// that toggles open, showing an item count and a chevron. Content aligns to one
+    /// shared left margin.
     private func sectionFrame<Content: View>(
-        _ title: String, _ icon: String, @ViewBuilder _ content: () -> Content
+        _ title: String, _ icon: String, count: Int, @ViewBuilder _ content: () -> Content
     ) -> some View {
-        HStack(alignment: .top, spacing: 12) {
+        let isOpen = expanded.contains(title)
+        return HStack(alignment: .top, spacing: 12) {
             RoundedRectangle(cornerRadius: 2).fill(.secondary.opacity(0.3)).frame(width: 3)
             VStack(alignment: .leading, spacing: 6) {
-                Label(title.uppercased(), systemImage: icon)
-                    .font(.system(size: 11 * scale, weight: .bold)).tracking(0.5)
-                    .foregroundStyle(.secondary).labelStyle(.titleAndIcon).imageScale(.small)
-                content()
+                Button {
+                    withAnimation(.easeInOut(duration: 0.15)) {
+                        if isOpen { expanded.remove(title) } else { expanded.insert(title) }
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        Label(title.uppercased(), systemImage: icon)
+                            .font(.system(size: 11 * scale, weight: .bold)).tracking(0.5)
+                            .foregroundStyle(.secondary).labelStyle(.titleAndIcon).imageScale(.small)
+                        Text("\(count)")
+                            .font(.system(size: 10 * scale, weight: .semibold)).foregroundStyle(.tertiary)
+                        Image(systemName: isOpen ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 8 * scale, weight: .semibold)).foregroundStyle(.tertiary)
+                        Spacer(minLength: 0)
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                if isOpen { content() }
             }
         }
     }
 
     @ViewBuilder private func ledgerSection(_ title: String, _ icon: String, _ es: [LedgerEntry], tag: Bool) -> some View {
         if !es.isEmpty {
-            sectionFrame(title, icon) {
+            sectionFrame(title, icon, count: es.count) {
                 ForEach(es.indices, id: \.self) { i in
                     bullet {
                         HStack(alignment: .firstTextBaseline, spacing: 6) {
@@ -3013,7 +3033,7 @@ struct ReportView: View {
 
     @ViewBuilder private func listSection(_ title: String, _ icon: String, _ xs: [String]) -> some View {
         if !xs.isEmpty {
-            sectionFrame(title, icon) {
+            sectionFrame(title, icon, count: xs.count) {
                 ForEach(xs, id: \.self) { x in bullet { Text(x).foregroundStyle(.secondary) } }
             }
         }
