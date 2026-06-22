@@ -1673,6 +1673,13 @@ final class AgentStore: ObservableObject {
     // that coexists with the regular (normal-level) main window.
     @Published var bubblesVisible: Bool = false
     @Published var bubbleCorner: BubbleCorner = .topRight
+    // Which display the overlay lives on. Empty = the main display. Stored by the
+    // display's localized name so it survives relaunch / replug. The panel can only
+    // float over fullscreen apps on the display it actually sits on, so on a
+    // multi-monitor setup you pin it to the screen where you run fullscreen apps.
+    @Published var bubbleDisplay: String = UserDefaults.standard.string(forKey: "agentMonitor.bubbleDisplay") ?? "" {
+        didSet { UserDefaults.standard.set(bubbleDisplay, forKey: "agentMonitor.bubbleDisplay") }
+    }
     // "Expand": also show inactive sessions in the overlay (dimmed + smaller).
     @Published var showInactive: Bool = false
     // User-assigned display names (per session). Shown in the bubble + main
@@ -3766,6 +3773,14 @@ struct SettingsView: View {
                     Picker("Corner", selection: $store.bubbleCorner) {
                         ForEach(BubbleCorner.allCases) { Text($0.label).tag($0) }
                     }
+                    Picker("Display", selection: $store.bubbleDisplay) {
+                        Text("Main display").tag("")
+                        ForEach(NSScreen.screens, id: \.self) { screen in
+                            Text(screen.localizedName).tag(screen.localizedName)
+                        }
+                    }
+                    Text("Bubbles float over fullscreen apps only on the display they live on. On a multi-monitor setup, pick the screen where you run fullscreen apps.")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
 
                 Section("Notifications") {
@@ -4660,6 +4675,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         store.$bubbleCorner
             .sink { [weak self] _ in self?.repositionBubblePanel() }
             .store(in: &cancellables)
+        // Re-pin when the user picks a different display...
+        store.$bubbleDisplay
+            .sink { [weak self] _ in self?.repositionBubblePanel() }
+            .store(in: &cancellables)
+        // ...or when displays are connected / disconnected / rearranged (the
+        // chosen screen may have moved or vanished — fall back to main).
+        NotificationCenter.default.publisher(for: NSApplication.didChangeScreenParametersNotification)
+            .sink { [weak self] _ in self?.repositionBubblePanel() }
+            .store(in: &cancellables)
 
         setBubbles(store.bubblesVisible)
         hotKeys = HotKeyManager(store: store)
@@ -4699,8 +4723,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    // The display the overlay should live on: the user's chosen screen (by
+    // localized name), falling back to the main screen if unset or unplugged.
+    private func targetBubbleScreen() -> NSScreen? {
+        let chosen = store.bubbleDisplay
+        if !chosen.isEmpty,
+           let screen = NSScreen.screens.first(where: { $0.localizedName == chosen }) {
+            return screen
+        }
+        return NSScreen.main ?? NSScreen.screens.first
+    }
+
     private func makeBubblePanel() {
-        let frame = (NSScreen.main ?? NSScreen.screens.first)?.visibleFrame
+        let frame = targetBubbleScreen()?.visibleFrame
             ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         bubblePanel = OverlayPanel(
             contentRect: frame,
@@ -4722,7 +4757,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func repositionBubblePanel() {
         guard bubblePanel != nil, store.bubblesVisible else { return }
-        if let screen = NSScreen.main ?? NSScreen.screens.first {
+        if let screen = targetBubbleScreen() {
             bubblePanel.setFrame(screen.visibleFrame, display: true)
         }
     }
