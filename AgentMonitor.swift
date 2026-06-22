@@ -1834,6 +1834,7 @@ final class AgentStore: ObservableObject {
         }
     }
     @Published var settingsOverlayOpen: Bool = false
+    @Published var commsOverlayOpen: Bool = false
     @Published var fileURL: URL
     @Published var soundEnabled: Bool = true
     @Published var titleGenerationEnabled: Bool = true
@@ -3119,10 +3120,16 @@ struct ContentView: View {
                     .background(.regularMaterial)
                     .transition(.opacity)
             }
+            if store.commsOverlayOpen {
+                CommsDashboardView()
+                    .background(.regularMaterial)
+                    .transition(.opacity)
+            }
         }
         .frame(minWidth: 520, minHeight: 260)
         .animation(.easeInOut(duration: 0.18), value: store.statsOverlayOpen)
         .animation(.easeInOut(duration: 0.18), value: store.settingsOverlayOpen)
+        .animation(.easeInOut(duration: 0.18), value: store.commsOverlayOpen)
         .animation(.easeInOut(duration: 0.18), value: store.showSidebar)
     }
 
@@ -3261,6 +3268,15 @@ struct ContentView: View {
             }
             .buttonStyle(.borderless)
             .help(store.settingsOverlayOpen ? "Close settings" : "Settings")
+
+            Button {
+                store.commsOverlayOpen.toggle()
+            } label: {
+                Image(systemName: "bubble.left.and.bubble.right")
+                    .foregroundStyle(store.commsOverlayOpen ? Color.accentColor : Color.secondary)
+            }
+            .buttonStyle(.borderless)
+            .help(store.commsOverlayOpen ? "Close comms board" : "Comms board")
 
             Button {
                 store.reload()
@@ -3537,6 +3553,183 @@ struct AgentRow: View {
 
 // MARK: - Settings overlay
 
+// MARK: - Comms board dashboard (viewer of the inter-agent comms broker)
+
+struct CommsAgent: Identifiable {
+    let id: String        // full host:alias
+    let host: String
+    let name: String      // alias
+    let owner: String
+    let armed: Bool
+}
+
+struct CommsMsg: Identifiable {
+    let id: String
+    let from: String
+    let to: String
+    let scope: String
+    let body: String
+    let ts: String
+}
+
+struct CommsDashboardView: View {
+    @EnvironmentObject var store: AgentStore
+    @State private var agents: [CommsAgent] = []
+    @State private var messages: [CommsMsg] = []
+    @State private var loaded = false
+    private let timer = Timer.publish(every: 10, on: .main, in: .common).autoconnect()
+
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+            Divider()
+            if commsCreds() == nil {
+                notConnected
+            } else {
+                HStack(spacing: 0) {
+                    agentsPane.frame(width: 260)
+                    Divider()
+                    messagesPane
+                }
+            }
+        }
+        .onAppear { refresh() }
+        .onReceive(timer) { _ in if store.commsOverlayOpen { refresh() } }
+    }
+
+    private var header: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "bubble.left.and.bubble.right").foregroundStyle(.tint)
+            Text("Comms Board").font(.headline)
+            Spacer()
+            Text("\(agents.count) agents · \(messages.count) messages")
+                .font(.caption).foregroundStyle(.secondary)
+            Button { refresh() } label: { Image(systemName: "arrow.clockwise") }
+                .buttonStyle(.borderless).help("Refresh")
+            Button { store.commsOverlayOpen = false } label: { Image(systemName: "xmark.circle.fill") }
+                .buttonStyle(.borderless).help("Close")
+        }
+        .padding(.horizontal, 12).padding(.vertical, 9)
+    }
+
+    private var agentsPane: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("AGENTS").font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
+                .padding(.horizontal, 12).padding(.vertical, 6)
+            List(agents) { a in
+                HStack(spacing: 8) {
+                    Circle().fill(a.armed ? Color.green : Color.secondary.opacity(0.35))
+                        .frame(width: 8, height: 8)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(a.name).font(.callout.weight(.medium)).lineLimit(1)
+                        Text(a.owner.isEmpty ? a.host : "\(a.host) · \(a.owner)")
+                            .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                    }
+                    Spacer()
+                }
+            }
+            .listStyle(.inset)
+        }
+    }
+
+    private var messagesPane: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("COMMUNICATIONS").font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
+                .padding(.horizontal, 12).padding(.vertical, 6)
+            if messages.isEmpty {
+                Text(loaded ? "No messages you can see yet." : "Loading…")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                List(messages) { m in
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 5) {
+                            Text(m.from).font(.caption.weight(.semibold))
+                            Image(systemName: "arrow.right").font(.system(size: 8)).foregroundStyle(.secondary)
+                            Text(m.scope == "global" ? "everyone" : m.to)
+                                .font(.caption).foregroundStyle(.secondary)
+                            Spacer()
+                            Text(shortTime(m.ts)).font(.caption2).foregroundStyle(.secondary)
+                        }
+                        Text(m.body).font(.caption).foregroundStyle(.primary).lineLimit(4)
+                    }
+                    .padding(.vertical, 2)
+                }
+                .listStyle(.inset)
+            }
+        }
+    }
+
+    private var notConnected: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "antenna.radiowaves.left.and.right.slash")
+                .font(.largeTitle).foregroundStyle(.secondary)
+            Text("Not connected to a comms board.").foregroundStyle(.secondary)
+            Button("Open Settings → Comms Board") {
+                store.commsOverlayOpen = false
+                store.settingsOverlayOpen = true
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    // ---- networking ----
+    private func commsCreds() -> (api: String, token: String)? {
+        let url = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".claude/settings.json")
+        guard let data = try? Data(contentsOf: url),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let env = root["env"] as? [String: Any],
+              let api = env["COMMS_API"] as? String, !api.isEmpty,
+              let token = env["COMMS_TOKEN"] as? String, !token.isEmpty else { return nil }
+        return (api, token)
+    }
+
+    private func get(_ path: String, _ done: @escaping ([String: Any]?) -> Void) {
+        guard let c = commsCreds(), let url = URL(string: c.api + path) else { done(nil); return }
+        var r = URLRequest(url: url)
+        r.setValue("Bearer \(c.token)", forHTTPHeaderField: "Authorization")
+        r.setValue("comms-cli/1.0", forHTTPHeaderField: "User-Agent")
+        r.timeoutInterval = 12
+        URLSession.shared.dataTask(with: r) { d, _, _ in
+            var obj: [String: Any]? = nil
+            if let d = d { obj = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] }
+            DispatchQueue.main.async { done(obj) }
+        }.resume()
+    }
+
+    private func refresh() {
+        get("/who") { o in
+            guard let arr = o?["agents"] as? [[String: Any]] else { return }
+            agents = arr.map { a in
+                let id = a["id"] as? String ?? "?"
+                return CommsAgent(id: id,
+                                  host: a["host"] as? String ?? "",
+                                  name: id.components(separatedBy: ":").last ?? id,
+                                  owner: a["owner"] as? String ?? "",
+                                  armed: a["armed"] as? Bool ?? false)
+            }
+        }
+        get("/log?all=1") { o in
+            loaded = true
+            guard let arr = o?["messages"] as? [[String: Any]] else { return }
+            let ms = arr.map { m in
+                CommsMsg(id: m["id"] as? String ?? UUID().uuidString,
+                         from: m["from"] as? String ?? "",
+                         to: m["to"] as? String ?? "all",
+                         scope: m["scope"] as? String ?? "",
+                         body: m["body"] as? String ?? "",
+                         ts: m["ts"] as? String ?? "")
+            }
+            messages = Array(ms.reversed())  // newest first
+        }
+    }
+
+    private func shortTime(_ iso: String) -> String {
+        guard let t = iso.split(separator: "T").last else { return iso }
+        return String(t.prefix(5))
+    }
+}
+
 struct SettingsView: View {
     @EnvironmentObject var store: AgentStore
 
@@ -3545,6 +3738,13 @@ struct SettingsView: View {
     @AppStorage("agentMonitor.housekeepingProvider") private var hkProvider = "auto"
     @AppStorage("agentMonitor.housekeepingHeartbeatSec") private var hkHeartbeat = 120.0
     @AppStorage("agentMonitor.housekeepingMarkdownDir") private var hkMarkdownDir = ""
+
+    // Comms board connection — persisted in ~/.claude/settings.json env, loaded on appear.
+    @State private var commsApi = ""
+    @State private var commsHost = ""
+    @State private var commsToken = ""
+    @State private var commsStatus = ""
+    @State private var commsBusy = false
 
     private var nativeBanners: Binding<Bool> {
         Binding(get: { store.localNotifier.enabled },
@@ -3624,6 +3824,25 @@ struct SettingsView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
 
+                Section("Comms Board") {
+                    TextField("Host (e.g. personal)", text: $commsHost)
+                    TextField("Server URL (https://…)", text: $commsApi)
+                    SecureField("API token", text: $commsToken)
+                    HStack {
+                        Button(commsBusy ? "Connecting…" : "Connect & Verify") { commsConnect() }
+                            .disabled(commsBusy || commsApi.isEmpty || commsHost.isEmpty || commsToken.isEmpty)
+                        Spacer()
+                        if !commsStatus.isEmpty {
+                            Text(commsStatus)
+                                .font(.caption)
+                                .foregroundStyle(commsStatus.hasPrefix("✓") ? Color.green : Color.red)
+                                .lineLimit(1).truncationMode(.tail)
+                        }
+                    }
+                    Text("Connect this Mac to the inter-agent comms board: saves your credentials to ~/.claude/settings.json, installs the comms CLI (~/.local/bin/comms, added to your shell PATH) and the open-comms skill, and verifies — so your Claude Code sessions can join in one click. Get the host, URL, and token from the board operator.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+
                 Section("Shortcuts") {
                     shortcut("⌥⌘B", "Toggle bubbles overlay")
                     shortcut("⌥⌘C", "Move overlay to next corner")
@@ -3638,6 +3857,121 @@ struct SettingsView: View {
                 }
             }
             .formStyle(.grouped)
+            .onAppear { loadCommsConfig() }
+        }
+    }
+
+    private func loadCommsConfig() {
+        let url = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".claude/settings.json")
+        guard let data = try? Data(contentsOf: url),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let env = root["env"] as? [String: Any] else { return }
+        commsApi = env["COMMS_API"] as? String ?? ""
+        commsHost = env["COMMS_HOST"] as? String ?? ""
+        commsToken = env["COMMS_TOKEN"] as? String ?? ""
+    }
+
+    // Persist the creds into ~/.claude/settings.json env (so Claude Code sessions inherit them),
+    // then verify the connection against the broker's /who.
+    private func commsConnect() {
+        commsBusy = true; commsStatus = ""
+        let api = commsApi.trimmingCharacters(in: .whitespaces)
+        let host = commsHost.trimmingCharacters(in: .whitespaces)
+        let token = commsToken.trimmingCharacters(in: .whitespaces)
+
+        let settingsURL = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".claude/settings.json")
+        var root: [String: Any] = [:]
+        if let data = try? Data(contentsOf: settingsURL),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            root = obj
+        }
+        var env = (root["env"] as? [String: Any]) ?? [:]
+        env["COMMS_API"] = api; env["COMMS_TOKEN"] = token; env["COMMS_HOST"] = host
+        root["env"] = env
+        do {
+            try FileManager.default.createDirectory(at: settingsURL.deletingLastPathComponent(),
+                                                     withIntermediateDirectories: true)
+            let out = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
+            try out.write(to: settingsURL)
+        } catch {
+            commsStatus = "⚠︎ settings.json: \(error.localizedDescription)"; commsBusy = false; return
+        }
+
+        guard let url = URL(string: api + "/who") else {
+            commsStatus = "⚠︎ invalid URL"; commsBusy = false; return
+        }
+        var req = URLRequest(url: url)
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.setValue("comms-cli/1.0", forHTTPHeaderField: "User-Agent")  // Cloudflare blocks default UAs
+        req.timeoutInterval = 12
+        URLSession.shared.dataTask(with: req) { data, resp, err in
+            DispatchQueue.main.async {
+                commsBusy = false
+                if let err = err { commsStatus = "⚠︎ \(err.localizedDescription)"; return }
+                let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                if code == 200 {
+                    var n = 0
+                    if let d = data,
+                       let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+                       let agents = o["agents"] as? [Any] { n = agents.count }
+                    commsStatus = "✓ Connected — installing CLI + skill…"
+                    installCommsTooling(api: api, token: token) { ok in
+                        commsStatus = ok
+                            ? "✓ Connected as \(host) — \(n) on the board, CLI + skill installed"
+                            : "✓ Connected as \(host) — \(n) on the board (CLI/skill install failed)"
+                    }
+                } else if code == 401 {
+                    commsStatus = "⚠︎ unauthorized (check token)"
+                } else {
+                    commsStatus = "⚠︎ HTTP \(code)"
+                }
+            }
+        }.resume()
+    }
+
+    // Download the CLI + skill from the broker's bearer-gated endpoints and install them,
+    // so a brand-new machine is fully set up to participate — in one click.
+    private func installCommsTooling(api: String, token: String, done: @escaping (Bool) -> Void) {
+        let group = DispatchGroup()
+        var ok = true
+        func fetch(_ path: String, to dest: URL, exec: Bool) {
+            group.enter()
+            guard let url = URL(string: api + path) else { ok = false; group.leave(); return }
+            var r = URLRequest(url: url)
+            r.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            r.setValue("comms-cli/1.0", forHTTPHeaderField: "User-Agent")
+            r.timeoutInterval = 12
+            URLSession.shared.dataTask(with: r) { d, resp, _ in
+                defer { group.leave() }
+                guard let d = d, (resp as? HTTPURLResponse)?.statusCode == 200 else { ok = false; return }
+                do {
+                    try FileManager.default.createDirectory(at: dest.deletingLastPathComponent(),
+                                                            withIntermediateDirectories: true)
+                    try d.write(to: dest)
+                    if exec {
+                        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dest.path)
+                    }
+                } catch { ok = false }
+            }.resume()
+        }
+        let home = NSHomeDirectory()
+        fetch("/cli", to: URL(fileURLWithPath: home).appendingPathComponent(".local/bin/comms"), exec: true)
+        fetch("/skill", to: URL(fileURLWithPath: home).appendingPathComponent(".claude/skills/open-comms/SKILL.md"), exec: false)
+        group.notify(queue: .main) { ensureLocalBinOnPath(); done(ok) }
+    }
+
+    // On a fresh Mac, ~/.local/bin is NOT on the default PATH, so the installed `comms`
+    // wouldn't be found. Add it to the user's zsh profile (idempotent), so new shells —
+    // and thus Claude Code's tool calls — can resolve it. Creates the profile if missing.
+    private func ensureLocalBinOnPath() {
+        let home = NSHomeDirectory()
+        let exportLine = "export PATH=\"$HOME/.local/bin:$PATH\"  # added by AgentMonitor comms wizard\n"
+        for name in [".zprofile", ".zshrc"] {
+            let f = URL(fileURLWithPath: home).appendingPathComponent(name)
+            let existing = (try? String(contentsOf: f, encoding: .utf8)) ?? ""
+            if existing.contains(".local/bin") { continue }   // already wired up in this file
+            let sep = (existing.isEmpty || existing.hasSuffix("\n")) ? "" : "\n"
+            try? (existing + sep + exportLine).write(to: f, atomically: true, encoding: .utf8)
         }
     }
 
