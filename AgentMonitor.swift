@@ -1075,6 +1075,12 @@ final class AgentStore: ObservableObject {
     // that coexists with the regular (normal-level) main window.
     @Published var bubblesVisible: Bool = false
     @Published var bubbleCorner: BubbleCorner = .topRight
+    // Live frames of the on-screen bubbles, in the overlay's SwiftUI `.global`
+    // space (top-left origin). The overlay window spans the whole screen and so
+    // must stay click-through; the AppDelegate flips it interactive only while
+    // the cursor is inside one of these rects. Not @Published — it's polled on
+    // mouse move, not observed by the view.
+    var bubbleHitRects: [CGRect] = []
     // "Expand": also show inactive sessions in the overlay (dimmed + smaller).
     @Published var showInactive: Bool = false
     // User-assigned display names (per session). Shown in the bubble + main
@@ -2953,19 +2959,33 @@ enum Ghostty {
 
 // MARK: - Floating bubbles overlay
 
+/// Collects every bubble's on-screen frame (overlay `.global` space) so the
+/// app can keep the full-screen overlay click-through everywhere except over a
+/// bubble. NSHostingView.hitTest reports the whole panel as hittable, so we
+/// can't rely on it — these measured rects are authoritative.
+private struct BubbleFramesKey: PreferenceKey {
+    static var defaultValue: [CGRect] = []
+    static func reduce(value: inout [CGRect], nextValue: () -> [CGRect]) {
+        value.append(contentsOf: nextValue())
+    }
+}
+
 struct BubblesView: View {
     @EnvironmentObject var store: AgentStore
 
     var body: some View {
         let bubbles = store.bubbleAgents
         ZStack(alignment: store.bubbleCorner.alignment) {
-            Color.clear
+            // Non-hittable so empty overlay area stays click-through (only the
+            // bubbles themselves capture clicks).
+            Color.clear.allowsHitTesting(false)
             VStack(alignment: store.bubbleCorner.horizontalAlignment, spacing: 9) {
                 ForEach(Array(bubbles.enumerated()), id: \.element.id) { idx, agent in
                     // 1-based number; only the first 9 get a ⌥N hotkey.
                     BubbleView(agent: agent,
                                number: idx < 9 ? idx + 1 : nil,
-                               customName: store.customName(for: agent.id))
+                               customName: store.customName(for: agent.id),
+                               onTap: { store.focus(agent: agent) })
                         .transition(.scale(scale: 0.85).combined(with: .opacity))
                 }
             }
@@ -2974,6 +2994,7 @@ struct BubblesView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .animation(.spring(response: 0.4, dampingFraction: 0.82), value: store.bubbleCorner)
         .animation(.easeInOut(duration: 0.25), value: bubbles.map(\.id))
+        .onPreferenceChange(BubbleFramesKey.self) { store.bubbleHitRects = $0 }
     }
 }
 
@@ -2981,7 +3002,9 @@ struct BubbleView: View {
     let agent: Agent
     var number: Int? = nil
     var customName: String? = nil
+    var onTap: () -> Void = {}
     @State private var pulse = false
+    @State private var hovering = false
 
     private var color: Color { statusColor(agent.status) }
 
@@ -3036,8 +3059,23 @@ struct BubbleView: View {
             }
         )
         .shadow(color: .black.opacity(0.3), radius: 6, y: 2)
-        .opacity(compact ? 0.55 : 1)
+        .opacity(compact ? (hovering ? 0.85 : 0.55) : 1)
+        .scaleEffect(hovering ? 1.04 : 1)
         .fixedSize()
+        // Whole capsule is the click target → jump to this session's terminal.
+        .contentShape(Capsule(style: .continuous))
+        .onTapGesture(perform: onTap)
+        .onHover { hovering = $0 }
+        .animation(.easeOut(duration: 0.12), value: hovering)
+        .help("Jump to this session's terminal")
+        // Publish this bubble's frame so the overlay knows exactly where to be
+        // interactive (everywhere else stays click-through).
+        .background(
+            GeometryReader { geo in
+                Color.clear
+                    .preference(key: BubbleFramesKey.self, value: [geo.frame(in: .global)])
+            }
+        )
     }
 
     private var dot: some View {
@@ -3180,6 +3218,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let store = AgentStore()
     private var mainWindow: NSWindow!
     private var bubblePanel: OverlayPanel!
+    private var bubbleHostingView: NSView?
+    private var mouseMonitors: [Any] = []
     private var hotKeys: HotKeyManager?
     private var cancellables: Set<AnyCancellable> = []
 
@@ -3240,14 +3280,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         bubblePanel.isOpaque = false
         bubblePanel.backgroundColor = .clear
         bubblePanel.hasShadow = false
-        bubblePanel.ignoresMouseEvents = true   // click-through: purely ambient
+        // This panel spans the whole screen, so it must stay click-through:
+        // ignoresMouseEvents=false on a full-screen window eats EVERY click
+        // (the window consumes events even where hitTest returns nil — it does
+        // not fall through to the app below). We instead keep it click-through
+        // and flip ignoresMouseEvents off only while the cursor is over a
+        // bubble (see installMouseTracking). So empty area = terminal stays
+        // fully interactive; bubbles still capture clicks.
+        bubblePanel.ignoresMouseEvents = true
         bubblePanel.level = .screenSaver         // float above fullscreen apps
         bubblePanel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         bubblePanel.hidesOnDeactivate = false
         bubblePanel.isReleasedWhenClosed = false
-        bubblePanel.contentView = NSHostingView(
-            rootView: BubblesView().environmentObject(store)
-        )
+        let hosting = NSHostingView(rootView: BubblesView().environmentObject(store))
+        bubblePanel.contentView = hosting
+        bubbleHostingView = hosting
+        installMouseTracking()
+    }
+
+    // Make the overlay interactive only where a bubble actually is. A global
+    // monitor sees mouse movement even while another app is frontmost (the
+    // usual case for the overlay); a local monitor covers the case where we're
+    // frontmost. Each move geometry-tests the cursor against the measured
+    // bubble frames: over a bubble → capture clicks; over empty area → stay
+    // click-through so the click reaches the terminal underneath. Mouse-event
+    // monitors need no Accessibility permission.
+    private func installMouseTracking() {
+        let onMove: (NSEvent) -> Void = { [weak self] _ in self?.updateOverlayClickThrough() }
+        if let g = NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved], handler: onMove) {
+            mouseMonitors.append(g)
+        }
+        if let l = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved], handler: { [weak self] ev in
+            self?.updateOverlayClickThrough(); return ev
+        }) {
+            mouseMonitors.append(l)
+        }
+    }
+
+    private func updateOverlayClickThrough() {
+        guard let panel = bubblePanel, panel.isVisible, let hosting = bubbleHostingView else { return }
+        let rects = store.bubbleHitRects
+        guard !rects.isEmpty else {
+            if !panel.ignoresMouseEvents { panel.ignoresMouseEvents = true }
+            return
+        }
+        // NSEvent.mouseLocation: screen coords, bottom-left origin.
+        // Bubble rects: overlay `.global` space, top-left origin. Convert the
+        // cursor into that space (window point, then flip Y by the content
+        // height) and test it against the measured bubble frames.
+        let windowPoint = panel.convertPoint(fromScreen: NSEvent.mouseLocation)
+        let p = CGPoint(x: windowPoint.x, y: hosting.bounds.height - windowPoint.y)
+        let overBubble = rects.contains { $0.contains(p) }
+        if panel.ignoresMouseEvents == overBubble {
+            panel.ignoresMouseEvents = !overBubble
+        }
     }
 
     private func repositionBubblePanel() {
@@ -3263,6 +3349,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             repositionBubblePanel()
             panel.orderFrontRegardless()
         } else {
+            // Reset to click-through so a hidden panel can never block clicks.
+            panel.ignoresMouseEvents = true
             panel.orderOut(nil)
         }
     }
