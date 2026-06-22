@@ -899,6 +899,382 @@ final class TranscriptReader {
     }
 }
 
+// MARK: - Housekeeping delta projection
+
+/// Projects a transcript slice into the compact `U:/A:/T:` lines the housekeeping
+/// fold consumes. Independent of TranscriptReader's live `ParseState` (which trims
+/// its middle to bound memory) — housekeeping keeps its own byte cursor and reads
+/// only the bytes appended since the last fold. Tool-result bodies, thinking blocks,
+/// and `isMeta` injections are dropped; each `tool_use` collapses to `Tool(keyArg)`,
+/// where keyArg is the one field that matters (file touched, command, query, …) —
+/// the raw material for the projects/sources/fixes ledgers.
+enum HousekeepingDelta {
+    static let userCap = 500
+    static let asstCap = 1200
+    static let bashCap = 60
+
+    /// Reads complete lines appended past `offset` and returns the projection plus
+    /// the advanced offset (a trailing partial line is left unconsumed, re-read whole
+    /// next time — same append-only discipline as TranscriptReader.ingestNewBytes).
+    static func project(path: String, from offset: UInt64) -> (lines: [String], newOffset: UInt64) {
+        guard let handle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: path)) else {
+            return ([], offset)
+        }
+        defer { try? handle.close() }
+        let newData: Data
+        do {
+            try handle.seek(toOffset: offset)
+            newData = try handle.readToEnd() ?? Data()
+        } catch {
+            return ([], offset)
+        }
+        guard !newData.isEmpty, let lastNL = newData.lastIndex(of: 0x0A) else { return ([], offset) }
+        let completeCount = newData.distance(from: newData.startIndex, to: lastNL) + 1
+        let newOffset = offset + UInt64(completeCount)
+
+        var lines: [String] = []
+        for lineData in newData.prefix(completeCount).split(separator: 0x0A, omittingEmptySubsequences: true) {
+            guard let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] else { continue }
+            switch obj["type"] as? String ?? "" {
+            case "user":
+                if (obj["isMeta"] as? Bool) == true { break }      // hook/meta injection
+                if let t = extractText(obj["message"]) {            // skips tool_result-only turns
+                    lines.append("U: \(cap(t, userCap))")
+                }
+            case "assistant":
+                guard let msg = obj["message"] as? [String: Any],
+                      let content = msg["content"] as? [[String: Any]] else { break }
+                for item in content {
+                    switch item["type"] as? String ?? "" {
+                    case "text":
+                        if let t = item["text"] as? String, !t.isEmpty {
+                            lines.append("A: \(cap(t, asstCap))")
+                        }
+                    case "tool_use":
+                        let name = item["name"] as? String ?? "?"
+                        let arg = keyArg(name: name, input: item["input"] as? [String: Any] ?? [:])
+                        lines.append(arg.isEmpty ? "T: \(name)" : "T: \(name)(\(arg))")
+                    default: break  // thinking, etc.
+                    }
+                }
+            default: break  // summary, etc.
+            }
+        }
+        return (lines, newOffset)
+    }
+
+    /// The one field that captures what a tool call did — feeds the ledgers.
+    private static func keyArg(name: String, input: [String: Any]) -> String {
+        func str(_ k: String) -> String? { input[k] as? String }
+        switch name {
+        case "Edit", "Write", "Read", "NotebookEdit", "MultiEdit":
+            return str("file_path").map(basename) ?? ""
+        case "Bash":
+            return str("command").map { cap(firstLine($0), bashCap) } ?? ""
+        case "Grep", "Glob":
+            return str("pattern") ?? ""
+        case "WebFetch":
+            return str("url").map(host) ?? ""
+        case "WebSearch":
+            return str("query") ?? ""
+        case "Task":
+            return str("description") ?? (str("subagent_type") ?? "")
+        default:
+            return ""  // tool name only
+        }
+    }
+
+    private static func extractText(_ message: Any?) -> String? {
+        guard let msg = message as? [String: Any] else { return nil }
+        if let s = msg["content"] as? String, !s.isEmpty { return s }
+        if let arr = msg["content"] as? [[String: Any]] {
+            let pieces = arr.compactMap { ($0["type"] as? String) == "text" ? $0["text"] as? String : nil }
+                .filter { !$0.isEmpty }
+            return pieces.isEmpty ? nil : pieces.joined(separator: " ")
+        }
+        return nil
+    }
+
+    private static func basename(_ p: String) -> String { (p as NSString).lastPathComponent }
+    private static func host(_ u: String) -> String { URL(string: u)?.host ?? u }
+    private static func firstLine(_ s: String) -> String { s.split(separator: "\n").first.map(String.init) ?? s }
+    private static func cap(_ s: String, _ n: Int) -> String {
+        s.count <= n ? s : String(s.prefix(n)) + "…"
+    }
+}
+
+// MARK: - Housekeeping state + fold
+
+/// One project-tagged ledger line (feature / fix / decision).
+struct LedgerEntry: Codable, Equatable {
+    var project: String
+    var text: String
+}
+
+/// Accumulated, persisted per-session state — the source of truth for both the next
+/// fold (passed back in) and the dashboard. `summary`/`status` are rewritten each fold;
+/// the ledgers are append-only. `offset` is the housekeeping byte cursor into the
+/// transcript (how far we've already folded). Metadata is app-managed, not model-emitted.
+struct HousekeepingState: Codable {
+    var title: String = ""           // PR-title concise, stable (changes only on a focus shift)
+    var subtitle: String = ""        // live, phase-aware, timely
+    var summary: String = ""         // detailed cumulative
+    var projects: [String] = []      // global set
+    var sources: [String] = []       // global set
+    var features: [LedgerEntry] = []
+    var fixes: [LedgerEntry] = []
+    var decisions: [LedgerEntry] = []
+
+    var sessionId: String = ""
+    var host: String = ""
+    var cwd: String = ""
+    var branch: String = ""
+    var started: String = ""
+    var updated: String = ""
+
+    var offset: UInt64 = 0
+
+    /// Folds a model result in: rewrite summary/status, append-dedupe the ledgers.
+    mutating func merge(_ f: HousekeepingFold) {
+        title = f.title
+        subtitle = f.subtitle
+        summary = f.summary
+        for p in f.newProjects ?? [] where !projects.contains(p) { projects.append(p) }
+        for s in f.newSources ?? [] where !sources.contains(s) { sources.append(s) }
+        for e in f.newFeatures ?? [] where !features.contains(e) { features.append(e) }
+        for e in f.newFixes ?? [] where !fixes.contains(e) { fixes.append(e) }
+        for e in f.newDecisions ?? [] where !decisions.contains(e) { decisions.append(e) }
+    }
+}
+
+/// What a single fold returns: the rewritten summary/status plus only the *new* ledger
+/// entries (append model — the app merges/dedupes).
+struct HousekeepingFold: Codable {
+    var title: String
+    var subtitle: String
+    var summary: String
+    var newProjects: [String]?
+    var newSources: [String]?
+    var newFeatures: [LedgerEntry]?
+    var newFixes: [LedgerEntry]?
+    var newDecisions: [LedgerEntry]?
+}
+
+/// Shared prompt — same instruction for both backends so they behave alike.
+enum FoldPrompt {
+    static let system = """
+    You maintain a long-lived, CUMULATIVE summary of a single Claude Code coding session.
+    Output STRICT JSON and nothing else — no prose, no markdown fences.
+
+    You are given:
+      - CURRENT SUMMARY: the running record of the WHOLE session so far. This is the
+        session's long-term memory — authoritative for everything that happened before now.
+      - CURRENT STATUS and the existing ledgers (features / fixes / decisions / sources /
+        projects).
+      - RECENT CONTEXT: the last several turns, to flesh out the summary with detail so it
+        isn't anchored to just the most recent message.
+      - NEW ACTIVITY: only what happened since the last update — use this for the LEDGERS.
+    Activity lines are compact:
+      U: a user message    A: the assistant's prose    T: Tool(arg) — a tool the assistant ran
+
+    Return JSON with this shape — THREE levels of conciseness (title → subtitle → summary),
+    plus the ledgers (omit or empty any array with nothing new):
+    {
+      "title":   string,   // The MOST concise level: a PR-title-style line (<= 12 words) — the
+                           // single best one-liner for what this session is/does. It must be
+                           // STABLE: you are given the CURRENT TITLE; keep it essentially the
+                           // same across updates. Only rewrite it if the session's focus has
+                           // changed substantially. Small wording tweaks are fine; drastic
+                           // rewrites only on a drastic change of what the session is about.
+      "subtitle": string,  // The LIVE level: a short line (<= 14 words) about the current PHASE
+                           // of the session — what's happening now and roughly where in the arc
+                           // (e.g. "wrapping up the dashboard polish", "debugging the fold
+                           //  pipeline", "just started — exploring the codebase", "blocked,
+                           //  awaiting permission"). This is the most dynamic line; expect it to
+                           // change every update and to reflect progress / timeliness.
+      "summary": string,   // The DETAILED level: the CUMULATIVE summary of the WHOLE session,
+                           // in MARKDOWN, structured TIMELY-FIRST. Prefer BULLET POINTS over
+                           // prose — avoid long paragraphs; most lines should be short `-`
+                           // bullets (one idea each). Group them under a few short `##`
+                           // subheaders ("## Now", "## Recently", "## Background"), each with a
+                           // handful of bullets. Use **bold** for key terms. Keep bullets tight
+                           // and scannable.
+                           // CRITICAL — DO NOT LOSE THE LONG-TERM ARC. The
+                           // CURRENT SUMMARY is your memory of everything before now: PRESERVE it
+                           // and weave the recent work in. NEVER collapse it into only the latest
+                           // step — the new work is an ADDITION, not a replacement. It grows
+                           // slower than the session, but only by compressing older detail, never
+                           // by dropping the earlier arc. A reader should still understand how the
+                           // session began and everything significant it has done.
+      "newFeatures":  [{"project": string, "text": string}],
+      "newFixes":     [{"project": string, "text": string}],
+      "newDecisions": [{"project": string, "text": string}],
+      "newProjects":  [string],
+      "newSources":   [string]
+    }
+
+    Ledgers are append-only and PERMANENT, drawn from the NEW ACTIVITY. Be strict — when in
+    doubt, LEAVE IT OUT; a wrong entry can never be removed. Emit only entries NOT already
+    present in the existing ledgers.
+    Inclusion tests:
+    - feature: a capability that now exists and didn't before. NOT refactors, NOT steps
+      toward one, NOT "improved X".
+      YES "added a manual refresh button"; NO "replaced the 1Hz poll with event-driven
+      reload" (internal — that's a decision).
+    - fix: a specific wrong behavior made right. NOT refactors / cleanups.
+      YES "fixed false away-flips during tool runs"; NO "renamed a function".
+    - decision: a choice between alternatives that constrains future work (architecture,
+      "use X not Y"). NOT mechanical picks.
+      YES "chose event-sourced single-path state mutation"; NO "used seekToEnd instead of
+      re-reading".
+    - source: a doc, note, or URL consulted for reference (API docs, a design note like
+      foo.md, a web page) — NOT the code files being edited.
+    - project: a repo / dir touched, repo level not file. `newProjects` must include
+      every project touched this update, including any name you use as a `project` tag
+      on a feature/fix/decision below.
+
+    Each feature/fix/decision carries the `project` it belongs to (a session may touch
+    several) — use the project name, not a path.
+    """
+
+    static func user(state: HousekeepingState, delta: [String], recent: [String]) -> String {
+        func entries(_ es: [LedgerEntry]) -> String {
+            es.isEmpty ? "(none)" : es.map { "- [\($0.project)] \($0.text)" }.joined(separator: "\n")
+        }
+        return """
+        CURRENT TITLE (keep stable — only rewrite on a substantial focus change): \(state.title.isEmpty ? "(none)" : state.title)
+        CURRENT SUBTITLE: \(state.subtitle.isEmpty ? "(none)" : state.subtitle)
+        CURRENT SUMMARY (the long-term record — preserve and extend, do not replace):
+        \(state.summary.isEmpty ? "(none yet)" : state.summary)
+
+        KNOWN PROJECTS: \(state.projects.isEmpty ? "(none)" : state.projects.joined(separator: ", "))
+        KNOWN SOURCES: \(state.sources.isEmpty ? "(none)" : state.sources.joined(separator: ", "))
+        EXISTING FEATURES:
+        \(entries(state.features))
+        EXISTING FIXES:
+        \(entries(state.fixes))
+        EXISTING DECISIONS:
+        \(entries(state.decisions))
+
+        RECENT CONTEXT (last several turns — for fleshing out the summary, NOT for ledgers):
+        \(recent.joined(separator: "\n"))
+
+        NEW ACTIVITY (since last update — use for the ledgers):
+        \(delta.joined(separator: "\n"))
+        """
+    }
+
+    /// Pulls the first balanced top-level JSON object out of a model's text reply
+    /// (for the `claude -p` path, which can wrap JSON in prose or ``` fences).
+    static func extractJSON(_ raw: String) -> Data? {
+        guard let start = raw.firstIndex(of: "{"), let end = raw.lastIndex(of: "}"),
+              start < end else { return nil }
+        return String(raw[start...end]).data(using: .utf8)
+    }
+}
+
+// MARK: - Housekeeping providers
+
+protocol HousekeepingProvider: Sendable {
+    /// `delta` = only the new activity since the last fold (drives the ledgers).
+    /// `recent` = a wider window of the last several turns (context for the summary, so it
+    /// isn't anchored to just the latest message).
+    func fold(state: HousekeepingState, delta: [String], recent: [String]) async -> HousekeepingFold?
+}
+
+enum HousekeepingProviderKind: String { case auto, claudeP, haikuApi }
+
+enum HousekeepingProviders {
+    /// `auto` → Haiku API when `ANTHROPIC_API_KEY` is set (metered, minimize tokens),
+    /// else `claude -p` (flat-rate subscription, no key).
+    static func resolve(_ kind: HousekeepingProviderKind) -> HousekeepingProvider {
+        switch kind {
+        case .haikuApi: return HaikuAPIProvider()
+        case .claudeP:  return ClaudePProvider()
+        case .auto:
+            let key = ProcessInfo.processInfo.environment["ANTHROPIC_API_KEY"] ?? ""
+            return key.isEmpty ? ClaudePProvider() : HaikuAPIProvider()
+        }
+    }
+}
+
+/// Subscription path: shells out via the shared `ClaudeP` runner (Haiku, OAuth, no key),
+/// prompts for JSON, parses defensively.
+struct ClaudePProvider: HousekeepingProvider {
+    func fold(state: HousekeepingState, delta: [String], recent: [String]) async -> HousekeepingFold? {
+        let user = FoldPrompt.user(state: state, delta: delta, recent: recent)
+        guard let out = ClaudeP.run(prompt: user, model: "claude-haiku-4-5",
+                                    systemPrompt: FoldPrompt.system),
+              let data = FoldPrompt.extractJSON(out),
+              let fold = try? JSONDecoder().decode(HousekeepingFold.self, from: data)
+        else { return nil }
+        return fold
+    }
+}
+
+/// Metered path: a direct Haiku 4.5 Messages API call with structured output, so the
+/// schema is enforced. Needs `ANTHROPIC_API_KEY`.
+struct HaikuAPIProvider: HousekeepingProvider {
+    func fold(state: HousekeepingState, delta: [String], recent: [String]) async -> HousekeepingFold? {
+        guard let key = ProcessInfo.processInfo.environment["ANTHROPIC_API_KEY"],
+              !key.isEmpty else { return nil }
+
+        let body: [String: Any] = [
+            "model": "claude-haiku-4-5",
+            "max_tokens": 1500,
+            "system": FoldPrompt.system,
+            "messages": [["role": "user", "content": FoldPrompt.user(state: state, delta: delta, recent: recent)]],
+            "output_config": ["format": ["type": "json_schema", "schema": Self.schema]],
+        ]
+        guard let payload = try? JSONSerialization.data(withJSONObject: body) else { return nil }
+
+        var req = URLRequest(url: URL(string: "https://api.anthropic.com/v1/messages")!)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue(key, forHTTPHeaderField: "x-api-key")
+        req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        req.httpBody = payload
+
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              (resp as? HTTPURLResponse)?.statusCode == 200,
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let content = obj["content"] as? [[String: Any]],
+              let text = content.first(where: { ($0["type"] as? String) == "text" })?["text"] as? String,
+              let jsonData = FoldPrompt.extractJSON(text),
+              let fold = try? JSONDecoder().decode(HousekeepingFold.self, from: jsonData)
+        else { return nil }
+        return fold
+    }
+
+    /// Structured-output schema: summary/status required, ledger arrays optional.
+    /// additionalProperties:false everywhere (required by structured outputs).
+    private static let schema: [String: Any] = {
+        let entry: [String: Any] = [
+            "type": "object",
+            "properties": ["project": ["type": "string"], "text": ["type": "string"]],
+            "required": ["project", "text"],
+            "additionalProperties": false,
+        ]
+        let strArr: [String: Any] = ["type": "array", "items": ["type": "string"]]
+        let entryArr: [String: Any] = ["type": "array", "items": entry]
+        return [
+            "type": "object",
+            "properties": [
+                "title": ["type": "string"],
+                "subtitle": ["type": "string"],
+                "summary": ["type": "string"],
+                "newProjects": strArr,
+                "newSources": strArr,
+                "newFeatures": entryArr,
+                "newFixes": entryArr,
+                "newDecisions": entryArr,
+            ],
+            "required": ["title", "subtitle", "summary"],
+            "additionalProperties": false,
+        ]
+    }()
+}
+
 // MARK: - Title generator (shells out to `claude -p` async)
 
 @MainActor
@@ -1033,6 +1409,228 @@ final class LiveStatusGenerator {
     }
 }
 
+// MARK: - Housekeeping generator (per-session running summary + facts)
+
+/// Side-car that maintains a slow-growing summary + quick-facts per session by folding
+/// only the new transcript delta on each trigger (Stop / permission / heartbeat / manual).
+/// Mirrors the title/live-status generators: gates cheaply on the main actor, runs the
+/// projection + provider call on a detached task, hops back to persist. JSON state is the
+/// source of truth; a markdown view is exported (throttled) for the Obsidian vault.
+@MainActor
+final class HousekeepingGenerator {
+    private var states: [String: HousekeepingState] = [:]
+    private var inFlight: Set<String> = []
+    // Depth-1 coalescing slot per session: a trigger that arrives while a fold is in
+    // flight is remembered (latest wins) and flushed exactly once when the fold finishes,
+    // so the tail of a burst (e.g. a Stop landing mid-fold) is never lost.
+    private var pending: [String: (path: String, cwd: String?, status: AgentStatus)] = [:]
+    private var lastFoldAt: [String: Date] = [:]
+    var onUpdated: ((String) -> Void)?
+    var onFoldingChanged: ((String, Bool) -> Void)?   // (sessionId, isFolding)
+
+    // Config (UserDefaults; sensible defaults so it works with no setup).
+    private var enabled: Bool {
+        if UserDefaults.standard.bool(forKey: "agentMonitor.classicView") { return false }  // classic = no summaries
+        return UserDefaults.standard.object(forKey: "agentMonitor.housekeepingEnabled") as? Bool ?? true
+    }
+    private var heartbeat: TimeInterval {
+        let v = UserDefaults.standard.double(forKey: "agentMonitor.housekeepingHeartbeatSec")
+        return v > 0 ? v : 120
+    }
+    private var stateDir: URL {
+        if let custom = UserDefaults.standard.string(forKey: "agentMonitor.housekeepingStateDir"), !custom.isEmpty {
+            return URL(fileURLWithPath: (custom as NSString).expandingTildeInPath, isDirectory: true)
+        }
+        return FileManager.default.homeDirectoryForCurrentUser.appending(path: ".claude/agent-monitor-summaries")
+    }
+    private var markdownDir: URL? {
+        guard let p = UserDefaults.standard.string(forKey: "agentMonitor.housekeepingMarkdownDir"), !p.isEmpty
+        else { return nil }
+        return URL(fileURLWithPath: (p as NSString).expandingTildeInPath, isDirectory: true)
+    }
+    private var providerKind: HousekeepingProviderKind {
+        HousekeepingProviderKind(rawValue: UserDefaults.standard.string(forKey: "agentMonitor.housekeepingProvider") ?? "") ?? .auto
+    }
+
+    /// Called per-rebuild for every top-level session. Decides whether this is a fold
+    /// boundary (Stop / permission / due heartbeat / forced) with new delta, and if so
+    /// spawns the fold off-main. Cheap when there's nothing to do.
+    func consider(sessionId: String, transcriptPath: String?, cwd: String?, status: AgentStatus, force: Bool = false) {
+        guard enabled, let path = transcriptPath, !path.isEmpty else { return }
+        // A fold is already running for this session — coalesce: remember the latest
+        // trigger and flush it once the current fold finishes (see finish()).
+        if inFlight.contains(sessionId) {
+            pending[sessionId] = (path, cwd, status)
+            return
+        }
+
+        let state = states[sessionId] ?? loadOrInit(sessionId: sessionId, cwd: cwd)
+
+        // Cheap "is there new delta?" via file size vs cursor — no full read on main.
+        let attrs = (try? FileManager.default.attributesOfItem(atPath: path)) ?? [:]
+        let size = (attrs[.size] as? NSNumber)?.uint64Value ?? 0
+        guard size > state.offset else { states[sessionId] = state; return }
+
+        // Trigger gate. Stop / permission boundaries fold immediately; running/away fold
+        // on the heartbeat cadence; manual forces regardless.
+        let isStopBoundary = (status == .idle || status == .inactive || status == .needsAttention)
+        let heartbeatDue = Date().timeIntervalSince(lastFoldAt[sessionId] ?? .distantPast) >= heartbeat
+        guard force || isStopBoundary || heartbeatDue else { states[sessionId] = state; return }
+
+        states[sessionId] = state
+        inFlight.insert(sessionId)
+        onFoldingChanged?(sessionId, true)
+        let fromOffset = state.offset
+        let snapshot = state
+        let kind = providerKind
+        let exportMd = (status == .idle || status == .inactive)  // throttle markdown to turn boundaries
+        let fileSize = size
+        let recentBytes = Self.recentWindowBytes
+        let recentMax = Self.recentWindowMaxLines
+        Task.detached(priority: .utility) { [weak self] in
+            // delta = only the new activity since the cursor → drives the ledgers.
+            let (lines, newOffset) = HousekeepingDelta.project(path: path, from: fromOffset)
+            // Only fold once the ASSISTANT has done something new. A lone user message (a
+            // turn just starting) isn't worth a fold — wait for the answer / heartbeat. We
+            // keep the cursor (fold:nil doesn't advance it), so the question folds together
+            // with the answer when it arrives.
+            let hasAssistantWork = lines.contains { $0.hasPrefix("A:") || $0.hasPrefix("T:") }
+            if lines.isEmpty || !hasAssistantWork {
+                await self?.finish(sessionId: sessionId, foldedOffset: newOffset, fold: nil, branch: nil, exportMd: false)
+                return
+            }
+            // recent = a wider window (last several turns) → context for the summary, so it
+            // isn't anchored to just the latest message. Independent of the cursor.
+            let recentStart = fileSize > recentBytes ? fileSize - recentBytes : 0
+            let recent = Array(HousekeepingDelta.project(path: path, from: recentStart).lines.suffix(recentMax))
+            let branch = Self.gitBranch(cwd: snapshot.cwd)
+            let fold = await HousekeepingProviders.resolve(kind).fold(state: snapshot, delta: lines, recent: recent)
+            await self?.finish(sessionId: sessionId, foldedOffset: newOffset, fold: fold, branch: branch, exportMd: exportMd)
+        }
+    }
+
+    // Recent-context window for the summary (independent of the fold cursor).
+    static let recentWindowBytes: UInt64 = 40_000
+    static let recentWindowMaxLines = 60
+
+    private func finish(sessionId: String, foldedOffset: UInt64, fold: HousekeepingFold?, branch: String?, exportMd: Bool) {
+        inFlight.remove(sessionId)
+        onFoldingChanged?(sessionId, false)
+        // Flush a coalesced trigger (if any) on the way out — on both success and the
+        // failure early-return below. It re-runs the normal gate, so it only re-folds
+        // when warranted (delta remaining + a stop boundary or due heartbeat).
+        defer { flushPending(sessionId) }
+        // Only advance the cursor / record the fold time on success, so a failed provider
+        // call simply retries the same delta on the next trigger.
+        guard let fold = fold, var state = states[sessionId] else { return }
+        state.offset = foldedOffset
+        if let b = branch, !b.isEmpty { state.branch = b }
+        state.updated = ISO8601.formatter.string(from: Date())
+        state.merge(fold)
+        states[sessionId] = state
+        lastFoldAt[sessionId] = Date()
+        save(state)
+        if exportMd { exportMarkdown(state) }
+        onUpdated?(sessionId)
+    }
+
+    /// Re-runs `consider` for a trigger that was coalesced while a fold was in flight.
+    /// Fires at most once per fold (the slot is consumed), so no overlap or runaway loop.
+    private func flushPending(_ sessionId: String) {
+        guard let p = pending.removeValue(forKey: sessionId) else { return }
+        consider(sessionId: sessionId, transcriptPath: p.path, cwd: p.cwd, status: p.status)
+    }
+
+    func snapshot(_ sessionId: String) -> HousekeepingState? { states[sessionId] }
+
+    /// All persisted session states on disk — used to seed the dashboard at launch so
+    /// it shows recently-worked sessions, not only the currently-active ones.
+    func allPersisted() -> [HousekeepingState] {
+        guard let urls = try? FileManager.default.contentsOfDirectory(
+            at: stateDir, includingPropertiesForKeys: nil) else { return [] }
+        let dec = JSONDecoder()
+        return urls.filter { $0.pathExtension == "json" }
+            .compactMap { (try? Data(contentsOf: $0)).flatMap { try? dec.decode(HousekeepingState.self, from: $0) } }
+    }
+
+    // MARK: persistence
+
+    private func loadOrInit(sessionId: String, cwd: String?) -> HousekeepingState {
+        let url = stateDir.appendingPathComponent("\(sessionId).json")
+        if let data = try? Data(contentsOf: url),
+           let s = try? JSONDecoder().decode(HousekeepingState.self, from: data) {
+            return s
+        }
+        var s = HousekeepingState()
+        s.sessionId = sessionId
+        s.cwd = cwd ?? ""
+        s.host = ProcessInfo.processInfo.hostName
+        s.started = ISO8601.formatter.string(from: Date())
+        return s
+    }
+
+    private func save(_ state: HousekeepingState) {
+        try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
+        let url = stateDir.appendingPathComponent("\(state.sessionId).json")
+        let enc = JSONEncoder()
+        enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+        if let data = try? enc.encode(state) { try? data.write(to: url) }
+    }
+
+    private func exportMarkdown(_ s: HousekeepingState) {
+        guard let dir = markdownDir else { return }
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let day = String(s.started.prefix(10))
+        let host = s.host.split(separator: ".").first.map(String.init) ?? s.host
+        let project = s.projects.first ?? (s.cwd as NSString).lastPathComponent
+        let shortSid = String(s.sessionId.prefix(6))
+        let name = "\(day)-\(host)-\(project)-\(shortSid).md".replacingOccurrences(of: "/", with: "-")
+        let url = dir.appendingPathComponent(name)
+        if let data = Self.markdown(s).data(using: .utf8) { try? data.write(to: url) }
+    }
+
+    private static func markdown(_ s: HousekeepingState) -> String {
+        func ledger(_ title: String, _ es: [LedgerEntry]) -> String {
+            es.isEmpty ? "" : "\n## \(title)\n" + es.map { "- [\($0.project)] \($0.text)" }.joined(separator: "\n") + "\n"
+        }
+        func list(_ title: String, _ xs: [String]) -> String {
+            xs.isEmpty ? "" : "\n## \(title)\n" + xs.map { "- \($0)" }.joined(separator: "\n") + "\n"
+        }
+        return """
+        ---
+        session_id: \(s.sessionId)
+        host: \(s.host)
+        projects: [\(s.projects.joined(separator: ", "))]
+        cwd: \(s.cwd)
+        branch: \(s.branch)
+        started: \(s.started)
+        updated: \(s.updated)
+        ---
+
+        # \(s.title.isEmpty ? (s.projects.first ?? "session") : s.title)
+        *\(s.subtitle)*
+
+        \(s.summary)
+        \(list("Projects", s.projects))\(list("Sources", s.sources))\(ledger("Features", s.features))\(ledger("Fixes", s.fixes))\(ledger("Decisions", s.decisions))
+        """
+    }
+
+    nonisolated private static func gitBranch(cwd: String) -> String {
+        guard !cwd.isEmpty else { return "" }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        p.arguments = ["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"]
+        let out = Pipe(); p.standardOutput = out; p.standardError = FileHandle.nullDevice
+        p.standardInput = FileHandle.nullDevice
+        do { try p.run(); p.waitUntilExit() } catch { return "" }
+        guard p.terminationStatus == 0,
+              let s = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
+        else { return "" }
+        let b = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        return b == "HEAD" ? "" : b   // detached HEAD → blank
+    }
+}
+
 // MARK: - Floating bubbles overlay placement
 
 enum BubbleCorner: CaseIterable, Identifiable {
@@ -1081,6 +1679,13 @@ final class AgentStore: ObservableObject {
     // the cursor is inside one of these rects. Not @Published — it's polled on
     // mouse move, not observed by the view.
     var bubbleHitRects: [CGRect] = []
+    // Which display the overlay lives on. Empty = the main display. Stored by the
+    // display's localized name so it survives relaunch / replug. The panel can only
+    // float over fullscreen apps on the display it actually sits on, so on a
+    // multi-monitor setup you pin it to the screen where you run fullscreen apps.
+    @Published var bubbleDisplay: String = UserDefaults.standard.string(forKey: "agentMonitor.bubbleDisplay") ?? "" {
+        didSet { UserDefaults.standard.set(bubbleDisplay, forKey: "agentMonitor.bubbleDisplay") }
+    }
     // "Expand": also show inactive sessions in the overlay (dimmed + smaller).
     @Published var showInactive: Bool = false
     // User-assigned display names (per session). Shown in the bubble + main
@@ -1242,6 +1847,7 @@ final class AgentStore: ObservableObject {
         }
     }
     @Published var settingsOverlayOpen: Bool = false
+    @Published var commsOverlayOpen: Bool = false
     @Published var fileURL: URL
     @Published var soundEnabled: Bool = true
     @Published var titleGenerationEnabled: Bool = true
@@ -1255,6 +1861,56 @@ final class AgentStore: ObservableObject {
     private let transcriptReader = TranscriptReader()
     private let titleGenerator = TitleGenerator()
     private let liveStatusGenerator = LiveStatusGenerator()
+    let housekeepingGenerator = HousekeepingGenerator()
+
+    // Workspace: published per-session housekeeping states + the pane layout.
+    @Published var housekeeping: [String: HousekeepingState] = [:]
+    @Published var panes: [String] = []          // sessionIds tiled in the main area, ordered
+    @Published var focusedPane: String?           // plain sidebar-click replaces this pane
+    @Published var showSidebar = true
+    @Published var folding: Set<String> = []      // sessions with a summary fold in flight
+
+    // Classic view: the original two-column live list, no summaries (and no folds run).
+    @Published var classicView: Bool = UserDefaults.standard.bool(forKey: "agentMonitor.classicView") {
+        didSet { UserDefaults.standard.set(classicView, forKey: "agentMonitor.classicView") }
+    }
+
+    // Report font scale — adjustable via header buttons / ⌘= ⌘- ; persisted.
+    @Published var reportFontScale: Double = {
+        let v = UserDefaults.standard.double(forKey: "agentMonitor.reportFontScale")
+        return v > 0 ? v : 1.0
+    }() {
+        didSet { UserDefaults.standard.set(reportFontScale, forKey: "agentMonitor.reportFontScale") }
+    }
+    func bumpReportFont(_ delta: Double) {
+        reportFontScale = min(2.4, max(0.8, reportFontScale + delta))
+    }
+
+    /// Sidebar click: focus an already-open pane, else replace the focused pane (or open
+    /// the first pane when none).
+    func selectPane(_ id: String) {
+        if panes.contains(id) { focusedPane = id; return }
+        if let f = focusedPane, let idx = panes.firstIndex(of: f) {
+            panes[idx] = id
+        } else if panes.isEmpty {
+            panes = [id]
+        } else {
+            panes[0] = id
+        }
+        focusedPane = id
+    }
+
+    /// Drag-drop from the sidebar: split — add a pane (no duplicates).
+    func addPane(_ id: String) {
+        guard !panes.contains(id) else { focusedPane = id; return }
+        panes.append(id)
+        focusedPane = id
+    }
+
+    func closePane(_ id: String) {
+        panes.removeAll { $0 == id }
+        if focusedPane == id { focusedPane = panes.last }
+    }
 
     // ── Incremental ingest state for agents.jsonl ──
     // byId is the live fold of the event log, advanced one delta at a time so a
@@ -1292,6 +1948,16 @@ final class AgentStore: ObservableObject {
         }
         liveStatusGenerator.onUpdated = { [weak self] _, _ in
             self?.rebuildView()
+        }
+        // Seed the dashboard with persisted states; refresh a session's card each fold.
+        housekeeping = Dictionary(housekeepingGenerator.allPersisted().map { ($0.sessionId, $0) },
+                                  uniquingKeysWith: { a, _ in a })
+        housekeepingGenerator.onUpdated = { [weak self] sid in
+            guard let self, let s = self.housekeepingGenerator.snapshot(sid) else { return }
+            self.housekeeping[sid] = s
+        }
+        housekeepingGenerator.onFoldingChanged = { [weak self] sid, folding in
+            if folding { self?.folding.insert(sid) } else { self?.folding.remove(sid) }
         }
         // Forward the nested notifier's published changes so toolbar toggles
         // re-render (nested ObservableObjects don't propagate automatically).
@@ -1978,8 +2644,26 @@ final class AgentStore: ObservableObject {
                     }
                 }
             }
+
+            // Housekeeping fold — top-level sessions only (subagents share the parent's
+            // transcript). Gates internally on trigger + new delta; cheap when idle.
+            if a.parentSessionId == nil, a.agentType == nil {
+                housekeepingGenerator.consider(
+                    sessionId: a.id, transcriptPath: a.transcriptPath,
+                    cwd: a.cwd, status: a.status
+                )
+            }
             return copy
         }
+    }
+
+    /// Manual housekeeping trigger (from the row button) — folds on demand regardless
+    /// of the heartbeat/stop gate.
+    func forceHousekeeping(_ agent: Agent) {
+        housekeepingGenerator.consider(
+            sessionId: agent.id, transcriptPath: agent.transcriptPath,
+            cwd: agent.cwd, status: agent.status, force: true
+        )
     }
 
     /// Reorders the list so each subagent appears immediately after its
@@ -2073,6 +2757,350 @@ final class AgentStore: ObservableObject {
 
 // MARK: - Views
 
+// MARK: - Workspace (right sidebar + tiling report panes)
+
+/// Right sidebar: the full agent list (active + inactive, one column), reusing the
+/// existing row UI. Click selects a pane; drag splits a new pane.
+struct AgentSidebar: View {
+    @EnvironmentObject var store: AgentStore
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Agents").font(.caption.weight(.semibold)).foregroundStyle(.secondary).textCase(.uppercase)
+                Spacer()
+                Text("\(store.agents.count)").font(.caption2.monospacedDigit()).foregroundStyle(.tertiary)
+            }
+            .padding(.horizontal, 12).padding(.vertical, 6)
+            .background(.quaternary.opacity(0.4))
+            Divider().opacity(0.4)
+            if store.agents.isEmpty {
+                VStack { Spacer(); Text("No agents").foregroundStyle(.tertiary); Spacer() }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(store.agents) { agent in
+                            AgentRow(agent: agent)
+                                .background(store.panes.contains(agent.id) ? Color.accentColor.opacity(0.10) : .clear)
+                                .contentShape(Rectangle())
+                                .onTapGesture { store.selectPane(agent.id) }
+                                .onDrag { NSItemProvider(object: agent.id as NSString) }
+                            Divider().opacity(0.3)
+                        }
+                    }
+                }
+            }
+        }
+        .frame(width: 300)
+        .background(.quaternary.opacity(0.12))
+    }
+}
+
+/// Main area: tiles open panes (auto 1 / 2 / 2x2), scrolls beyond 4. A sidebar agent
+/// dropped here splits a new pane.
+struct PaneWorkspace: View {
+    @EnvironmentObject var store: AgentStore
+
+    var body: some View {
+        Group {
+            if store.panes.isEmpty {
+                VStack(spacing: 8) {
+                    Spacer()
+                    Image(systemName: "rectangle.split.2x2").font(.largeTitle).foregroundStyle(.tertiary)
+                    Text("Pick an agent").foregroundStyle(.secondary)
+                    Text("Click a session in the sidebar — or drag one here to split.")
+                        .font(.caption2).foregroundStyle(.tertiary)
+                    Spacer()
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                GeometryReader { geo in
+                    let cols = store.panes.count == 1 ? 1 : 2
+                    let rows = Int(ceil(Double(store.panes.count) / Double(cols)))
+                    let fill = store.panes.count <= 4
+                    let paneH = fill ? max(220, (geo.size.height - CGFloat(rows + 1) * 8) / CGFloat(rows)) : 340
+                    ScrollView {
+                        LazyVGrid(
+                            columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: cols),
+                            spacing: 8
+                        ) {
+                            ForEach(store.panes, id: \.self) { id in
+                                ReportView(sessionId: id).frame(height: paneH)
+                            }
+                        }
+                        .padding(8)
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .onDrop(of: ["public.text"], isTargeted: nil) { providers in
+            guard let p = providers.first else { return false }
+            _ = p.loadObject(ofClass: NSString.self) { obj, _ in
+                if let id = obj as? String {
+                    Task { @MainActor in store.addPane(id) }
+                }
+            }
+            return true
+        }
+    }
+}
+
+/// One pane: the full report for a session (summary, status, branch, fully-expanded
+/// ledgers, metadata), with live agent status overlaid.
+/// Minimal block-level Markdown renderer (no external deps): `#`/`##`/`###` headers,
+/// `-`/`*` bullets, and paragraphs with inline markdown (**bold**, *italic*, `code`).
+struct MarkdownText: View {
+    let text: String
+    var baseSize: CGFloat = 14
+
+    private enum Block { case h(Int, String), bullet(String), para(String) }
+
+    var body: some View {
+        let blocks = parse()
+        VStack(alignment: .leading, spacing: 6) {
+            ForEach(blocks.indices, id: \.self) { i in row(blocks[i]) }
+        }
+    }
+
+    private func parse() -> [Block] {
+        var blocks: [Block] = []
+        var para: [String] = []
+        func flush() { if !para.isEmpty { blocks.append(.para(para.joined(separator: " "))); para = [] } }
+        for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = String(raw).trimmingCharacters(in: .whitespaces)
+            if line.isEmpty { flush(); continue }
+            if line.hasPrefix("### ") { flush(); blocks.append(.h(3, String(line.dropFirst(4)))) }
+            else if line.hasPrefix("## ") { flush(); blocks.append(.h(2, String(line.dropFirst(3)))) }
+            else if line.hasPrefix("# ") { flush(); blocks.append(.h(1, String(line.dropFirst(2)))) }
+            else if line.hasPrefix("- ") || line.hasPrefix("* ") { flush(); blocks.append(.bullet(String(line.dropFirst(2)))) }
+            else { para.append(line) }
+        }
+        flush()
+        return blocks
+    }
+
+    @ViewBuilder private func row(_ b: Block) -> some View {
+        switch b {
+        case .h(let lvl, let s):
+            inline(s)
+                .font(.system(size: baseSize * (lvl == 1 ? 1.35 : lvl == 2 ? 1.16 : 1.04), weight: .bold))
+                .padding(.top, 3)
+        case .bullet(let s):
+            HStack(alignment: .firstTextBaseline, spacing: 7) {
+                Text("•").foregroundStyle(.tertiary)
+                inline(s).font(.system(size: baseSize))
+            }
+        case .para(let s):
+            inline(s).font(.system(size: baseSize)).lineSpacing(4)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func inline(_ s: String) -> Text {
+        if let attr = try? AttributedString(
+            markdown: s, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        ) {
+            return Text(attr)
+        }
+        return Text(s)
+    }
+}
+
+struct ReportView: View {
+    let sessionId: String
+    @EnvironmentObject var store: AgentStore
+    private let accent = Color.orange   // the one highlight; everything else is secondary
+    private var scale: CGFloat { CGFloat(store.reportFontScale) }
+    @State private var expanded: Set<String> = []   // collapsible sections; default all collapsed
+
+    var body: some View {
+        let s = store.housekeeping[sessionId]
+        let agent = store.agents.first { $0.id == sessionId }
+        let generating = store.folding.contains(sessionId)
+        VStack(alignment: .leading, spacing: 0) {
+            header(state: s, agent: agent)
+            Divider()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    if let s {
+                        // Level 1+2: title (concise, stable, the focal point) with the live
+                        // subtitle tucked right beneath it.
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(titleText(s))
+                                .font(.system(size: 21 * scale, weight: .semibold))
+                                .lineSpacing(2)
+                                .fixedSize(horizontal: false, vertical: true)
+                            if !s.subtitle.isEmpty {
+                                Text(s.subtitle)
+                                    .font(.system(size: 13 * scale, weight: .medium))
+                                    .foregroundStyle(accent)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
+                        // Level 3: the detailed cumulative summary, rendered as Markdown.
+                        if !s.summary.isEmpty, s.title != s.summary {
+                            MarkdownText(text: s.summary, baseSize: 14.5 * scale)
+                                .foregroundStyle(.primary)
+                        }
+
+                        // Tag entries with their project only when the session spans more
+                        // than one — otherwise the header already says which project it is.
+                        let multiProject = s.projects.count > 1
+                        ledgerSection("Features", "sparkles", s.features, tag: multiProject)
+                        ledgerSection("Fixes", "wrench.and.screwdriver", s.fixes, tag: multiProject)
+                        ledgerSection("Decisions", "signpost.right", s.decisions, tag: multiProject)
+                        listSection("Sources", "book", s.sources)
+                        listSection("Projects", "folder", s.projects)
+
+                        Text("\(s.host) · \(s.cwd)")
+                            .font(.caption.monospaced()).foregroundStyle(.tertiary).padding(.top, 6)
+                    } else {
+                        Label("Generating summary…", systemImage: "sparkles")
+                            .font(.title3).foregroundStyle(.secondary)
+                    }
+                }
+                .padding(18)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .background(RoundedRectangle(cornerRadius: 12).fill(.quaternary.opacity(0.22)))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .strokeBorder(generating ? accent.opacity(0.85) : Color.clear, lineWidth: 2)
+        )
+        .contentShape(Rectangle())
+        .onTapGesture { store.focusedPane = sessionId }
+    }
+
+    private func titleText(_ s: HousekeepingState) -> String {
+        if !s.title.isEmpty { return s.title }
+        if !s.summary.isEmpty { return s.summary }   // pre-title states
+        return "(no summary yet)"
+    }
+
+    private func header(state s: HousekeepingState?, agent: Agent?) -> some View {
+        HStack(spacing: 10) {
+            Circle().fill(dotColor(agent?.status)).frame(width: 10, height: 10)
+            Text(s?.projects.first ?? agent?.generatedTitle ?? "session")
+                .font(.title3.weight(.bold)).lineLimit(1)
+            if let b = s?.branch, !b.isEmpty {
+                Label(b, systemImage: "arrow.triangle.branch")
+                    .font(.caption.weight(.medium)).foregroundStyle(.secondary)
+                    .labelStyle(.titleAndIcon).lineLimit(1)
+                    .padding(.horizontal, 7).padding(.vertical, 2)
+                    .background(Capsule().fill(.secondary.opacity(0.15)))
+            }
+            if store.folding.contains(sessionId) {
+                HStack(spacing: 5) {
+                    ProgressView().controlSize(.small)
+                    Text("generating…").font(.caption2.weight(.medium)).foregroundStyle(accent)
+                }
+            }
+            Spacer()
+            if let agent {
+                Button { store.forceHousekeeping(agent) } label: { Image(systemName: "arrow.clockwise") }
+                    .buttonStyle(.borderless).help("Fold now")
+            }
+            Button { store.closePane(sessionId) } label: { Image(systemName: "xmark") }
+                .buttonStyle(.borderless).help("Close pane")
+        }
+        .padding(.horizontal, 14).padding(.vertical, 10)
+    }
+
+    /// A titled section: a muted accent bar + icon + caps label, content aligned to one
+    /// shared left margin so the eye runs straight down the report. Single accent palette.
+    /// A collapsible titled section (default collapsed): a muted accent bar + a header
+    /// that toggles open, showing an item count and a chevron. Content aligns to one
+    /// shared left margin.
+    private func sectionFrame<Content: View>(
+        _ title: String, _ icon: String, count: Int, @ViewBuilder _ content: () -> Content
+    ) -> some View {
+        let isOpen = expanded.contains(title)
+        return HStack(alignment: .top, spacing: 12) {
+            RoundedRectangle(cornerRadius: 2).fill(.secondary.opacity(0.3)).frame(width: 3)
+            VStack(alignment: .leading, spacing: 6) {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.15)) {
+                        if isOpen { expanded.remove(title) } else { expanded.insert(title) }
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        Label(title.uppercased(), systemImage: icon)
+                            .font(.system(size: 11 * scale, weight: .bold)).tracking(0.5)
+                            .foregroundStyle(.secondary).labelStyle(.titleAndIcon).imageScale(.small)
+                        Text("\(count)")
+                            .font(.system(size: 10 * scale, weight: .semibold)).foregroundStyle(.tertiary)
+                        Image(systemName: isOpen ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 8 * scale, weight: .semibold)).foregroundStyle(.tertiary)
+                        Spacer(minLength: 0)
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                if isOpen { content() }
+            }
+        }
+    }
+
+    @ViewBuilder private func ledgerSection(_ title: String, _ icon: String, _ es: [LedgerEntry], tag: Bool) -> some View {
+        if !es.isEmpty {
+            sectionFrame(title, icon, count: es.count) {
+                ForEach(es.indices, id: \.self) { i in
+                    bullet {
+                        HStack(alignment: .firstTextBaseline, spacing: 6) {
+                            if tag { ProjectTag(project: es[i].project) }
+                            Text(es[i].text)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private func listSection(_ title: String, _ icon: String, _ xs: [String]) -> some View {
+        if !xs.isEmpty {
+            sectionFrame(title, icon, count: xs.count) {
+                ForEach(xs, id: \.self) { x in bullet { Text(x).foregroundStyle(.secondary) } }
+            }
+        }
+    }
+
+    /// A bullet row with a hanging indent.
+    private func bullet<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 7) {
+            Text("•").foregroundStyle(.tertiary)
+            content().font(.system(size: 13.5 * scale)).fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func dotColor(_ status: AgentStatus?) -> Color {
+        switch status {
+        case .running: return .green
+        case .away: return .yellow
+        case .needsAttention: return .orange
+        case .idle: return .blue
+        default: return .gray
+        }
+    }
+}
+
+/// A small muted capsule for a project tag (shown only in multi-project sessions to
+/// disambiguate — single accent palette, no rainbow).
+struct ProjectTag: View {
+    let project: String
+    var body: some View {
+        Text(project)
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 6).padding(.vertical, 1)
+            .background(Capsule().fill(.secondary.opacity(0.15)))
+            .fixedSize()
+    }
+}
+
+
 struct ContentView: View {
     @EnvironmentObject var store: AgentStore
 
@@ -2081,27 +3109,20 @@ struct ContentView: View {
             VStack(spacing: 0) {
                 header
                 Divider()
-                if store.agents.isEmpty {
-                    emptyState
+                if store.classicView {
+                    classicLayout
                 } else {
                     HStack(spacing: 0) {
-                        column(
-                            title: "Idle / Attention",
-                            agents: store.agents.filter {
-                                $0.status != .running && $0.status != .away
-                            }
-                        )
-                        Divider()
-                        column(
-                            title: "Running",
-                            agents: store.agents.filter {
-                                $0.status == .running || $0.status == .away
-                            }
-                        )
+                        PaneWorkspace()
+                        if store.showSidebar {
+                            Divider()
+                            AgentSidebar()
+                        }
                     }
                 }
                 footer
             }
+            .onAppear(perform: seedDefaultPane)
             if store.statsOverlayOpen {
                 StatsView()
                     .background(.regularMaterial)
@@ -2112,10 +3133,42 @@ struct ContentView: View {
                     .background(.regularMaterial)
                     .transition(.opacity)
             }
+            if store.commsOverlayOpen {
+                CommsDashboardView()
+                    .background(.regularMaterial)
+                    .transition(.opacity)
+            }
         }
         .frame(minWidth: 520, minHeight: 260)
         .animation(.easeInOut(duration: 0.18), value: store.statsOverlayOpen)
         .animation(.easeInOut(duration: 0.18), value: store.settingsOverlayOpen)
+        .animation(.easeInOut(duration: 0.18), value: store.commsOverlayOpen)
+        .animation(.easeInOut(duration: 0.18), value: store.showSidebar)
+    }
+
+    /// On first appearance, open the most-recently-active agent in a pane.
+    private func seedDefaultPane() {
+        guard !store.classicView, store.panes.isEmpty else { return }
+        if let first = store.agents.first {
+            store.selectPane(first.id)
+        } else if let recent = store.housekeeping.values.sorted(by: { $0.updated > $1.updated }).first {
+            store.selectPane(recent.sessionId)
+        }
+    }
+
+    /// The legacy two-column live list (no summaries).
+    @ViewBuilder private var classicLayout: some View {
+        if store.agents.isEmpty {
+            emptyState
+        } else {
+            HStack(spacing: 0) {
+                column(title: "Idle / Attention",
+                       agents: store.agents.filter { $0.status != .running && $0.status != .away })
+                Divider()
+                column(title: "Running",
+                       agents: store.agents.filter { $0.status == .running || $0.status == .away })
+            }
+        }
     }
 
     private func column(title: String, agents: [Agent]) -> some View {
@@ -2180,6 +3233,37 @@ struct ContentView: View {
             .buttonStyle(.borderless)
             .help("Toggle bubbles overlay (⌥⌘B)")
 
+            // Workspace ⇄ Classic view.
+            Button {
+                store.classicView.toggle()
+            } label: {
+                Image(systemName: store.classicView ? "list.bullet.rectangle" : "rectangle.split.3x1")
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.borderless)
+            .help(store.classicView ? "Switch to workspace (summaries)" : "Switch to classic view (no summaries)")
+
+            if !store.classicView {
+                Button {
+                    store.showSidebar.toggle()
+                } label: {
+                    Image(systemName: "sidebar.right")
+                        .foregroundStyle(store.showSidebar ? Color.accentColor : Color.secondary)
+                }
+                .buttonStyle(.borderless)
+                .help(store.showSidebar ? "Hide agent sidebar" : "Show agent sidebar")
+
+                // Report font size: buttons + ⌘- / ⌘= (and ⌘0 to reset).
+                Button { store.bumpReportFont(-0.1) } label: { Image(systemName: "textformat.size.smaller") }
+                    .buttonStyle(.borderless).help("Smaller report text (⌘−)")
+                    .keyboardShortcut("-", modifiers: .command)
+                Button { store.bumpReportFont(0.1) } label: { Image(systemName: "textformat.size.larger") }
+                    .buttonStyle(.borderless).help("Larger report text (⌘=)")
+                    .keyboardShortcut("=", modifiers: .command)
+                Button { store.reportFontScale = 1.0 } label: { EmptyView() }
+                    .keyboardShortcut("0", modifiers: .command).frame(width: 0).opacity(0)
+            }
+
             Button {
                 store.statsOverlayOpen.toggle()
             } label: {
@@ -2197,6 +3281,15 @@ struct ContentView: View {
             }
             .buttonStyle(.borderless)
             .help(store.settingsOverlayOpen ? "Close settings" : "Settings")
+
+            Button {
+                store.commsOverlayOpen.toggle()
+            } label: {
+                Image(systemName: "bubble.left.and.bubble.right")
+                    .foregroundStyle(store.commsOverlayOpen ? Color.accentColor : Color.secondary)
+            }
+            .buttonStyle(.borderless)
+            .help(store.commsOverlayOpen ? "Close comms board" : "Comms board")
 
             Button {
                 store.reload()
@@ -2473,8 +3566,198 @@ struct AgentRow: View {
 
 // MARK: - Settings overlay
 
+// MARK: - Comms board dashboard (viewer of the inter-agent comms broker)
+
+struct CommsAgent: Identifiable {
+    let id: String        // full host:alias
+    let host: String
+    let name: String      // alias
+    let owner: String
+    let armed: Bool
+}
+
+struct CommsMsg: Identifiable {
+    let id: String
+    let from: String
+    let to: String
+    let scope: String
+    let body: String
+    let ts: String
+}
+
+struct CommsDashboardView: View {
+    @EnvironmentObject var store: AgentStore
+    @State private var agents: [CommsAgent] = []
+    @State private var messages: [CommsMsg] = []
+    @State private var loaded = false
+    private let timer = Timer.publish(every: 10, on: .main, in: .common).autoconnect()
+
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+            Divider()
+            if commsCreds() == nil {
+                notConnected
+            } else {
+                HStack(spacing: 0) {
+                    agentsPane.frame(width: 260)
+                    Divider()
+                    messagesPane
+                }
+            }
+        }
+        .onAppear { refresh() }
+        .onReceive(timer) { _ in if store.commsOverlayOpen { refresh() } }
+    }
+
+    private var header: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "bubble.left.and.bubble.right").foregroundStyle(.tint)
+            Text("Comms Board").font(.headline)
+            Spacer()
+            Text("\(agents.count) agents · \(messages.count) messages")
+                .font(.caption).foregroundStyle(.secondary)
+            Button { refresh() } label: { Image(systemName: "arrow.clockwise") }
+                .buttonStyle(.borderless).help("Refresh")
+            Button { store.commsOverlayOpen = false } label: { Image(systemName: "xmark.circle.fill") }
+                .buttonStyle(.borderless).help("Close")
+        }
+        .padding(.horizontal, 12).padding(.vertical, 9)
+    }
+
+    private var agentsPane: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("AGENTS").font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
+                .padding(.horizontal, 12).padding(.vertical, 6)
+            List(agents) { a in
+                HStack(spacing: 8) {
+                    Circle().fill(a.armed ? Color.green : Color.secondary.opacity(0.35))
+                        .frame(width: 8, height: 8)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(a.name).font(.callout.weight(.medium)).lineLimit(1)
+                        Text(a.owner.isEmpty ? a.host : "\(a.host) · \(a.owner)")
+                            .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                    }
+                    Spacer()
+                }
+            }
+            .listStyle(.inset)
+        }
+    }
+
+    private var messagesPane: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("COMMUNICATIONS").font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
+                .padding(.horizontal, 12).padding(.vertical, 6)
+            if messages.isEmpty {
+                Text(loaded ? "No messages you can see yet." : "Loading…")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                List(messages) { m in
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 5) {
+                            Text(m.from).font(.caption.weight(.semibold))
+                            Image(systemName: "arrow.right").font(.system(size: 8)).foregroundStyle(.secondary)
+                            Text(m.scope == "global" ? "everyone" : m.to)
+                                .font(.caption).foregroundStyle(.secondary)
+                            Spacer()
+                            Text(shortTime(m.ts)).font(.caption2).foregroundStyle(.secondary)
+                        }
+                        Text(m.body).font(.caption).foregroundStyle(.primary).lineLimit(4)
+                    }
+                    .padding(.vertical, 2)
+                }
+                .listStyle(.inset)
+            }
+        }
+    }
+
+    private var notConnected: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "antenna.radiowaves.left.and.right.slash")
+                .font(.largeTitle).foregroundStyle(.secondary)
+            Text("Not connected to a comms board.").foregroundStyle(.secondary)
+            Button("Open Settings → Comms Board") {
+                store.commsOverlayOpen = false
+                store.settingsOverlayOpen = true
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    // ---- networking ----
+    private func commsCreds() -> (api: String, token: String)? {
+        let url = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".claude/settings.json")
+        guard let data = try? Data(contentsOf: url),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let env = root["env"] as? [String: Any],
+              let api = env["COMMS_API"] as? String, !api.isEmpty,
+              let token = env["COMMS_TOKEN"] as? String, !token.isEmpty else { return nil }
+        return (api, token)
+    }
+
+    private func get(_ path: String, _ done: @escaping ([String: Any]?) -> Void) {
+        guard let c = commsCreds(), let url = URL(string: c.api + path) else { done(nil); return }
+        var r = URLRequest(url: url)
+        r.setValue("Bearer \(c.token)", forHTTPHeaderField: "Authorization")
+        r.setValue("comms-cli/1.0", forHTTPHeaderField: "User-Agent")
+        r.timeoutInterval = 12
+        URLSession.shared.dataTask(with: r) { d, _, _ in
+            var obj: [String: Any]? = nil
+            if let d = d { obj = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] }
+            DispatchQueue.main.async { done(obj) }
+        }.resume()
+    }
+
+    private func refresh() {
+        get("/who") { o in
+            guard let arr = o?["agents"] as? [[String: Any]] else { return }
+            agents = arr.map { a in
+                let id = a["id"] as? String ?? "?"
+                return CommsAgent(id: id,
+                                  host: a["host"] as? String ?? "",
+                                  name: id.components(separatedBy: ":").last ?? id,
+                                  owner: a["owner"] as? String ?? "",
+                                  armed: a["armed"] as? Bool ?? false)
+            }
+        }
+        get("/log?all=1") { o in
+            loaded = true
+            guard let arr = o?["messages"] as? [[String: Any]] else { return }
+            let ms = arr.map { m in
+                CommsMsg(id: m["id"] as? String ?? UUID().uuidString,
+                         from: m["from"] as? String ?? "",
+                         to: m["to"] as? String ?? "all",
+                         scope: m["scope"] as? String ?? "",
+                         body: m["body"] as? String ?? "",
+                         ts: m["ts"] as? String ?? "")
+            }
+            messages = Array(ms.reversed())  // newest first
+        }
+    }
+
+    private func shortTime(_ iso: String) -> String {
+        guard let t = iso.split(separator: "T").last else { return iso }
+        return String(t.prefix(5))
+    }
+}
+
 struct SettingsView: View {
     @EnvironmentObject var store: AgentStore
+
+    // Housekeeping config — same UserDefaults keys HousekeepingGenerator reads.
+    @AppStorage("agentMonitor.housekeepingEnabled") private var hkEnabled = true
+    @AppStorage("agentMonitor.housekeepingProvider") private var hkProvider = "auto"
+    @AppStorage("agentMonitor.housekeepingHeartbeatSec") private var hkHeartbeat = 120.0
+    @AppStorage("agentMonitor.housekeepingMarkdownDir") private var hkMarkdownDir = ""
+
+    // Comms board connection — persisted in ~/.claude/settings.json env, loaded on appear.
+    @State private var commsApi = ""
+    @State private var commsHost = ""
+    @State private var commsToken = ""
+    @State private var commsStatus = ""
+    @State private var commsBusy = false
 
     private var nativeBanners: Binding<Bool> {
         Binding(get: { store.localNotifier.enabled },
@@ -2496,6 +3779,14 @@ struct SettingsView: View {
                     Picker("Corner", selection: $store.bubbleCorner) {
                         ForEach(BubbleCorner.allCases) { Text($0.label).tag($0) }
                     }
+                    Picker("Display", selection: $store.bubbleDisplay) {
+                        Text("Main display").tag("")
+                        ForEach(NSScreen.screens, id: \.self) { screen in
+                            Text(screen.localizedName).tag(screen.localizedName)
+                        }
+                    }
+                    Text("Bubbles float over fullscreen apps only on the display they live on. On a multi-monitor setup, pick the screen where you run fullscreen apps.")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
 
                 Section("Notifications") {
@@ -2517,6 +3808,62 @@ struct SettingsView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
 
+                Section("Interface") {
+                    Toggle("Classic view (live list, no summaries)", isOn: $store.classicView)
+                    Text("Shows the original two-column list and disables the summary agent entirely (no folds, no token use).")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+
+                Section("Housekeeping") {
+                    Toggle("Keep live session summaries", isOn: $hkEnabled)
+                        .disabled(store.classicView)
+                    Picker("Backend", selection: $hkProvider) {
+                        Text("Auto (key → Haiku, else claude -p)").tag("auto")
+                        Text("claude -p (subscription)").tag("claudeP")
+                        Text("Haiku API (needs API key)").tag("haikuApi")
+                    }
+                    .disabled(!hkEnabled)
+                    HStack {
+                        Text("Heartbeat")
+                        Spacer()
+                        Text("\(Int(hkHeartbeat))s").foregroundStyle(.secondary)
+                    }
+                    Slider(value: $hkHeartbeat, in: 30...600, step: 30).disabled(!hkEnabled)
+                    HStack {
+                        Text("Markdown export")
+                        Spacer()
+                        Text(hkMarkdownDir.isEmpty ? "off"
+                             : hkMarkdownDir.replacingOccurrences(of: NSHomeDirectory(), with: "~"))
+                            .font(.caption).foregroundStyle(.secondary)
+                            .lineLimit(1).truncationMode(.middle)
+                        if !hkMarkdownDir.isEmpty {
+                            Button("Clear") { hkMarkdownDir = "" }.disabled(!hkEnabled)
+                        }
+                        Button("Choose…") { chooseMarkdownDir() }.disabled(!hkEnabled)
+                    }
+                    Text("Folds a running summary + facts per session into ~/.claude/agent-monitor-summaries/. Pick a folder (e.g. an Obsidian vault) to also export a markdown note on turn boundaries.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+
+                Section("Comms Board") {
+                    TextField("Host (e.g. personal)", text: $commsHost)
+                    TextField("Server URL (https://…)", text: $commsApi)
+                    SecureField("API token", text: $commsToken)
+                    HStack {
+                        Button(commsBusy ? "Connecting…" : "Connect & Verify") { commsConnect() }
+                            .disabled(commsBusy || commsApi.isEmpty || commsHost.isEmpty || commsToken.isEmpty)
+                        Spacer()
+                        if !commsStatus.isEmpty {
+                            Text(commsStatus)
+                                .font(.caption)
+                                .foregroundStyle(commsStatus.hasPrefix("✓") ? Color.green : Color.red)
+                                .lineLimit(1).truncationMode(.tail)
+                        }
+                    }
+                    Text("Connect this Mac to the inter-agent comms board: saves your credentials to ~/.claude/settings.json, installs the comms CLI (~/.local/bin/comms, added to your shell PATH) and the open-comms skill, and verifies — so your Claude Code sessions can join in one click. Get the host, URL, and token from the board operator.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+
                 Section("Shortcuts") {
                     shortcut("⌥⌘B", "Toggle bubbles overlay")
                     shortcut("⌥⌘C", "Move overlay to next corner")
@@ -2531,6 +3878,136 @@ struct SettingsView: View {
                 }
             }
             .formStyle(.grouped)
+            .onAppear { loadCommsConfig() }
+        }
+    }
+
+    private func loadCommsConfig() {
+        let url = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".claude/settings.json")
+        guard let data = try? Data(contentsOf: url),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let env = root["env"] as? [String: Any] else { return }
+        commsApi = env["COMMS_API"] as? String ?? ""
+        commsHost = env["COMMS_HOST"] as? String ?? ""
+        commsToken = env["COMMS_TOKEN"] as? String ?? ""
+    }
+
+    // Persist the creds into ~/.claude/settings.json env (so Claude Code sessions inherit them),
+    // then verify the connection against the broker's /who.
+    private func commsConnect() {
+        commsBusy = true; commsStatus = ""
+        let api = commsApi.trimmingCharacters(in: .whitespaces)
+        let host = commsHost.trimmingCharacters(in: .whitespaces)
+        let token = commsToken.trimmingCharacters(in: .whitespaces)
+
+        let settingsURL = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".claude/settings.json")
+        var root: [String: Any] = [:]
+        if let data = try? Data(contentsOf: settingsURL),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            root = obj
+        }
+        var env = (root["env"] as? [String: Any]) ?? [:]
+        env["COMMS_API"] = api; env["COMMS_TOKEN"] = token; env["COMMS_HOST"] = host
+        root["env"] = env
+        do {
+            try FileManager.default.createDirectory(at: settingsURL.deletingLastPathComponent(),
+                                                     withIntermediateDirectories: true)
+            let out = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
+            try out.write(to: settingsURL)
+        } catch {
+            commsStatus = "⚠︎ settings.json: \(error.localizedDescription)"; commsBusy = false; return
+        }
+
+        guard let url = URL(string: api + "/who") else {
+            commsStatus = "⚠︎ invalid URL"; commsBusy = false; return
+        }
+        var req = URLRequest(url: url)
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.setValue("comms-cli/1.0", forHTTPHeaderField: "User-Agent")  // Cloudflare blocks default UAs
+        req.timeoutInterval = 12
+        URLSession.shared.dataTask(with: req) { data, resp, err in
+            DispatchQueue.main.async {
+                commsBusy = false
+                if let err = err { commsStatus = "⚠︎ \(err.localizedDescription)"; return }
+                let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                if code == 200 {
+                    var n = 0
+                    if let d = data,
+                       let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+                       let agents = o["agents"] as? [Any] { n = agents.count }
+                    commsStatus = "✓ Connected — installing CLI + skill…"
+                    installCommsTooling(api: api, token: token) { ok in
+                        commsStatus = ok
+                            ? "✓ Connected as \(host) — \(n) on the board, CLI + skill installed"
+                            : "✓ Connected as \(host) — \(n) on the board (CLI/skill install failed)"
+                    }
+                } else if code == 401 {
+                    commsStatus = "⚠︎ unauthorized (check token)"
+                } else {
+                    commsStatus = "⚠︎ HTTP \(code)"
+                }
+            }
+        }.resume()
+    }
+
+    // Download the CLI + skill from the broker's bearer-gated endpoints and install them,
+    // so a brand-new machine is fully set up to participate — in one click.
+    private func installCommsTooling(api: String, token: String, done: @escaping (Bool) -> Void) {
+        let group = DispatchGroup()
+        var ok = true
+        func fetch(_ path: String, to dest: URL, exec: Bool) {
+            group.enter()
+            guard let url = URL(string: api + path) else { ok = false; group.leave(); return }
+            var r = URLRequest(url: url)
+            r.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            r.setValue("comms-cli/1.0", forHTTPHeaderField: "User-Agent")
+            r.timeoutInterval = 12
+            URLSession.shared.dataTask(with: r) { d, resp, _ in
+                defer { group.leave() }
+                guard let d = d, (resp as? HTTPURLResponse)?.statusCode == 200 else { ok = false; return }
+                do {
+                    try FileManager.default.createDirectory(at: dest.deletingLastPathComponent(),
+                                                            withIntermediateDirectories: true)
+                    try d.write(to: dest)
+                    if exec {
+                        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dest.path)
+                    }
+                } catch { ok = false }
+            }.resume()
+        }
+        let home = NSHomeDirectory()
+        fetch("/cli", to: URL(fileURLWithPath: home).appendingPathComponent(".local/bin/comms"), exec: true)
+        fetch("/skill", to: URL(fileURLWithPath: home).appendingPathComponent(".claude/skills/open-comms/SKILL.md"), exec: false)
+        group.notify(queue: .main) { ensureLocalBinOnPath(); done(ok) }
+    }
+
+    // On a fresh Mac, ~/.local/bin is NOT on the default PATH, so the installed `comms`
+    // wouldn't be found. Add it to the user's zsh profile (idempotent), so new shells —
+    // and thus Claude Code's tool calls — can resolve it. Creates the profile if missing.
+    private func ensureLocalBinOnPath() {
+        let home = NSHomeDirectory()
+        let exportLine = "export PATH=\"$HOME/.local/bin:$PATH\"  # added by AgentMonitor comms wizard\n"
+        for name in [".zprofile", ".zshrc"] {
+            let f = URL(fileURLWithPath: home).appendingPathComponent(name)
+            let existing = (try? String(contentsOf: f, encoding: .utf8)) ?? ""
+            if existing.contains(".local/bin") { continue }   // already wired up in this file
+            let sep = (existing.isEmpty || existing.hasSuffix("\n")) ? "" : "\n"
+            try? (existing + sep + exportLine).write(to: f, atomically: true, encoding: .utf8)
+        }
+    }
+
+    private func chooseMarkdownDir() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Choose"
+        panel.message = "Choose a folder for markdown summary exports"
+        if !hkMarkdownDir.isEmpty {
+            panel.directoryURL = URL(fileURLWithPath: (hkMarkdownDir as NSString).expandingTildeInPath)
+        }
+        if panel.runModal() == .OK, let url = panel.url {
+            hkMarkdownDir = url.path
         }
     }
 
@@ -3238,6 +4715,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         store.$bubbleCorner
             .sink { [weak self] _ in self?.repositionBubblePanel() }
             .store(in: &cancellables)
+        // Re-pin when the user picks a different display...
+        store.$bubbleDisplay
+            .sink { [weak self] _ in self?.repositionBubblePanel() }
+            .store(in: &cancellables)
+        // ...or when displays are connected / disconnected / rearranged (the
+        // chosen screen may have moved or vanished — fall back to main).
+        NotificationCenter.default.publisher(for: NSApplication.didChangeScreenParametersNotification)
+            .sink { [weak self] _ in self?.repositionBubblePanel() }
+            .store(in: &cancellables)
 
         setBubbles(store.bubblesVisible)
         hotKeys = HotKeyManager(store: store)
@@ -3252,25 +4738,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // Regular, normal-level window — behaves like any app window (not pinned
     // on top, lives in its own Space).
     private func makeMainWindow() {
+        // Open near-fullscreen — the workspace wants room for the sidebar + panes.
+        let screen = (NSScreen.main ?? NSScreen.screens.first)?.visibleFrame
+            ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let inset = screen.insetBy(dx: screen.width * 0.04, dy: screen.height * 0.04)
         mainWindow = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 560, height: 360),
+            contentRect: inset,
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered, defer: false
         )
         mainWindow.title = "Agent Monitor"
         mainWindow.titlebarAppearsTransparent = true
-        mainWindow.isMovableByWindowBackground = true
+        // Background-drag moves the window and swallows SwiftUI .onDrag (sidebar → pane
+        // split) when not fullscreen. Drag the window by its title bar instead.
+        mainWindow.isMovableByWindowBackground = false
         mainWindow.isReleasedWhenClosed = false
+        // Allow native fullscreen so the workspace can fill a second display.
+        mainWindow.collectionBehavior.insert(.fullScreenPrimary)
         mainWindow.contentView = NSHostingView(
             rootView: ContentView().environmentObject(store)
         )
-        mainWindow.center()
+        mainWindow.setFrame(inset, display: true)
         mainWindow.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    // The display the overlay should live on: the user's chosen screen (by
+    // localized name), falling back to the main screen if unset or unplugged.
+    private func targetBubbleScreen() -> NSScreen? {
+        let chosen = store.bubbleDisplay
+        if !chosen.isEmpty,
+           let screen = NSScreen.screens.first(where: { $0.localizedName == chosen }) {
+            return screen
+        }
+        return NSScreen.main ?? NSScreen.screens.first
+    }
+
     private func makeBubblePanel() {
-        let frame = (NSScreen.main ?? NSScreen.screens.first)?.visibleFrame
+        let frame = targetBubbleScreen()?.visibleFrame
             ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         bubblePanel = OverlayPanel(
             contentRect: frame,
@@ -3338,7 +4843,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func repositionBubblePanel() {
         guard bubblePanel != nil, store.bubblesVisible else { return }
-        if let screen = NSScreen.main ?? NSScreen.screens.first {
+        if let screen = targetBubbleScreen() {
             bubblePanel.setFrame(screen.visibleFrame, display: true)
         }
     }

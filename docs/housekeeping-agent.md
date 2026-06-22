@@ -4,7 +4,8 @@ A side-car that maintains a slow-growing **working summary** + **quick facts** p
 Claude Code session, by folding each step's activity into a bounded running state
 instead of re-reading the whole transcript.
 
-Status: design in progress. Decisions below are settled unless under "Open".
+Status: **built** on `feat/housekeeping-agent` (projector → fold/provider → side-car →
+settings + dashboard), validated live. Decisions below are settled unless under "Open".
 
 ---
 
@@ -35,6 +36,10 @@ session.
   can't accidentally drop old entries and output stays near-empty on quiet turns.
 
 Schema:
+> **Note:** this schema is the *original* design. The shipped version uses a three-level
+> summary (`title` / `subtitle` / `summary`) — see **Changes since the original design**
+> at the end of this doc. The ledger structure below is unchanged.
+
 ```jsonc
 {
   "summary": "≤ ~120 words",   // rewrite each fold
@@ -162,9 +167,13 @@ project / date in the filename + frontmatter, for a navigable vault:
   host: personal        # personal | work, from hostname
   projects: [agent-monitor]
   cwd: /Users/joaohts/fun/agent-monitor
+  branch: feat/housekeeping-agent   # app-captured (git rev-parse in cwd), not model-emitted
   started: <iso>
   updated: <iso>
   ```
+  `branch` is metadata the app reads from the session's `cwd` (not a fold output) —
+  it's a per-session field the v2 "Contexto amplo" dashboard wants (projeto · branch ·
+  último resumo · status).
   (`short-sid` = first 6 of the UUID, just to keep same-day/same-project files
   distinct in a listing.)
 
@@ -180,12 +189,105 @@ Settle while building, by eyeballing real output (not in the abstract):
 
 ---
 
+## Frontend v2 — workspace layout (in progress)
+
+Pivot from the compact window to an IDE-style full-screen workspace. Unifies the live
+list and the summaries dashboard into one screen.
+
+- **Near-fullscreen by default** on launch; sidebar visible; main shows the
+  most-recently-active agent.
+- **Right sidebar (collapsible)** — the full agent list, active + inactive merged into
+  one column, keeping all current row features (status, live status, title, tags,
+  Ghostty jump). Toggle to hide → panes take full width.
+- **Main area = tiling pane manager.** Each pane is a full `ReportView` of one agent
+  (summary · status · branch · fully-expanded ledgers · metadata · live activity).
+  - **Click** a sidebar agent → replaces the **focused** pane (or creates the first
+    pane when none).
+  - **Drag** a sidebar agent into the main area → **splits** (adds a pane).
+  - Auto-tile up to **4** panes (1 → full, 2 → side by side, 3–4 → 2×2); beyond 4 →
+    scroll. Per-pane close button.
+- **Grid tiling, not recursive splits** for v1 (recursive H/V split trees are a SwiftUI
+  rabbit hole; revisit only if genuinely missed).
+- The `SummaryCard` grows into the pane `ReportView`; the two-column `ContentView`
+  content is absorbed into the sidebar; the live/dashboard mode toggle is removed.
+
+## Visualization (downstream)
+
+This agent is the **data layer** for the v2 "Contexto amplo" / orchestration view
+(`~/notes/jonathan/projects/agent-monitor-v2.md`). The per-session JSON state is what
+that dashboard renders.
+
+Surface split (the groundwork already exists in the code):
+- **Bubbles overlay** (`BubblesView` on the click-through `OverlayPanel`) = the ambient
+  quick-glance. Stays as-is.
+- **Main window** (`ContentView` on a normal resizable `NSWindow`) → grows into the
+  **dashboard**: per-agent cards showing summary + status + quick-facts, selectable
+  subset (filter by tag/project), live updates as folds land. Already a normal
+  resizable window — this is a `ContentView` evolution, not a re-plumb. Add
+  `collectionBehavior = [.fullScreenPrimary]` to enable native fullscreen / second
+  display.
+
+Built *after* the data layer (steps 2–3) — the dashboard just watches `summaryStateDir`
+(kqueue, same pattern used elsewhere) and loads each session's JSON into a published
+store the cards observe.
+
 ## Build order (proposed)
 
-1. **Delta extractor** — `ingestLine` tweak + standalone projector; dump to debug log
-   and eyeball against a real session. Isolated, testable, off the live path.
-2. **Provider** — protocol + `ClaudeP` and `HaikuAPI` impls.
-3. **Side-car + persistence** — queue, per-session cursor, triggers, fold, write.
+1. **Delta extractor** — ✅ `HousekeepingDelta` projector (own cursor, U/A/T lines).
+2. **Provider** — ✅ `HousekeepingProvider` + `ClaudeP`/`Haiku` impls + fold prompt.
+3. **Side-car + persistence** — ✅ `HousekeepingGenerator`: per-session state/cursor,
+   triggers wired in `enrichWithTranscripts` (Stop/permission/heartbeat), JSON + markdown
+   export, git branch + metadata. Validated live against a real session.
+4. **Dashboard** (next) — main window → cards reading the JSON state; manual fold button;
+   settings toggle for enable/provider/paths.
 
 Rough size: ~500–700 lines net in the single Swift file; no new deps, no threading
 risk (another async side-car). Cost is breadth, not difficulty.
+
+---
+
+## Changes since the original design
+
+The sections above are the original design. The shipped implementation refined it:
+
+- **Three-level summary** (replaces `summary` + `status`): a sticky **`title`** (PR-style,
+  ≤12 words — only rewritten on a substantial focus change), a live **`subtitle`** (the
+  current phase, most dynamic), and the detailed **`summary`**. All three are rewritten
+  each fold; the ledgers are unchanged.
+- **Summary is Markdown, bullet-first, timely-first.** The prompt asks for short `-`
+  bullets under `## Now` / `## Recently` / `## Background`. A small dependency-free
+  `MarkdownText` view renders headers/bullets/`**bold**`/italic/code in the report.
+- **Recency-bias fix.** Each fold also receives a **recent-context window** (last ~60
+  projected lines) for the summary, while the cursor delta still drives the ledgers. The
+  prompt is reframed as **cumulative** — "the current summary is long-term memory: preserve
+  and extend, never collapse to the latest step."
+- **Trigger gate — no fold on a lone user message.** A fold only runs once the *assistant*
+  has produced new work (an `A:`/`T:` line in the delta). A turn that just started no
+  longer triggers a premature, recency-biased fold; the question folds together with its
+  answer. Effective triggers: Stop (answer), heartbeat (timer), permission, manual.
+- **Depth-1 coalescing.** A trigger arriving while a fold is in flight is remembered
+  (latest wins) and flushed exactly once when the fold finishes — so a Stop landing
+  mid-fold isn't lost. One fold at a time; no overlap or runaway loop.
+- **Markdown export is throttled to turn boundaries** (`Stop`/inactive), not every fold,
+  to keep a synced vault from churning. JSON state still writes every fold.
+
+### Frontend (shipped)
+
+- **Workspace** — collapsible right `AgentSidebar` + a tiling `PaneWorkspace` of
+  `ReportView` panes (click-to-replace, drag-to-split, auto-tile up to 4 then scroll).
+  Opens near-fullscreen. Replaced the live/dashboard mode toggle.
+- **ReportView** — single orange accent (everything else secondary), title/subtitle/markdown
+  summary, **collapsible ledger sections (collapsed by default)** with item counts.
+- **Report font scaling** — `store.reportFontScale`, header buttons + `⌘=` / `⌘−` / `⌘0`,
+  persisted.
+- **Classic view** — header + Settings → Interface toggle that restores the original
+  two-column live list and **disables the summary agent entirely** (no folds, no tokens).
+- **Settings** — Interface (classic toggle), Housekeeping (enable, backend, heartbeat,
+  markdown export via a native **folder picker**).
+
+### Install / upgrade impact
+
+Drop-in: only `AgentMonitor.swift` changed — **no hook, `settings.json`, dependency, or
+`build.sh` changes**. No new hard requirements (reuses the logged-in `claude` CLI;
+`ANTHROPIC_API_KEY` optional → Haiku backend). Summaries auto-run after upgrade (real
+subscription/token use); Classic view is the opt-out. See the README "v2" section.

@@ -5,3 +5,8 @@ AgentMonitor
 .DS_Store
 
 .claude/
+
+# comms board lives in its own repo (joaohtsantos/comms); keep the local copy +
+# the infra-bearing design doc out of agent-monitor
+comms/
+docs/comms-board.md

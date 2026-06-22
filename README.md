@@ -8,6 +8,47 @@ Built in a single Swift file with no external dependencies (no Xcode project, no
 
 ---
 
+## v2 — live session summaries + workspace
+
+Agent Monitor now does more than show *that* sessions are running — it keeps a **live,
+self-updating report** of what each one is *doing*, in an IDE-style workspace.
+
+- **Workspace UI** — the main window is now a collapsible **right sidebar** (the full
+  agent list) plus a **tiling pane area**. Click an agent to open its report; drag one
+  into the panes to split (up to 4, then scroll). Opens near-fullscreen.
+- **Housekeeping agent** — a side-car that folds each session's new activity into a
+  per-session report on a budget (only on the assistant's answer, a long-turn heartbeat,
+  a permission prompt, or a manual refresh — never on a bare user message). It reuses the
+  transcripts the app already reads; **no new hooks**.
+- **Three-level report** — a sticky PR-style **title**, a live phase **subtitle**, and a
+  cumulative **markdown summary** (bulleted, timely-first), plus collapsible ledgers:
+  features · fixes · decisions · sources · projects.
+- **Reading controls** — Markdown rendering, adjustable report font (`⌘=` / `⌘−`, `⌘0`
+  to reset), collapsible sections (collapsed by default).
+- **Design doc:** [docs/housekeeping-agent.md](docs/housekeeping-agent.md).
+
+### Upgrading from the classic version
+
+It's a drop-in upgrade — **rebuild and you're done:**
+
+- **Installation is unchanged.** `./build.sh` as before. **No hook changes, no
+  `settings.json` changes, no new dependencies/frameworks** — the only changed source is
+  `AgentMonitor.swift`. Your existing hooks keep working as-is.
+- **No new hard requirements.** The summary agent uses your already-logged-in `claude`
+  CLI (the same prereq the AI titles/live-status already needed). An `ANTHROPIC_API_KEY`
+  is **optional** — if set, summaries use Haiku via the API instead of `claude -p`.
+- **⚠️ Summaries run automatically after you upgrade** — every monitored session gets
+  folded, which uses your Claude subscription (via `claude -p`) or API key. It's cheap
+  (Haiku-class, incremental) but it is real usage.
+- **Want the old experience? Use Classic view.** A toggle in the header (and
+  Settings → Interface) switches back to the original two-column live list **and turns the
+  summary agent fully off** — no folds, no token use. Pick your default and forget it.
+- **Where things live:** summaries persist as JSON in `~/.claude/agent-monitor-summaries/`
+  (created automatically). Optionally export a markdown copy to a folder you choose
+  (e.g. an Obsidian vault) in Settings.
+
+---
+
 ## What it does
 
 - **Always-on-top floating window** that lists every Claude Code session you have open
