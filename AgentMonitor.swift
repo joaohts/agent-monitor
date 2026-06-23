@@ -1654,7 +1654,14 @@ final class AgentStore: ObservableObject {
     // must stay click-through; the AppDelegate flips it interactive only while
     // the cursor is inside one of these rects. Not @Published — it's polled on
     // mouse move, not observed by the view.
-    var bubbleHitRects: [CGRect] = []
+    // `didSet` fires `onBubbleHitRectsChanged` so the AppDelegate re-evaluates
+    // click-through the instant the bubbles move/appear/vanish — without it, a
+    // bubble sliding out from under a stationary cursor would leave the overlay
+    // stuck interactive (eating clicks) until the next mouse move.
+    var bubbleHitRects: [CGRect] = [] {
+        didSet { onBubbleHitRectsChanged?() }
+    }
+    var onBubbleHitRectsChanged: (() -> Void)?
     // Which display the overlay lives on. Empty = the main display. Stored by the
     // display's localized name so it survives relaunch / replug. The panel can only
     // float over fullscreen apps on the display it actually sits on, so on a
@@ -4789,6 +4796,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let hosting = NSHostingView(rootView: BubblesView().environmentObject(store))
         bubblePanel.contentView = hosting
         bubbleHostingView = hosting
+        // Re-test click-through whenever the bubble frames change (move/appear/
+        // vanish), not just on mouse move — closes the stuck-interactive gap.
+        store.onBubbleHitRectsChanged = { [weak self] in self?.updateOverlayClickThrough() }
         installMouseTracking()
     }
 
