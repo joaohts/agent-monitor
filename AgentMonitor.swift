@@ -1063,49 +1063,25 @@ struct HousekeepingFold: Codable {
 /// Shared prompt — same instruction for both backends so they behave alike.
 enum FoldPrompt {
     static let system = """
-    You maintain a long-lived, CUMULATIVE summary of a single Claude Code coding session.
-    Output STRICT JSON and nothing else — no prose, no markdown fences.
+    You maintain a long-lived, CUMULATIVE summary of one Claude Code coding session.
+    Output STRICT JSON only — no prose, no markdown fences.
 
-    You are given:
-      - CURRENT SUMMARY: the running record of the WHOLE session so far. This is the
-        session's long-term memory — authoritative for everything that happened before now.
-      - CURRENT STATUS and the existing ledgers (features / fixes / decisions / sources /
-        projects).
-      - RECENT CONTEXT: the last several turns, to flesh out the summary with detail so it
-        isn't anchored to just the most recent message.
-      - NEW ACTIVITY: only what happened since the last update — use this for the LEDGERS.
-    Activity lines are compact:
-      U: a user message    A: the assistant's prose    T: Tool(arg) — a tool the assistant ran
+    Inputs:
+    - CURRENT SUMMARY: the running record of the WHOLE session — authoritative for everything before now.
+    - CURRENT TITLE/SUBTITLE and the existing ledgers (features / fixes / decisions / sources / projects).
+    - NEW ACTIVITY since the last update — use this for the LEDGERS. Lines are compact:
+      U: user message   A: assistant prose   T: Tool(arg) the assistant ran
 
-    Return JSON with this shape — THREE levels of conciseness (title → subtitle → summary),
-    plus the ledgers (omit or empty any array with nothing new):
+    Return JSON:
     {
-      "title":   string,   // The MOST concise level: a PR-title-style line (<= 12 words) — the
-                           // single best one-liner for what this session is/does. It must be
-                           // STABLE: you are given the CURRENT TITLE; keep it essentially the
-                           // same across updates. Only rewrite it if the session's focus has
-                           // changed substantially. Small wording tweaks are fine; drastic
-                           // rewrites only on a drastic change of what the session is about.
-      "subtitle": string,  // The LIVE level: a short line (<= 14 words) about the current PHASE
-                           // of the session — what's happening now and roughly where in the arc
-                           // (e.g. "wrapping up the dashboard polish", "debugging the fold
-                           //  pipeline", "just started — exploring the codebase", "blocked,
-                           //  awaiting permission"). This is the most dynamic line; expect it to
-                           // change every update and to reflect progress / timeliness.
-      "summary": string,   // The DETAILED level: the CUMULATIVE summary of the WHOLE session,
-                           // in MARKDOWN, structured TIMELY-FIRST. Prefer BULLET POINTS over
-                           // prose — avoid long paragraphs; most lines should be short `-`
-                           // bullets (one idea each). Group them under a few short `##`
-                           // subheaders ("## Now", "## Recently", "## Background"), each with a
-                           // handful of bullets. Use **bold** for key terms. Keep bullets tight
-                           // and scannable.
-                           // CRITICAL — DO NOT LOSE THE LONG-TERM ARC. The
-                           // CURRENT SUMMARY is your memory of everything before now: PRESERVE it
-                           // and weave the recent work in. NEVER collapse it into only the latest
-                           // step — the new work is an ADDITION, not a replacement. It grows
-                           // slower than the session, but only by compressing older detail, never
-                           // by dropping the earlier arc. A reader should still understand how the
-                           // session began and everything significant it has done.
+      "title":   string,  // <=12 words, PR-title style. STABLE — keep ~same; rewrite only on a substantial focus change.
+      "subtitle": string, // <=14 words, the current PHASE ("debugging the fold pipeline", "blocked, awaiting permission").
+      "summary": string,  // The FULL cumulative summary of the WHOLE session, in MARKDOWN, timely-first.
+                          // Prefer short `-` bullets (one idea each) under a few `##` subheaders
+                          // ("## Now", "## Recently", "## Background"). **Bold** key terms.
+                          // PRESERVE the long-term arc: weave new work in as an ADDITION; never collapse
+                          // to only the latest step. It grows slower than the session — compress older
+                          // detail, never drop the earlier arc.
       "newFeatures":  [{"project": string, "text": string}],
       "newFixes":     [{"project": string, "text": string}],
       "newDecisions": [{"project": string, "text": string}],
@@ -1113,38 +1089,25 @@ enum FoldPrompt {
       "newSources":   [string]
     }
 
-    Ledgers are append-only and PERMANENT, drawn from the NEW ACTIVITY. Be strict — when in
-    doubt, LEAVE IT OUT; a wrong entry can never be removed. Emit only entries NOT already
-    present in the existing ledgers.
-    Inclusion tests:
-    - feature: a capability that now exists and didn't before. NOT refactors, NOT steps
-      toward one, NOT "improved X".
-      YES "added a manual refresh button"; NO "replaced the 1Hz poll with event-driven
-      reload" (internal — that's a decision).
-    - fix: a specific wrong behavior made right. NOT refactors / cleanups.
-      YES "fixed false away-flips during tool runs"; NO "renamed a function".
-    - decision: a choice between alternatives that constrains future work (architecture,
-      "use X not Y"). NOT mechanical picks.
-      YES "chose event-sourced single-path state mutation"; NO "used seekToEnd instead of
-      re-reading".
-    - source: a doc, note, or URL consulted for reference (API docs, a design note like
-      foo.md, a web page) — NOT the code files being edited.
-    - project: a repo / dir touched, repo level not file. `newProjects` must include
-      every project touched this update, including any name you use as a `project` tag
-      on a feature/fix/decision below.
-
-    Each feature/fix/decision carries the `project` it belongs to (a session may touch
-    several) — use the project name, not a path.
+    Ledgers are append-only and PERMANENT, drawn from NEW ACTIVITY. When in doubt, LEAVE IT OUT —
+    a wrong entry can't be removed. Emit only entries NOT already present.
+    - feature: a capability that now exists and didn't before. NOT refactors or "improved X".
+    - fix: a specific wrong behavior made right. NOT cleanups / renames.
+    - decision: a choice between alternatives that constrains future work (architecture, "use X not Y"). NOT mechanical picks.
+    - source: a doc / note / URL consulted for reference — NOT the code files being edited.
+    - project: a repo / dir touched (repo level). newProjects must include every project touched this
+      update, including any used as a `project` tag below.
+    Each feature/fix/decision carries the `project` it belongs to (use the name, not a path).
     """
 
-    static func user(state: HousekeepingState, delta: [String], recent: [String]) -> String {
+    static func user(state: HousekeepingState, delta: [String]) -> String {
         func entries(_ es: [LedgerEntry]) -> String {
             es.isEmpty ? "(none)" : es.map { "- [\($0.project)] \($0.text)" }.joined(separator: "\n")
         }
         return """
         CURRENT TITLE (keep stable — only rewrite on a substantial focus change): \(state.title.isEmpty ? "(none)" : state.title)
         CURRENT SUBTITLE: \(state.subtitle.isEmpty ? "(none)" : state.subtitle)
-        CURRENT SUMMARY (the long-term record — preserve and extend, do not replace):
+        CURRENT SUMMARY (the long-term record — preserve and extend, rewrite in full):
         \(state.summary.isEmpty ? "(none yet)" : state.summary)
 
         KNOWN PROJECTS: \(state.projects.isEmpty ? "(none)" : state.projects.joined(separator: ", "))
@@ -1155,9 +1118,6 @@ enum FoldPrompt {
         \(entries(state.fixes))
         EXISTING DECISIONS:
         \(entries(state.decisions))
-
-        RECENT CONTEXT (last several turns — for fleshing out the summary, NOT for ledgers):
-        \(recent.joined(separator: "\n"))
 
         NEW ACTIVITY (since last update — use for the ledgers):
         \(delta.joined(separator: "\n"))
@@ -1176,24 +1136,36 @@ enum FoldPrompt {
 // MARK: - Housekeeping providers
 
 protocol HousekeepingProvider: Sendable {
-    /// `delta` = only the new activity since the last fold (drives the ledgers).
-    /// `recent` = a wider window of the last several turns (context for the summary, so it
-    /// isn't anchored to just the latest message).
-    func fold(state: HousekeepingState, delta: [String], recent: [String]) async -> HousekeepingFold?
+    /// `delta` = only the new activity since the last fold (drives the ledgers and the
+    /// summary rewrite). No separate "recent" window is sent — the cumulative summary
+    /// already carries prior context, so we pay for the new bytes only.
+    func fold(state: HousekeepingState, delta: [String]) async -> HousekeepingFold?
 }
 
 enum HousekeepingProviderKind: String { case auto, claudeP, haikuApi }
 
+/// API key for the metered Haiku path. Read ONLY from a dedicated file
+/// (`~/.claude/agent-monitor-api-key`) — never from the environment, so a stray
+/// `ANTHROPIC_API_KEY` in the shell can't silently switch providers or bill you.
+enum HousekeepingAPIKey {
+    static let url = FileManager.default.homeDirectoryForCurrentUser
+        .appending(path: ".claude/agent-monitor-api-key")
+
+    static func load() -> String {
+        guard let raw = try? String(contentsOf: url, encoding: .utf8) else { return "" }
+        return raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
 enum HousekeepingProviders {
-    /// `auto` → Haiku API when `ANTHROPIC_API_KEY` is set (metered, minimize tokens),
-    /// else `claude -p` (flat-rate subscription, no key).
+    /// `auto` → Haiku API when a key file exists at `~/.claude/agent-monitor-api-key`
+    /// (metered, minimize tokens), else `claude -p` (flat-rate subscription, no key).
     static func resolve(_ kind: HousekeepingProviderKind) -> HousekeepingProvider {
         switch kind {
         case .haikuApi: return HaikuAPIProvider()
         case .claudeP:  return ClaudePProvider()
         case .auto:
-            let key = ProcessInfo.processInfo.environment["ANTHROPIC_API_KEY"] ?? ""
-            return key.isEmpty ? ClaudePProvider() : HaikuAPIProvider()
+            return HousekeepingAPIKey.load().isEmpty ? ClaudePProvider() : HaikuAPIProvider()
         }
     }
 }
@@ -1201,8 +1173,8 @@ enum HousekeepingProviders {
 /// Subscription path: shells out via the shared `ClaudeP` runner (Haiku, OAuth, no key),
 /// prompts for JSON, parses defensively.
 struct ClaudePProvider: HousekeepingProvider {
-    func fold(state: HousekeepingState, delta: [String], recent: [String]) async -> HousekeepingFold? {
-        let user = FoldPrompt.user(state: state, delta: delta, recent: recent)
+    func fold(state: HousekeepingState, delta: [String]) async -> HousekeepingFold? {
+        let user = FoldPrompt.user(state: state, delta: delta)
         guard let out = ClaudeP.run(prompt: user, model: "claude-haiku-4-5",
                                     systemPrompt: FoldPrompt.system),
               let data = FoldPrompt.extractJSON(out),
@@ -1213,17 +1185,17 @@ struct ClaudePProvider: HousekeepingProvider {
 }
 
 /// Metered path: a direct Haiku 4.5 Messages API call with structured output, so the
-/// schema is enforced. Needs `ANTHROPIC_API_KEY`.
+/// schema is enforced. Needs a key in `~/.claude/agent-monitor-api-key`.
 struct HaikuAPIProvider: HousekeepingProvider {
-    func fold(state: HousekeepingState, delta: [String], recent: [String]) async -> HousekeepingFold? {
-        guard let key = ProcessInfo.processInfo.environment["ANTHROPIC_API_KEY"],
-              !key.isEmpty else { return nil }
+    func fold(state: HousekeepingState, delta: [String]) async -> HousekeepingFold? {
+        let key = HousekeepingAPIKey.load()
+        guard !key.isEmpty else { return nil }
 
         let body: [String: Any] = [
             "model": "claude-haiku-4-5",
             "max_tokens": 1500,
             "system": FoldPrompt.system,
-            "messages": [["role": "user", "content": FoldPrompt.user(state: state, delta: delta, recent: recent)]],
+            "messages": [["role": "user", "content": FoldPrompt.user(state: state, delta: delta)]],
             "output_config": ["format": ["type": "json_schema", "schema": Self.schema]],
         ]
         guard let payload = try? JSONSerialization.data(withJSONObject: body) else { return nil }
@@ -1412,7 +1384,7 @@ final class LiveStatusGenerator {
 // MARK: - Housekeeping generator (per-session running summary + facts)
 
 /// Side-car that maintains a slow-growing summary + quick-facts per session by folding
-/// only the new transcript delta on each trigger (Stop / permission / heartbeat / manual).
+/// only the new transcript delta on each trigger (heartbeat / manual).
 /// Mirrors the title/live-status generators: gates cheaply on the main actor, runs the
 /// projection + provider call on a detached task, hops back to persist. JSON state is the
 /// source of truth; a markdown view is exported (throttled) for the Obsidian vault.
@@ -1435,8 +1407,11 @@ final class HousekeepingGenerator {
     }
     private var heartbeat: TimeInterval {
         let v = UserDefaults.standard.double(forKey: "agentMonitor.housekeepingHeartbeatSec")
-        return v > 0 ? v : 120
+        return v > 0 ? v : 1800
     }
+    // Minimum new transcript bytes since the last fold before a (non-forced) fold is worth
+    // it — keeps low-activity sessions from folding on the cadence just for a stray line.
+    private static let minDeltaBytes: UInt64 = 1500
     private var stateDir: URL {
         if let custom = UserDefaults.standard.string(forKey: "agentMonitor.housekeepingStateDir"), !custom.isEmpty {
             return URL(fileURLWithPath: (custom as NSString).expandingTildeInPath, isDirectory: true)
@@ -1453,10 +1428,13 @@ final class HousekeepingGenerator {
     }
 
     /// Called per-rebuild for every top-level session. Decides whether this is a fold
-    /// boundary (Stop / permission / due heartbeat / forced) with new delta, and if so
-    /// spawns the fold off-main. Cheap when there's nothing to do.
+    /// boundary (due heartbeat / forced) with new delta, and if so spawns the fold
+    /// off-main. Cheap when there's nothing to do.
     func consider(sessionId: String, transcriptPath: String?, cwd: String?, status: AgentStatus, force: Bool = false) {
-        guard enabled, let path = transcriptPath, !path.isEmpty else { return }
+        guard let path = transcriptPath, !path.isEmpty else { return }
+        // Live folding can be switched off ("Keep live session summaries") — but a manual
+        // force still runs, so summaries can be generated on demand with auto-folding off.
+        guard enabled || force else { return }
         // A fold is already running for this session — coalesce: remember the latest
         // trigger and flush it once the current fold finishes (see finish()).
         if inFlight.contains(sessionId) {
@@ -1467,15 +1445,18 @@ final class HousekeepingGenerator {
         let state = states[sessionId] ?? loadOrInit(sessionId: sessionId, cwd: cwd)
 
         // Cheap "is there new delta?" via file size vs cursor — no full read on main.
+        // A manual force folds on any new bytes; the cadence requires a meaningful chunk.
         let attrs = (try? FileManager.default.attributesOfItem(atPath: path)) ?? [:]
         let size = (attrs[.size] as? NSNumber)?.uint64Value ?? 0
-        guard size > state.offset else { states[sessionId] = state; return }
+        let minDelta = force ? 1 : Self.minDeltaBytes
+        guard size >= state.offset + minDelta else { states[sessionId] = state; return }
 
-        // Trigger gate. Stop / permission boundaries fold immediately; running/away fold
-        // on the heartbeat cadence; manual forces regardless.
-        let isStopBoundary = (status == .idle || status == .inactive || status == .needsAttention)
+        // Trigger gate — two triggers only: the heartbeat cadence (default 30 min) and a
+        // manual force. Answer-finished / stop boundaries deliberately do NOT fold; that
+        // auto-generation was removed to cut token spend. Abandoned (.inactive) sessions
+        // are skipped on the cadence — only a manual force will fold them.
         let heartbeatDue = Date().timeIntervalSince(lastFoldAt[sessionId] ?? .distantPast) >= heartbeat
-        guard force || isStopBoundary || heartbeatDue else { states[sessionId] = state; return }
+        guard force || (heartbeatDue && status != .inactive) else { states[sessionId] = state; return }
 
         states[sessionId] = state
         inFlight.insert(sessionId)
@@ -1484,11 +1465,10 @@ final class HousekeepingGenerator {
         let snapshot = state
         let kind = providerKind
         let exportMd = (status == .idle || status == .inactive)  // throttle markdown to turn boundaries
-        let fileSize = size
-        let recentBytes = Self.recentWindowBytes
-        let recentMax = Self.recentWindowMaxLines
         Task.detached(priority: .utility) { [weak self] in
-            // delta = only the new activity since the cursor → drives the ledgers.
+            // delta = only the new activity since the cursor → drives the ledgers and the
+            // summary rewrite. No separate "recent" window is sent: the cumulative summary
+            // already carries prior context, so we pay for the new bytes only.
             let (lines, newOffset) = HousekeepingDelta.project(path: path, from: fromOffset)
             // Only fold once the ASSISTANT has done something new. A lone user message (a
             // turn just starting) isn't worth a fold — wait for the answer / heartbeat. We
@@ -1499,19 +1479,11 @@ final class HousekeepingGenerator {
                 await self?.finish(sessionId: sessionId, foldedOffset: newOffset, fold: nil, branch: nil, exportMd: false)
                 return
             }
-            // recent = a wider window (last several turns) → context for the summary, so it
-            // isn't anchored to just the latest message. Independent of the cursor.
-            let recentStart = fileSize > recentBytes ? fileSize - recentBytes : 0
-            let recent = Array(HousekeepingDelta.project(path: path, from: recentStart).lines.suffix(recentMax))
             let branch = Self.gitBranch(cwd: snapshot.cwd)
-            let fold = await HousekeepingProviders.resolve(kind).fold(state: snapshot, delta: lines, recent: recent)
+            let fold = await HousekeepingProviders.resolve(kind).fold(state: snapshot, delta: lines)
             await self?.finish(sessionId: sessionId, foldedOffset: newOffset, fold: fold, branch: branch, exportMd: exportMd)
         }
     }
-
-    // Recent-context window for the summary (independent of the fold cursor).
-    static let recentWindowBytes: UInt64 = 40_000
-    static let recentWindowMaxLines = 60
 
     private func finish(sessionId: String, foldedOffset: UInt64, fold: HousekeepingFold?, branch: String?, exportMd: Bool) {
         inFlight.remove(sessionId)
@@ -1633,7 +1605,7 @@ final class HousekeepingGenerator {
 
 // MARK: - Floating bubbles overlay placement
 
-enum BubbleCorner: CaseIterable, Identifiable {
+enum BubbleCorner: String, CaseIterable, Identifiable {
     case topLeft, topRight, bottomLeft, bottomRight
 
     var id: Self { self }
@@ -1671,8 +1643,12 @@ final class AgentStore: ObservableObject {
     @Published var agents: [Agent] = []
     // Floating-bubbles overlay: a separate always-on-top, click-through window
     // that coexists with the regular (normal-level) main window.
-    @Published var bubblesVisible: Bool = false
-    @Published var bubbleCorner: BubbleCorner = .topRight
+    @Published var bubblesVisible: Bool = (UserDefaults.standard.object(forKey: "agentMonitor.bubblesVisible") as? Bool) ?? false {
+        didSet { UserDefaults.standard.set(bubblesVisible, forKey: "agentMonitor.bubblesVisible") }
+    }
+    @Published var bubbleCorner: BubbleCorner = BubbleCorner(rawValue: UserDefaults.standard.string(forKey: "agentMonitor.bubbleCorner") ?? "") ?? .topRight {
+        didSet { UserDefaults.standard.set(bubbleCorner.rawValue, forKey: "agentMonitor.bubbleCorner") }
+    }
     // Live frames of the on-screen bubbles, in the overlay's SwiftUI `.global`
     // space (top-left origin). The overlay window spans the whole screen and so
     // must stay click-through; the AppDelegate flips it interactive only while
@@ -1687,7 +1663,9 @@ final class AgentStore: ObservableObject {
         didSet { UserDefaults.standard.set(bubbleDisplay, forKey: "agentMonitor.bubbleDisplay") }
     }
     // "Expand": also show inactive sessions in the overlay (dimmed + smaller).
-    @Published var showInactive: Bool = false
+    @Published var showInactive: Bool = (UserDefaults.standard.object(forKey: "agentMonitor.showInactive") as? Bool) ?? false {
+        didSet { UserDefaults.standard.set(showInactive, forKey: "agentMonitor.showInactive") }
+    }
     // User-assigned display names (per session). Shown in the bubble + main
     // window only — the Ghostty tab title is left alone. Persisted.
     @Published private(set) var customNames: [String: String] = [:]
@@ -1849,8 +1827,13 @@ final class AgentStore: ObservableObject {
     @Published var settingsOverlayOpen: Bool = false
     @Published var commsOverlayOpen: Bool = false
     @Published var fileURL: URL
-    @Published var soundEnabled: Bool = true
-    @Published var titleGenerationEnabled: Bool = true
+    // Persisted toggles (default ON; survive rebuilds — keyed under the stable bundle id).
+    @Published var soundEnabled: Bool = (UserDefaults.standard.object(forKey: "agentMonitor.soundEnabled") as? Bool) ?? true {
+        didSet { UserDefaults.standard.set(soundEnabled, forKey: "agentMonitor.soundEnabled") }
+    }
+    @Published var titleGenerationEnabled: Bool = (UserDefaults.standard.object(forKey: "agentMonitor.titleGenerationEnabled") as? Bool) ?? true {
+        didSet { UserDefaults.standard.set(titleGenerationEnabled, forKey: "agentMonitor.titleGenerationEnabled") }
+    }
     @Published var pushNotifier = PushNotifier()
     @Published var localNotifier = LocalNotifier()
 
@@ -1867,7 +1850,9 @@ final class AgentStore: ObservableObject {
     @Published var housekeeping: [String: HousekeepingState] = [:]
     @Published var panes: [String] = []          // sessionIds tiled in the main area, ordered
     @Published var focusedPane: String?           // plain sidebar-click replaces this pane
-    @Published var showSidebar = true
+    @Published var showSidebar: Bool = (UserDefaults.standard.object(forKey: "agentMonitor.showSidebar") as? Bool) ?? true {
+        didSet { UserDefaults.standard.set(showSidebar, forKey: "agentMonitor.showSidebar") }
+    }
     @Published var folding: Set<String> = []      // sessions with a summary fold in flight
 
     // Classic view: the original two-column live list, no summaries (and no folds run).
@@ -3749,7 +3734,7 @@ struct SettingsView: View {
     // Housekeeping config — same UserDefaults keys HousekeepingGenerator reads.
     @AppStorage("agentMonitor.housekeepingEnabled") private var hkEnabled = true
     @AppStorage("agentMonitor.housekeepingProvider") private var hkProvider = "auto"
-    @AppStorage("agentMonitor.housekeepingHeartbeatSec") private var hkHeartbeat = 120.0
+    @AppStorage("agentMonitor.housekeepingHeartbeatSec") private var hkHeartbeat = 1800.0
     @AppStorage("agentMonitor.housekeepingMarkdownDir") private var hkMarkdownDir = ""
 
     // Comms board connection — persisted in ~/.claude/settings.json env, loaded on appear.
@@ -3817,6 +3802,10 @@ struct SettingsView: View {
                 Section("Housekeeping") {
                     Toggle("Keep live session summaries", isOn: $hkEnabled)
                         .disabled(store.classicView)
+                    if !hkEnabled && !store.classicView {
+                        Text("Auto-folding is off. The “Fold now” button on each pane still generates a summary on demand.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     Picker("Backend", selection: $hkProvider) {
                         Text("Auto (key → Haiku, else claude -p)").tag("auto")
                         Text("claude -p (subscription)").tag("claudeP")
@@ -3824,11 +3813,11 @@ struct SettingsView: View {
                     }
                     .disabled(!hkEnabled)
                     HStack {
-                        Text("Heartbeat")
+                        Text("Summary interval")
                         Spacer()
-                        Text("\(Int(hkHeartbeat))s").foregroundStyle(.secondary)
+                        Text("\(Int(hkHeartbeat / 60)) min").foregroundStyle(.secondary)
                     }
-                    Slider(value: $hkHeartbeat, in: 30...600, step: 30).disabled(!hkEnabled)
+                    Slider(value: $hkHeartbeat, in: 300...3600, step: 60).disabled(!hkEnabled)
                     HStack {
                         Text("Markdown export")
                         Spacer()
