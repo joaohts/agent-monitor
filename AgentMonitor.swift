@@ -1158,6 +1158,11 @@ enum HousekeepingAPIKey {
 }
 
 enum HousekeepingProviders {
+    /// The configured backend (same setting the summary fold uses).
+    static var configuredKind: HousekeepingProviderKind {
+        HousekeepingProviderKind(rawValue: UserDefaults.standard.string(forKey: "agentMonitor.housekeepingProvider") ?? "") ?? .auto
+    }
+
     /// `auto` → Haiku API when a key file exists at `~/.claude/agent-monitor-api-key`
     /// (metered, minimize tokens), else `claude -p` (flat-rate subscription, no key).
     static func resolve(_ kind: HousekeepingProviderKind) -> HousekeepingProvider {
@@ -1166,6 +1171,17 @@ enum HousekeepingProviders {
         case .claudeP:  return ClaudePProvider()
         case .auto:
             return HousekeepingAPIKey.load().isEmpty ? ClaudePProvider() : HaikuAPIProvider()
+        }
+    }
+
+    /// Whether short-text generation (tags/titles) should take the metered Haiku
+    /// API route instead of `claude -p` — resolved exactly like the summary fold,
+    /// so they stay in lockstep. API route isn't subject to subscription limits.
+    static var useHaikuAPI: Bool {
+        switch configuredKind {
+        case .haikuApi: return true
+        case .claudeP:  return false
+        case .auto:     return !HousekeepingAPIKey.load().isEmpty
         }
     }
 }
@@ -1245,6 +1261,62 @@ struct HaikuAPIProvider: HousekeepingProvider {
             "additionalProperties": false,
         ]
     }()
+}
+
+// MARK: - Short-text generation (tags/titles), same route as the summary
+
+/// A plain free-text Haiku call that routes the SAME way as the summary fold:
+/// the metered Messages API when configured (key file present / provider forced),
+/// otherwise `claude -p` (OAuth subscription). Use this instead of `ClaudeP.run`
+/// directly so short generators aren't hard-pinned to the rate-limited
+/// subscription path.
+enum HaikuShortText {
+    /// Returns the model's raw text, or nil on failure. Caller sanitizes.
+    static func run(systemPrompt: String?, prompt: String, maxTokens: Int = 64) async -> String? {
+        if HousekeepingProviders.useHaikuAPI, let out = await runAPI(systemPrompt: systemPrompt, prompt: prompt, maxTokens: maxTokens) {
+            return out
+        }
+        // claude -p is blocking; keep it off the calling actor.
+        return await Task.detached(priority: .userInitiated) {
+            ClaudeP.run(prompt: prompt, systemPrompt: systemPrompt)
+        }.value
+    }
+
+    /// Direct Haiku Messages API call (no structured output — just text).
+    private static func runAPI(systemPrompt: String?, prompt: String, maxTokens: Int) async -> String? {
+        let key = HousekeepingAPIKey.load()
+        guard !key.isEmpty else { return nil }
+        var body: [String: Any] = [
+            "model": "claude-haiku-4-5",
+            "max_tokens": maxTokens,
+            "messages": [["role": "user", "content": prompt]],
+        ]
+        if let systemPrompt { body["system"] = systemPrompt }
+        guard let payload = try? JSONSerialization.data(withJSONObject: body) else { return nil }
+
+        var req = URLRequest(url: URL(string: "https://api.anthropic.com/v1/messages")!)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue(key, forHTTPHeaderField: "x-api-key")
+        req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        req.httpBody = payload
+
+        guard let (data, resp) = try? await URLSession.shared.data(for: req) else {
+            PushNotifier.debugLog("haiku-api: request failed"); return nil
+        }
+        let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+        guard code == 200,
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let content = obj["content"] as? [[String: Any]],
+              let text = content.first(where: { ($0["type"] as? String) == "text" })?["text"] as? String
+        else {
+            let snippet = String(data: data, encoding: .utf8)?.prefix(200) ?? ""
+            PushNotifier.debugLog("haiku-api: HTTP \(code) — \(snippet)")
+            return nil
+        }
+        PushNotifier.debugLog("haiku-api: OK — \(text.count) chars")
+        return text
+    }
 }
 
 // MARK: - Title generator (shells out to `claude -p` async)
@@ -1704,13 +1776,10 @@ final class AgentStore: ObservableObject {
             if let t = agent.initialTask, !t.isEmpty { ctx += "Initial task: \(t)\n" }
             if let s = agent.latestSummary, !s.isEmpty { ctx += "Recent summary: \(s)\n" }
         }
-        let ctxCopy = ctx
-        return await Task.detached(priority: .userInitiated) {
-            Self.runTagClaude(context: ctxCopy)
-        }.value
+        return await Self.runTag(context: ctx)
     }
 
-    nonisolated private static func runTagClaude(context: String) -> String? {
+    nonisolated private static func runTag(context: String) async -> String? {
         let systemPrompt = """
         You are a tag generator. You output ONLY a short tag and nothing else — \
         no explanation, no quotes, no punctuation. You never use tools.
@@ -1731,7 +1800,9 @@ final class AgentStore: ObservableObject {
         \(context)
         --- END ---
         """
-        guard let raw = ClaudeP.run(prompt: prompt, systemPrompt: systemPrompt),
+        // Same route as the summary fold: metered Haiku API when configured, else
+        // claude -p. 32 tokens is plenty for a 1–3 word tag.
+        guard let raw = await HaikuShortText.run(systemPrompt: systemPrompt, prompt: prompt, maxTokens: 32),
               let phrase = ClaudeP.sanitizeShortPhrase(raw) else { return nil }
         // Hard-cap to 3 words.
         return phrase.split(separator: " ").prefix(3).joined(separator: " ")
