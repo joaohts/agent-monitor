@@ -3648,12 +3648,59 @@ struct CommsMsg: Identifiable {
     let ts: String
 }
 
+/// How "live" an agent is, derived purely from the comms board's /who presence.
+/// armed = holding a /wait doorbell (idle & instantly reachable); present = a fresh
+/// presence row but no held wait (busy mid-turn); gone = reaped/closed.
+enum PresenceTier: Int, Comparable {
+    case gone = 0, present = 1, armed = 2
+    static func < (l: PresenceTier, r: PresenceTier) -> Bool { l.rawValue < r.rawValue }
+    var color: Color {
+        switch self {
+        case .armed:   return .green
+        case .present: return .yellow
+        case .gone:    return Color.secondary.opacity(0.35)
+        }
+    }
+    var label: String {
+        switch self {
+        case .armed:   return "armed"
+        case .present: return "present"
+        case .gone:    return "gone"
+        }
+    }
+}
+
+/// A WhatsApp-style thread: either the pinned global "Everyone" feed, or every
+/// message exchanged between one unordered pair of agent ids (host:alias).
+struct CommsConversation: Identifiable {
+    let id: String          // canonical pair key, or "__everyone__"
+    let isEveryone: Bool
+    let a: String           // canonical-ordered participant ids ("" for everyone)
+    let b: String
+    var msgs: [CommsMsg]    // chronological ascending
+    var lastTs: String { msgs.last?.ts ?? "" }
+    var lastBody: String { msgs.last?.body ?? "" }
+}
+
 struct CommsDashboardView: View {
     @EnvironmentObject var store: AgentStore
     @State private var agents: [CommsAgent] = []
-    @State private var messages: [CommsMsg] = []
+    @State private var conversations: [CommsConversation] = []
+    @State private var selectedId: String? = nil   // nil = showing the conversation list
     @State private var loaded = false
+    @AppStorage("agentMonitor.commsFontScale") private var commsFontScale: Double = 1.0
+    @State private var keyMonitor: Any? = nil
     private let timer = Timer.publish(every: 10, on: .main, in: .common).autoconnect()
+
+    // Explicit font scaling — macOS ignores dynamicTypeSize, so (like the report view)
+    // we multiply concrete point sizes by this factor. ⌘± / A−/A+ bump it.
+    private var scale: CGFloat { CGFloat(commsFontScale) }
+    private func sysFont(_ size: CGFloat, _ w: Font.Weight = .regular) -> Font {
+        .system(size: size * scale, weight: w)
+    }
+    private func stepType(_ d: Int) {
+        commsFontScale = min(2.4, max(0.8, commsFontScale + Double(d) * 0.1))
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -3663,23 +3710,62 @@ struct CommsDashboardView: View {
                 notConnected
             } else {
                 HStack(spacing: 0) {
-                    agentsPane.frame(width: 260)
+                    agentsPane.frame(width: 240)
                     Divider()
-                    messagesPane
+                    mainPane
                 }
             }
         }
-        .onAppear { refresh() }
+        .onAppear {
+            refresh()
+            installTypeKeyMonitor()
+        }
+        .onDisappear {
+            if let m = keyMonitor { NSEvent.removeMonitor(m); keyMonitor = nil }
+        }
         .onReceive(timer) { _ in if store.commsOverlayOpen { refresh() } }
     }
+
+    // ⌘+ / ⌘= / ⌘- resize text. A local key monitor is more reliable than SwiftUI
+    // keyboardShortcut here (no menu item, and "+" needs Shift on most layouts).
+    private func installTypeKeyMonitor() {
+        guard keyMonitor == nil else { return }
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { ev in
+            guard store.commsOverlayOpen, ev.modifierFlags.contains(.command) else { return ev }
+            switch ev.charactersIgnoringModifiers {
+            case "+", "=": stepType(1);  return nil
+            case "-", "_": stepType(-1); return nil
+            default:       return ev
+            }
+        }
+    }
+
+    // ---- presence ----
+    private func tier(_ id: String) -> PresenceTier {
+        guard let a = agents.first(where: { $0.id == id }) else { return .gone }
+        return a.armed ? .armed : .present
+    }
+    /// A conversation lights up at the strongest tier among its participants.
+    private func convTier(_ c: CommsConversation) -> PresenceTier {
+        if c.isEveryone {
+            let ids = Set(c.msgs.flatMap { [$0.from, $0.to] }).filter { !$0.isEmpty }
+            return ids.map(tier).max() ?? .gone
+        }
+        return Swift.max(tier(c.a), tier(c.b))
+    }
+    private func alias(_ id: String) -> String { id.components(separatedBy: ":").last ?? id }
 
     private var header: some View {
         HStack(spacing: 10) {
             Image(systemName: "bubble.left.and.bubble.right").foregroundStyle(.tint)
             Text("Comms Board").font(.headline)
             Spacer()
-            Text("\(agents.count) agents · \(messages.count) messages")
+            Text("\(conversations.count) chats · \(agents.filter { $0.armed }.count)/\(agents.count) live")
                 .font(.caption).foregroundStyle(.secondary)
+            Button { stepType(-1) } label: { Image(systemName: "textformat.size.smaller") }
+                .buttonStyle(.borderless).help("Smaller text (⌘−)")
+            Button { stepType(1) } label: { Image(systemName: "textformat.size.larger") }
+                .buttonStyle(.borderless).help("Larger text (⌘+)")
             Button { refresh() } label: { Image(systemName: "arrow.clockwise") }
                 .buttonStyle(.borderless).help("Refresh")
             Button { store.commsOverlayOpen = false } label: { Image(systemName: "xmark.circle.fill") }
@@ -3688,52 +3774,166 @@ struct CommsDashboardView: View {
         .padding(.horizontal, 12).padding(.vertical, 9)
     }
 
+    // ---- agents sidebar (left) ----
     private var agentsPane: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text("AGENTS").font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
+            Text("AGENTS").font(sysFont(10, .semibold)).foregroundStyle(.secondary)
                 .padding(.horizontal, 12).padding(.vertical, 6)
-            List(agents) { a in
-                HStack(spacing: 8) {
-                    Circle().fill(a.armed ? Color.green : Color.secondary.opacity(0.35))
-                        .frame(width: 8, height: 8)
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(a.name).font(.callout.weight(.medium)).lineLimit(1)
-                        Text(a.owner.isEmpty ? a.host : "\(a.host) · \(a.owner)")
-                            .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
-                    }
-                    Spacer()
-                }
-            }
-            .listStyle(.inset)
-        }
-    }
-
-    private var messagesPane: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Text("COMMUNICATIONS").font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
-                .padding(.horizontal, 12).padding(.vertical, 6)
-            if messages.isEmpty {
-                Text(loaded ? "No messages you can see yet." : "Loading…")
-                    .font(.caption).foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            if agents.isEmpty {
+                Text(loaded ? "No agents online." : "Loading…")
+                    .font(sysFont(11)).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 12)
+                Spacer()
             } else {
-                List(messages) { m in
-                    VStack(alignment: .leading, spacing: 2) {
-                        HStack(spacing: 5) {
-                            Text(m.from).font(.caption.weight(.semibold))
-                            Image(systemName: "arrow.right").font(.system(size: 8)).foregroundStyle(.secondary)
-                            Text(m.scope == "global" ? "everyone" : m.to)
-                                .font(.caption).foregroundStyle(.secondary)
-                            Spacer()
-                            Text(shortTime(m.ts)).font(.caption2).foregroundStyle(.secondary)
+                List(agents) { a in
+                    HStack(spacing: 8) {
+                        Circle().fill(tier(a.id).color).frame(width: 8 * scale, height: 8 * scale)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(a.name).font(sysFont(13, .medium)).lineLimit(1)
+                            Text(a.owner.isEmpty ? a.host : "\(a.host) · \(a.owner)")
+                                .font(sysFont(10)).foregroundStyle(.secondary).lineLimit(1)
                         }
-                        Text(m.body).font(.caption).foregroundStyle(.primary).lineLimit(4)
+                        Spacer()
                     }
-                    .padding(.vertical, 2)
+                    .help("\(a.id) — \(tier(a.id).label)")
                 }
                 .listStyle(.inset)
             }
         }
+    }
+
+    // ---- main pane (right): conversation list, or an opened thread ----
+    @ViewBuilder
+    private var mainPane: some View {
+        if let c = conversations.first(where: { $0.id == selectedId }) {
+            thread(c)
+        } else {
+            conversationList
+        }
+    }
+
+    private var conversationList: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("CONVERSATIONS").font(sysFont(10, .semibold)).foregroundStyle(.secondary)
+                .padding(.horizontal, 12).padding(.vertical, 6)
+            if conversations.isEmpty {
+                Text(loaded ? "No conversations yet." : "Loading…")
+                    .font(sysFont(11)).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                List(conversations) { c in
+                    Button { selectedId = c.id } label: { convRow(c) }
+                        .buttonStyle(.plain)
+                        .contentShape(Rectangle())
+                }
+                .listStyle(.inset)
+            }
+        }
+    }
+
+    private func convTitle(_ c: CommsConversation) -> String {
+        c.isEveryone ? "📣 Everyone" : "\(c.a) ⇄ \(c.b)"
+    }
+
+    @ViewBuilder
+    private func convRow(_ c: CommsConversation) -> some View {
+        let t = convTier(c)
+        HStack(spacing: 8) {
+            Circle().fill(t.color).frame(width: 9 * scale, height: 9 * scale)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(convTitle(c)).font(sysFont(13, .medium)).lineLimit(1)
+                    Spacer(minLength: 4)
+                    Text(shortTime(c.lastTs)).font(sysFont(10)).foregroundStyle(.secondary)
+                }
+                Text(c.msgs.isEmpty ? "" : "\(alias(c.msgs.last!.from)): \(c.lastBody)")
+                    .font(sysFont(11)).foregroundStyle(.secondary).lineLimit(1)
+            }
+            Image(systemName: "chevron.right").font(sysFont(10)).foregroundStyle(.tertiary)
+        }
+        .padding(.vertical, 4)
+        .opacity(t == .gone ? 0.5 : 1)
+    }
+
+    @ViewBuilder
+    private func thread(_ c: CommsConversation) -> some View {
+        VStack(spacing: 0) {
+            threadHeader(c)
+            Divider()
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 6) {
+                        ForEach(c.msgs) { m in bubble(m, in: c) }
+                    }
+                    .padding(12)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .onAppear { scrollToEnd(proxy, c) }
+                .onChange(of: c.lastTs) { scrollToEnd(proxy, c) }
+                .onChange(of: selectedId) { scrollToEnd(proxy, c) }
+            }
+        }
+    }
+
+    private func scrollToEnd(_ proxy: ScrollViewProxy, _ c: CommsConversation) {
+        guard let last = c.msgs.last else { return }
+        DispatchQueue.main.async { proxy.scrollTo(last.id, anchor: .bottom) }
+    }
+
+    @ViewBuilder
+    private func threadHeader(_ c: CommsConversation) -> some View {
+        HStack(spacing: 10) {
+            Button { selectedId = nil } label: {
+                Image(systemName: "chevron.left").font(.body.weight(.semibold))
+            }
+            .buttonStyle(.borderless).help("Back to conversations")
+            .keyboardShortcut(.escape, modifiers: [])
+            if c.isEveryone {
+                Text("📣 Everyone").font(sysFont(15, .semibold))
+                Text("global broadcasts").font(sysFont(11)).foregroundStyle(.secondary)
+            } else {
+                participantTag(c.a)
+                Image(systemName: "arrow.left.arrow.right").font(sysFont(11)).foregroundStyle(.secondary)
+                participantTag(c.b)
+            }
+            Spacer()
+            Text("\(c.msgs.count) msgs").font(sysFont(10)).foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 12).padding(.vertical, 8)
+    }
+
+    @ViewBuilder
+    private func participantTag(_ id: String) -> some View {
+        let t = tier(id)
+        HStack(spacing: 5) {
+            Circle().fill(t.color).frame(width: 8 * scale, height: 8 * scale)
+            Text(alias(id)).font(sysFont(13, .semibold))
+            Text(id.components(separatedBy: ":").first ?? "")
+                .font(sysFont(10)).foregroundStyle(.secondary)
+        }
+        .help("\(id) — \(t.label)")
+    }
+
+    @ViewBuilder
+    private func bubble(_ m: CommsMsg, in c: CommsConversation) -> some View {
+        // In a pair thread, agent `b` sits on the right; everyone-thread is all-left.
+        let right = !c.isEveryone && m.from == c.b
+        HStack {
+            if right { Spacer(minLength: 48) }
+            VStack(alignment: .leading, spacing: 3) {
+                Text(alias(m.from)).font(sysFont(10, .semibold)).foregroundStyle(.secondary)
+                Text(m.body).font(sysFont(13)).textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(shortTime(m.ts)).font(sysFont(9)).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+            }
+            .padding(.horizontal, 10).padding(.vertical, 7)
+            .background(RoundedRectangle(cornerRadius: 13)
+                .fill(right ? Color.accentColor.opacity(0.18) : Color.secondary.opacity(0.12)))
+            if !right { Spacer(minLength: 48) }
+        }
+        .id(m.id)
     }
 
     private var notConnected: some View {
@@ -3791,18 +3991,72 @@ struct CommsDashboardView: View {
             let ms = arr.map { m in
                 CommsMsg(id: m["id"] as? String ?? UUID().uuidString,
                          from: m["from"] as? String ?? "",
-                         to: m["to"] as? String ?? "all",
+                         to: m["to"] as? String ?? "",
                          scope: m["scope"] as? String ?? "",
                          body: m["body"] as? String ?? "",
                          ts: m["ts"] as? String ?? "")
             }
-            messages = Array(ms.reversed())  // newest first
+            conversations = buildConversations(ms)  // server returns ts ascending
+            // Keep showing the list by default; only drop back if the open thread vanished.
+            if let s = selectedId, !conversations.contains(where: { $0.id == s }) {
+                selectedId = nil
+            }
         }
     }
 
+    /// Group the flat message log into pairwise threads + one pinned Everyone feed.
+    /// Threads are sorted most-recent-first; Everyone is always pinned on top.
+    private func buildConversations(_ msgs: [CommsMsg]) -> [CommsConversation] {
+        var pairs: [String: [CommsMsg]] = [:]
+        var everyone: [CommsMsg] = []
+        for m in msgs {
+            let broadcast = m.scope == "global" || m.to.isEmpty || m.to == "all" || m.to == "everyone"
+            if broadcast {
+                everyone.append(m)
+            } else {
+                let key = [m.from, m.to].sorted().joined(separator: "\u{1}")
+                pairs[key, default: []].append(m)
+            }
+        }
+        var convs: [CommsConversation] = pairs.map { key, ms in
+            let parts = key.components(separatedBy: "\u{1}")
+            return CommsConversation(id: key, isEveryone: false,
+                                     a: parts.first ?? "",
+                                     b: parts.count > 1 ? parts[1] : "",
+                                     msgs: ms.sorted { $0.ts < $1.ts })
+        }
+        convs.sort { $0.lastTs > $1.lastTs }
+        if !everyone.isEmpty {
+            convs.insert(CommsConversation(id: "__everyone__", isEveryone: true, a: "", b: "",
+                                           msgs: everyone.sorted { $0.ts < $1.ts }), at: 0)
+        }
+        return convs
+    }
+
+    // Server timestamps are UTC ISO8601 ("…T14:32:05Z"); render them in the client's
+    // local timezone — today as HH:mm, older as "d MMM, HH:mm".
+    private static let isoParser: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime]; return f
+    }()
+    private static let isoParserFrac: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]; return f
+    }()
+    private static let localTime: DateFormatter = {
+        let f = DateFormatter(); f.locale = .current; f.dateFormat = "HH:mm"; return f
+    }()
+    private static let localDayTime: DateFormatter = {
+        let f = DateFormatter(); f.locale = .current
+        f.setLocalizedDateFormatFromTemplate("d MMM HH:mm"); return f
+    }()
+
     private func shortTime(_ iso: String) -> String {
-        guard let t = iso.split(separator: "T").last else { return iso }
-        return String(t.prefix(5))
+        guard let d = Self.isoParser.date(from: iso) ?? Self.isoParserFrac.date(from: iso) else {
+            return iso.split(separator: "T").last.map { String($0.prefix(5)) } ?? iso
+        }
+        return Calendar.current.isDateInToday(d)
+            ? Self.localTime.string(from: d)
+            : Self.localDayTime.string(from: d)
     }
 }
 
