@@ -3,6 +3,7 @@ import AppKit
 import Combine
 import Carbon.HIToolbox
 import UserNotifications
+import SQLite3
 
 // MARK: - Shared ISO8601 formatter
 
@@ -63,6 +64,25 @@ struct AgentEvent: Codable {
     }
 }
 
+// MARK: - Agent source (which tool the session belongs to)
+
+/// Which coding tool a monitored session comes from. Claude Code is the original
+/// (hook-driven) source; additional tools (Cursor, …) are pluggable via the
+/// `SessionProvider` protocol. Add a case here + a provider conformer to support
+/// a new tool — nothing else in the view layer needs to know the difference.
+enum AgentSource: String, Codable {
+    case claudeCode
+    case cursor
+
+    /// Short label shown in the row badge identifying which tool the session is from.
+    var badge: String {
+        switch self {
+        case .claudeCode: return "Claude"
+        case .cursor:     return "Cursor"
+        }
+    }
+}
+
 // MARK: - Derived agent state
 
 enum AgentStatus: String {
@@ -94,6 +114,10 @@ struct Agent: Identifiable {
     var parentSessionId: String? = nil
     // Authoritative Ghostty terminal id, reported by the hook (overrides heuristics).
     var terminalId: String? = nil
+    // Which tool this session belongs to. Defaults to .claudeCode so every existing
+    // construction site (and the hook pipeline) is unchanged; non-Claude providers
+    // set it explicitly.
+    var source: AgentSource = .claudeCode
     // Runtime tracking: ticks while .running, frozen when .needsAttention or .stopped
     var accumulatedSeconds: Double = 0
     var runStartedAt: Date? = nil
@@ -1001,6 +1025,60 @@ enum HousekeepingDelta {
     private static func cap(_ s: String, _ n: Int) -> String {
         s.count <= n ? s : String(s.prefix(n)) + "…"
     }
+
+    /// Cursor variant: projects the messages appended past `fromIndex` (a message
+    /// count, not a byte offset) into the same `U:/A:` lines the fold consumes.
+    /// Cursor doesn't expose per-tool call detail in the message text, so there are
+    /// no `T:` lines — the summary works from the conversation prose.
+    static func projectCursor(composerId: String, fromIndex: UInt64) -> (lines: [String], newOffset: UInt64) {
+        let (bubbles, newIndex) = CursorReader.conversationDelta(
+            composerId: composerId, fromIndex: Int(fromIndex))
+        var lines: [String] = []
+        for b in bubbles {
+            let t = cap(b.text, b.type == 1 ? userCap : asstCap)
+            if t.isEmpty { continue }
+            lines.append(b.type == 1 ? "U: \(t)" : "A: \(t)")
+        }
+        return (lines, UInt64(newIndex))
+    }
+}
+
+/// Where a session's activity delta comes from. Claude reads an append-only
+/// transcript file by byte offset; Cursor reads SQLite messages by index. Both
+/// expose the same monotonic `extent`/`project` pair so the fold pipeline doesn't
+/// care which tool produced the session. Add a case to support a new tool's store.
+enum HousekeepingSource {
+    case transcript(path: String)
+    case cursor(composerId: String)
+
+    /// Monotonic size compared against the folded cursor to detect new activity.
+    func extent() -> UInt64 {
+        switch self {
+        case .transcript(let path):
+            let attrs = (try? FileManager.default.attributesOfItem(atPath: path)) ?? [:]
+            return (attrs[.size] as? NSNumber)?.uint64Value ?? 0
+        case .cursor(let id):
+            return UInt64(CursorReader.bubbleCount(composerId: id))
+        }
+    }
+
+    /// Minimum new delta (beyond the cursor) to bother folding on the cadence.
+    /// Bytes for a transcript; messages for Cursor.
+    var minDelta: UInt64 {
+        switch self {
+        case .transcript: return 1500
+        case .cursor:     return 2
+        }
+    }
+
+    var isCursor: Bool { if case .cursor = self { return true }; return false }
+
+    func project(from offset: UInt64) -> (lines: [String], newOffset: UInt64) {
+        switch self {
+        case .transcript(let path): return HousekeepingDelta.project(path: path, from: offset)
+        case .cursor(let id):       return HousekeepingDelta.projectCursor(composerId: id, fromIndex: offset)
+        }
+    }
 }
 
 // MARK: - Housekeeping state + fold
@@ -1395,7 +1473,7 @@ final class HousekeepingGenerator {
     // Depth-1 coalescing slot per session: a trigger that arrives while a fold is in
     // flight is remembered (latest wins) and flushed exactly once when the fold finishes,
     // so the tail of a burst (e.g. a Stop landing mid-fold) is never lost.
-    private var pending: [String: (path: String, cwd: String?, status: AgentStatus)] = [:]
+    private var pending: [String: (source: HousekeepingSource, cwd: String?, status: AgentStatus)] = [:]
     private var lastFoldAt: [String: Date] = [:]
     var onUpdated: ((String) -> Void)?
     var onFoldingChanged: ((String, Bool) -> Void)?   // (sessionId, isFolding)
@@ -1409,9 +1487,8 @@ final class HousekeepingGenerator {
         let v = UserDefaults.standard.double(forKey: "agentMonitor.housekeepingHeartbeatSec")
         return v > 0 ? v : 1800
     }
-    // Minimum new transcript bytes since the last fold before a (non-forced) fold is worth
-    // it — keeps low-activity sessions from folding on the cadence just for a stray line.
-    private static let minDeltaBytes: UInt64 = 1500
+    // Minimum new delta before a (non-forced) fold is worth it now lives on
+    // HousekeepingSource.minDelta (bytes for transcripts, messages for Cursor).
     private var stateDir: URL {
         if let custom = UserDefaults.standard.string(forKey: "agentMonitor.housekeepingStateDir"), !custom.isEmpty {
             return URL(fileURLWithPath: (custom as NSString).expandingTildeInPath, isDirectory: true)
@@ -1430,26 +1507,42 @@ final class HousekeepingGenerator {
     /// Called per-rebuild for every top-level session. Decides whether this is a fold
     /// boundary (due heartbeat / forced) with new delta, and if so spawns the fold
     /// off-main. Cheap when there's nothing to do.
-    func consider(sessionId: String, transcriptPath: String?, cwd: String?, status: AgentStatus, force: Bool = false) {
-        guard let path = transcriptPath, !path.isEmpty else { return }
+    func consider(sessionId: String, source: HousekeepingSource?, cwd: String?, status: AgentStatus, force: Bool = false) {
+        guard let source = source else { return }
         // Live folding can be switched off ("Keep live session summaries") — but a manual
         // force still runs, so summaries can be generated on demand with auto-folding off.
         guard enabled || force else { return }
         // A fold is already running for this session — coalesce: remember the latest
         // trigger and flush it once the current fold finishes (see finish()).
         if inFlight.contains(sessionId) {
-            pending[sessionId] = (path, cwd, status)
+            pending[sessionId] = (source, cwd, status)
             return
         }
 
-        let state = states[sessionId] ?? loadOrInit(sessionId: sessionId, cwd: cwd)
+        var state = states[sessionId] ?? loadOrInit(sessionId: sessionId, cwd: cwd)
 
-        // Cheap "is there new delta?" via file size vs cursor — no full read on main.
-        // A manual force folds on any new bytes; the cadence requires a meaningful chunk.
-        let attrs = (try? FileManager.default.attributesOfItem(atPath: path)) ?? [:]
-        let size = (attrs[.size] as? NSNumber)?.uint64Value ?? 0
-        let minDelta = force ? 1 : Self.minDeltaBytes
-        guard size >= state.offset + minDelta else { states[sessionId] = state; return }
+        // A manual force on a never-folded Cursor session folds the WHOLE history
+        // (the auto path seeds the cursor forward; force is the way to summarize the
+        // full backlog on demand).
+        if force, source.isCursor, state.summary.isEmpty { state.offset = 0 }
+
+        // Cursor keeps EVERY composer forever (85+ here), so on launch a dozen
+        // historical sessions would each fold their full backlog at once — a token
+        // burst Claude doesn't have (its sessions get cleared). For a never-folded
+        // Cursor session, start the cursor at "now": auto-folds then cover only NEW
+        // activity. A manual force (below, force==true) still folds the whole thing.
+        if source.isCursor, !force, state.summary.isEmpty, state.offset == 0 {
+            var seeded = state
+            seeded.offset = source.extent()
+            states[sessionId] = seeded
+            return
+        }
+
+        // Cheap "is there new delta?" via extent vs cursor — no full read on main.
+        // A manual force folds on any new delta; the cadence requires a meaningful chunk.
+        let extent = source.extent()
+        let minDelta = force ? 1 : source.minDelta
+        guard extent >= state.offset + minDelta else { states[sessionId] = state; return }
 
         // Trigger gate — two triggers only: the heartbeat cadence (default 30 min) and a
         // manual force. Answer-finished / stop boundaries deliberately do NOT fold; that
@@ -1469,7 +1562,7 @@ final class HousekeepingGenerator {
             // delta = only the new activity since the cursor → drives the ledgers and the
             // summary rewrite. No separate "recent" window is sent: the cumulative summary
             // already carries prior context, so we pay for the new bytes only.
-            let (lines, newOffset) = HousekeepingDelta.project(path: path, from: fromOffset)
+            let (lines, newOffset) = source.project(from: fromOffset)
             // Only fold once the ASSISTANT has done something new. A lone user message (a
             // turn just starting) isn't worth a fold — wait for the answer / heartbeat. We
             // keep the cursor (fold:nil doesn't advance it), so the question folds together
@@ -1510,7 +1603,7 @@ final class HousekeepingGenerator {
     /// Fires at most once per fold (the slot is consumed), so no overlap or runaway loop.
     private func flushPending(_ sessionId: String) {
         guard let p = pending.removeValue(forKey: sessionId) else { return }
-        consider(sessionId: sessionId, transcriptPath: p.path, cwd: p.cwd, status: p.status)
+        consider(sessionId: sessionId, source: p.source, cwd: p.cwd, status: p.status)
     }
 
     func snapshot(_ sessionId: String) -> HousekeepingState? { states[sessionId] }
@@ -1600,6 +1693,464 @@ final class HousekeepingGenerator {
         else { return "" }
         let b = s.trimmingCharacters(in: .whitespacesAndNewlines)
         return b == "HEAD" ? "" : b   // detached HEAD → blank
+    }
+}
+
+// MARK: - Pluggable session sources
+
+/// A source of monitored agent sessions for one tool. Claude Code remains the
+/// built-in hook-driven path inside `AgentStore`; every *other* tool plugs in by
+/// conforming to this protocol and being registered in `AgentStore.providers`.
+///
+/// To add a new tool (Windsurf, Zed, …): add an `AgentSource` case, implement a
+/// `SessionProvider` that reads that tool's storage and derives `[Agent]`, and
+/// append it to the registry in `AgentStore.init`. Nothing in the view layer,
+/// stats, bubbles, or notifications needs to change — they all key off `Agent`.
+@MainActor
+protocol SessionProvider: AnyObject {
+    var source: AgentSource { get }
+    /// Whether the tool is installed/usable on this machine (its storage exists).
+    var isAvailable: Bool { get }
+    /// Begin watching the tool's storage. Call `onChange` whenever the underlying
+    /// state may have changed, so the store re-merges and re-renders.
+    func start(onChange: @escaping () -> Void)
+    func stop()
+    /// A fresh snapshot of this provider's sessions, statuses derived as of `now`.
+    /// Must be cheap — it runs on every merge/rebuild.
+    func currentAgents(now: Date) -> [Agent]
+}
+
+// MARK: - Cursor: read-only access to its SQLite session store
+
+/// One composer (Cursor's chat/agent session) as surfaced by the lightweight
+/// `composer.composerHeaders` index — enough to render a row without touching the
+/// multi-hundred-MB blob table on the hot path.
+struct CursorHeader {
+    let composerId: String
+    let name: String?
+    let subtitle: String?
+    let unifiedMode: String?
+    let createdAtMs: Double?
+    let lastUpdatedAtMs: Double?
+    let hasBlockingPendingActions: Bool
+    let isArchived: Bool
+    let isDraft: Bool
+    let cwd: String?
+    // Subagent linkage (Cursor's "explore"/task sub-composers spawned by a parent).
+    let parentComposerId: String?     // nil for top-level sessions
+    let subagentType: String?         // e.g. "explore" — shown as the row's agent type
+}
+
+/// Read-only reader for Cursor's global SQLite store. Opens the DB `READONLY`
+/// (Cursor itself is the writer; WAL mode lets us read committed state live) and
+/// never writes. All access is best-effort: any failure returns empty/nil so the
+/// monitor degrades gracefully when Cursor isn't installed or the schema shifts.
+enum CursorReader {
+    static var globalDBURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appending(path: "Library/Application Support/Cursor/User/globalStorage/state.vscdb")
+    }
+    /// WAL sidecar — its mtime advances on every Cursor write, so we kqueue-watch
+    /// it for liveness instead of polling the DB blindly.
+    static var walURL: URL {
+        URL(fileURLWithPath: globalDBURL.path + "-wal")
+    }
+    static var isAvailable: Bool {
+        FileManager.default.fileExists(atPath: globalDBURL.path)
+    }
+
+    /// Opens the global DB read-only, runs `body`, and always closes. `body` gets
+    /// nil if the DB couldn't be opened.
+    private static func withDB<T>(_ body: (OpaquePointer?) -> T) -> T {
+        var db: OpaquePointer?
+        let flags = SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX
+        let rc = sqlite3_open_v2(globalDBURL.path, &db, flags, nil)
+        defer { if db != nil { sqlite3_close(db) } }
+        guard rc == SQLITE_OK else { return body(nil) }
+        sqlite3_busy_timeout(db, 200)
+        return body(db)
+    }
+
+    /// Prepares `sql`, binds `bind` positionally, and invokes `row` (with the live
+    /// statement handle) once per result row. Best-effort: any prepare failure is a
+    /// silent no-op so a schema shift can't crash the monitor.
+    private static func query(_ db: OpaquePointer?, _ sql: String,
+                              bind: [String] = [],
+                              _ row: (OpaquePointer) -> Void) {
+        guard let db else { return }
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK,
+              let stmt else { return }
+        defer { sqlite3_finalize(stmt) }
+        // SQLITE_TRANSIENT so SQLite copies the bound strings.
+        let TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        for (i, v) in bind.enumerated() {
+            sqlite3_bind_text(stmt, Int32(i + 1), v, -1, TRANSIENT)
+        }
+        while sqlite3_step(stmt) == SQLITE_ROW { row(stmt) }
+    }
+
+    private static func text(_ stmt: OpaquePointer, _ col: Int32) -> String? {
+        guard let c = sqlite3_column_text(stmt, col) else { return nil }
+        return String(cString: c)
+    }
+
+    /// Number of messages in a composer — a cheap monotonic cursor for the
+    /// housekeeping delta (json_array_length avoids pulling the blob).
+    static func bubbleCount(composerId: String) -> Int {
+        var n = 0
+        withDB { db in
+            query(db, """
+                SELECT json_array_length(value,'$.fullConversationHeadersOnly')
+                FROM cursorDiskKV WHERE key=? LIMIT 1
+                """, bind: ["composerData:\(composerId)"]) { stmt in
+                n = Int(sqlite3_column_int64(stmt, 0))
+            }
+        }
+        return n
+    }
+
+    /// The messages appended after `fromIndex`, in order, as (type, text) where
+    /// type 1 = user, 2 = assistant. Returns the new total count so the caller can
+    /// advance its cursor. Reads the ordered header list once, then the delta
+    /// bubbles' text — off the hot path (housekeeping heartbeat only).
+    static func conversationDelta(composerId: String, fromIndex: Int)
+        -> (bubbles: [(type: Int, text: String)], newIndex: Int) {
+        var result: [(type: Int, text: String)] = []
+        var total = fromIndex
+        withDB { db in
+            // Ordered list of bubble ids + roles.
+            var headerJSON: String?
+            query(db, """
+                SELECT json_extract(value,'$.fullConversationHeadersOnly')
+                FROM cursorDiskKV WHERE key=? LIMIT 1
+                """, bind: ["composerData:\(composerId)"]) { stmt in
+                headerJSON = text(stmt, 0)
+            }
+            guard let headerJSON,
+                  let data = headerJSON.data(using: .utf8),
+                  let headers = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return }
+            total = headers.count
+            guard fromIndex < headers.count else { return }
+            for h in headers[fromIndex...] {
+                guard let bid = h["bubbleId"] as? String else { continue }
+                let type = (h["type"] as? NSNumber)?.intValue ?? 0
+                var body: String?
+                query(db, "SELECT json_extract(value,'$.text') FROM cursorDiskKV WHERE key=? LIMIT 1",
+                      bind: ["bubbleId:\(composerId):\(bid)"]) { stmt in
+                    body = text(stmt, 0)
+                }
+                let t = (body ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                if !t.isEmpty { result.append((type: type, text: t)) }
+            }
+        }
+        return (result, total)
+    }
+
+    /// The full header index — one cheap read of a single small JSON blob — parsed
+    /// from an already-open connection so callers can batch other reads in the same
+    /// `withDB` (see `readState`).
+    private static func parseHeaders(_ db: OpaquePointer?) -> [CursorHeader] {
+        var json: String?
+        query(db, "SELECT value FROM ItemTable WHERE key='composer.composerHeaders' LIMIT 1") { stmt in
+            json = text(stmt, 0)
+        }
+        guard let json,
+              let data = json.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let all = obj["allComposers"] as? [[String: Any]] else { return [] }
+
+        return all.compactMap { c in
+            guard let id = c["composerId"] as? String else { return nil }
+            // cwd: prefer the workspace identifier, fall back to the first tracked repo.
+            var cwd: String?
+            if let ws = c["workspaceIdentifier"] as? [String: Any],
+               let uri = ws["uri"] as? [String: Any],
+               let p = uri["fsPath"] as? String, !p.isEmpty {
+                cwd = p
+            } else if let repos = c["trackedGitRepos"] as? [[String: Any]],
+                      let p = repos.first?["repoPath"] as? String, !p.isEmpty {
+                cwd = p
+            }
+            let sub = c["subagentInfo"] as? [String: Any]
+            return CursorHeader(
+                composerId: id,
+                name: (c["name"] as? String).flatMap { $0.isEmpty ? nil : $0 },
+                subtitle: (c["subtitle"] as? String).flatMap { $0.isEmpty ? nil : $0 },
+                unifiedMode: c["unifiedMode"] as? String,
+                createdAtMs: (c["createdAt"] as? NSNumber)?.doubleValue,
+                lastUpdatedAtMs: (c["lastUpdatedAt"] as? NSNumber)?.doubleValue,
+                hasBlockingPendingActions: (c["hasBlockingPendingActions"] as? Bool) ?? false,
+                isArchived: (c["isArchived"] as? Bool) ?? false,
+                isDraft: (c["isDraft"] as? Bool) ?? false,
+                cwd: cwd,
+                parentComposerId: (sub?["parentComposerId"] as? String).flatMap { $0.isEmpty ? nil : $0 },
+                subagentType: (sub?["subagentTypeName"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            )
+        }
+    }
+
+    /// For the few recently-touched composers, returns whether each is actively
+    /// generating. Uses json_extract so we never pull the (potentially multi-MB)
+    /// composer blobs — just the status + the generating-bubble list shape.
+    private static func generatingStates(_ db: OpaquePointer?, ids: [String]) -> [String: Bool] {
+        guard !ids.isEmpty else { return [:] }
+        var result: [String: Bool] = [:]
+        for id in ids {
+            query(db, """
+                SELECT json_extract(value,'$.status'),
+                       json_extract(value,'$.generatingBubbleIds')
+                FROM cursorDiskKV WHERE key=? LIMIT 1
+                """, bind: ["composerData:\(id)"]) { stmt in
+                let status = text(stmt, 0)
+                let gen = text(stmt, 1)
+                let genActive = (gen != nil && gen != "[]" && gen != "null" && !(gen ?? "").isEmpty)
+                result[id] = (status == "generating") || genActive
+            }
+        }
+        return result
+    }
+
+    /// One DB open per refresh: parse the header index, then read the generating
+    /// state of just the composers `isRecent` accepts (only recently-touched ones
+    /// can be mid-generation). Folding both reads into a single connection keeps the
+    /// hot path to one open/close instead of two.
+    static func readState(isRecent: (CursorHeader) -> Bool)
+        -> (headers: [CursorHeader], generating: [String: Bool]) {
+        withDB { db in
+            let headers = parseHeaders(db)
+            let ids = headers.filter(isRecent).map(\.composerId)
+            return (headers, generatingStates(db, ids: ids))
+        }
+    }
+}
+
+/// `SessionProvider` for Cursor. Polls the global SQLite store (kqueue-driven on
+/// the WAL sidecar, plus a slow heartbeat for time-based staleness) and derives
+/// the same `Agent`/`AgentStatus` model the rest of the app already renders.
+///
+/// Cursor has no hooks, so status is reconstructed from the header index:
+///   running       — composer is generating and the WAL was touched recently
+///   away          — generating but the store has been silent past the away cutoff
+///   needsAttention — hasBlockingPendingActions (waiting on the user)
+///   idle          — finished and recently active
+///   inactive      — finished and silent past the inactive cutoff
+@MainActor
+final class CursorProvider: SessionProvider {
+    let source: AgentSource = .cursor
+    var isAvailable: Bool { CursorReader.isAvailable }
+
+    // Cursor keeps every composer forever (85+ here), so surfacing them all would
+    // swamp the list with long-dead sessions. Show only those touched within this
+    // window; anything active is recent by definition. (Claude self-prunes via
+    // SessionEnd/dismiss; Cursor rows are regenerated each poll, so dismiss can't
+    // stick yet — a recency cutoff keeps the list relevant. Per-row hide is Fase 2.)
+    private let lookbackSec: TimeInterval = 12 * 3600
+
+    private var onChange: (() -> Void)?
+    private var walWatcher: DispatchSourceFileSystemObject?
+    private var heartbeat: DispatchSourceTimer?
+    private var debounce: DispatchWorkItem?
+    // Sticky run-start per composer so the duration timer doesn't reset every poll.
+    private var runStart: [String: Date] = [:]
+    // Dismissed composers: id → the lastUpdatedAt (ms) at dismissal. The row stays
+    // hidden until the composer is touched again (lastUpdatedAt advances past it),
+    // mirroring how a Claude session reappears on a new event. Persisted.
+    private var dismissed: [String: Double] = [:]
+    // Cache of the last DB read, refreshed only when the store's mtime advances.
+    // rebuildView() fires on every Claude transcript write and on the 30s heartbeat;
+    // without this, each of those would re-open SQLite and re-parse the 85+ composer
+    // header blob on the main thread even when nothing in Cursor changed. Time-based
+    // status transitions still recompute every call from `now` against this cache.
+    private var cachedHeaders: [CursorHeader] = []
+    private var cachedGenerating: [String: Bool] = [:]
+    private var cacheMtime: Date?
+
+    private var dismissedURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appending(path: ".claude/agent-monitor-cursor-dismissed.json")
+    }
+
+    func start(onChange: @escaping () -> Void) {
+        self.onChange = onChange
+        loadDismissed()
+        armWalWatcher()
+        // Heartbeat: time-based transitions (idle→inactive) have no write to ride
+        // on, so re-evaluate periodically. Cheap — one small blob read.
+        let t = DispatchSource.makeTimerSource(queue: .main)
+        t.schedule(deadline: .now() + 30, repeating: 30, leeway: .seconds(5))
+        t.setEventHandler { [weak self] in
+            guard let self else { return }
+            // If the WAL didn't exist at startup (Cursor closed / already
+            // checkpointed) armWalWatcher bailed and nothing re-armed it. Retry here
+            // so we regain kqueue liveness once Cursor writes a WAL, instead of being
+            // stuck on this 30s heartbeat forever.
+            if self.walWatcher == nil { self.armWalWatcher() }
+            self.onChange?()
+        }
+        heartbeat = t
+        t.resume()
+    }
+
+    func stop() {
+        walWatcher?.cancel(); walWatcher = nil
+        heartbeat?.cancel(); heartbeat = nil
+        debounce?.cancel(); debounce = nil
+    }
+
+    /// Watches the WAL sidecar; a write means Cursor changed something. Debounced
+    /// so a burst of frames during generation collapses into one rebuild. Re-arms
+    /// itself if the WAL is checkpointed away (delete/rename).
+    private func armWalWatcher() {
+        walWatcher?.cancel(); walWatcher = nil
+        let path = CursorReader.walURL.path
+        let fd = open(path, O_EVTONLY)
+        guard fd >= 0 else { return }
+        let src = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd, eventMask: [.write, .extend, .delete, .rename], queue: .main)
+        src.setEventHandler { [weak self] in
+            guard let self else { return }
+            if src.data.contains(.delete) || src.data.contains(.rename) {
+                src.cancel()
+                // WAL rotated; re-arm shortly so we keep getting liveness events.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.armWalWatcher() }
+            }
+            self.scheduleRebuild()
+        }
+        src.setCancelHandler { close(fd) }
+        walWatcher = src
+        src.resume()
+    }
+
+    private func scheduleRebuild() {
+        debounce?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.onChange?() }
+        debounce = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: work)
+    }
+
+    /// Hides a composer until it's next touched. Triggers a rebuild via the change
+    /// callback so the row disappears immediately.
+    func dismiss(_ composerId: String, lastUpdatedMs: Double) {
+        dismissed[composerId] = lastUpdatedMs
+        saveDismissed()
+        onChange?()
+    }
+
+    private func loadDismissed() {
+        guard let data = try? Data(contentsOf: dismissedURL),
+              let m = try? JSONDecoder().decode([String: Double].self, from: data) else { return }
+        dismissed = m
+    }
+    private func saveDismissed() {
+        if let data = try? JSONEncoder().encode(dismissed) { try? data.write(to: dismissedURL) }
+    }
+
+    /// mtime of the store — the max of the DB file and its WAL sidecar. Advances on
+    /// every Cursor write and on checkpoint, so it's a sound "did anything change?"
+    /// token for the cache. nil only if the store is gone (Cursor uninstalled).
+    private func storeMtime() -> Date? {
+        let fm = FileManager.default
+        let db = (try? fm.attributesOfItem(atPath: CursorReader.globalDBURL.path))?[.modificationDate] as? Date
+        let wal = (try? fm.attributesOfItem(atPath: CursorReader.walURL.path))?[.modificationDate] as? Date
+        switch (db, wal) {
+        case let (d?, w?): return max(d, w)
+        default:           return db ?? wal
+        }
+    }
+
+    /// Re-reads the store only when its mtime advanced; otherwise the cache is reused
+    /// and just re-evaluated against `now`. Also prunes dismissals for composers
+    /// Cursor no longer keeps, so that map can't grow unbounded.
+    private func refreshCacheIfChanged(now: Date) {
+        let mtime = storeMtime()
+        if let mtime, mtime == cacheMtime { return }
+        let away = AgentStore.awayThresholdSec
+        let (headers, generating) = CursorReader.readState { h in
+            now.timeIntervalSince1970 - ((h.lastUpdatedAtMs ?? 0) / 1000) < away * 2
+        }
+        cachedHeaders = headers
+        cachedGenerating = generating
+        cacheMtime = mtime
+        let live = Set(headers.map(\.composerId))
+        let pruned = dismissed.filter { live.contains($0.key) }
+        if pruned.count != dismissed.count { dismissed = pruned; saveDismissed() }
+    }
+
+    func currentAgents(now: Date) -> [Agent] {
+        refreshCacheIfChanged(now: now)
+        let headers = cachedHeaders.filter { h in
+            // Real, non-archived sessions only.
+            guard !h.isArchived, !h.isDraft else { return false }
+            // A usable timestamp (lastUpdatedAt, or createdAt for subagents that
+            // never got one) filters out empty drafts and bounds recency.
+            guard let ms = h.lastUpdatedAtMs ?? h.createdAtMs else { return false }
+            guard now.timeIntervalSince1970 - ms / 1000 < lookbackSec else { return false }
+            // Stay hidden until touched again after a dismiss.
+            if let dms = dismissed[h.composerId], ms <= dms { return false }
+            return true
+        }
+        let away = AgentStore.awayThresholdSec
+        let inactive = AgentStore.inactiveThresholdSec
+        let generating = cachedGenerating
+
+        var agents: [Agent] = []
+        var liveIds = Set<String>()
+        for h in headers {
+            let lastMs = h.lastUpdatedAtMs ?? h.createdAtMs ?? 0
+            let last = Date(timeIntervalSince1970: lastMs / 1000)
+            let age = now.timeIntervalSince(last)
+            let isGen = generating[h.composerId] ?? false
+
+            let status: AgentStatus
+            if h.hasBlockingPendingActions {
+                status = .needsAttention
+            } else if isGen {
+                status = age > away ? .away : .running
+            } else {
+                status = age > inactive ? .inactive : .idle
+            }
+
+            // Maintain a sticky run-start so the elapsed timer is stable across polls.
+            var runStartedAt: Date?
+            var accumulated: Double = 0
+            if status == .running {
+                liveIds.insert(h.composerId)
+                let start = runStart[h.composerId] ?? now
+                runStart[h.composerId] = start
+                runStartedAt = start
+            } else {
+                runStart[h.composerId] = nil
+                // Freeze a representative duration for finished/blocked sessions.
+                if let created = h.createdAtMs { accumulated = max(0, (lastMs - created) / 1000) }
+            }
+
+            let createdDate = Date(timeIntervalSince1970: (h.createdAtMs ?? lastMs) / 1000)
+            var a = Agent(
+                id: h.composerId,
+                cwd: h.cwd,
+                status: status,
+                firstSeen: ISO8601.formatter.string(from: createdDate),
+                lastUpdate: ISO8601.formatter.string(from: last),
+                lastMessage: nil,
+                transcriptPath: nil
+            )
+            a.source = .cursor
+            a.generatedTitle = h.name
+            a.liveStatus = (status == .running) ? h.subtitle : nil
+            a.accumulatedSeconds = accumulated
+            a.runStartedAt = runStartedAt
+            // Subagent linkage: group under the parent composer and label by type.
+            a.parentSessionId = h.parentComposerId
+            a.agentType = h.subagentType
+            // No real model id; surface the conversation mode (agent/chat) instead
+            // so the row's identifier slot reads sensibly rather than a UUID prefix.
+            a.model = h.unifiedMode
+            agents.append(a)
+        }
+        // Drop run-starts for composers no longer live so the map can't grow.
+        runStart = runStart.filter { liveIds.contains($0.key) }
+        return agents
     }
 }
 
@@ -1790,6 +2341,16 @@ final class AgentStore: ObservableObject {
 
     func focus(agent: Agent) {
         guard let cwd = agent.cwd, !cwd.isEmpty else { return }
+        // Cursor sessions live in the Cursor app, not a Ghostty tab. Best-effort:
+        // bring the project window forward by opening its folder in Cursor.
+        // (Deep-linking to a specific composer isn't publicly supported.)
+        if agent.source == .cursor {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+            p.arguments = ["-a", "Cursor", cwd]
+            try? p.run()
+            return
+        }
         // Subagents share the parent's terminal. Prefer the hook-reported id
         // (authoritative), then the heuristic map, then occurrence-th tab.
         let key = agent.parentSessionId ?? agent.id
@@ -1841,6 +2402,17 @@ final class AgentStore: ObservableObject {
     @Published var titleGenerationEnabled: Bool = (UserDefaults.standard.object(forKey: "agentMonitor.titleGenerationEnabled") as? Bool) ?? true {
         didSet { UserDefaults.standard.set(titleGenerationEnabled, forKey: "agentMonitor.titleGenerationEnabled") }
     }
+    /// Monitor sessions from non-Claude tools (currently Cursor). Default ON; when
+    /// off, external providers are ignored entirely and the list shows Claude only.
+    @Published var cursorEnabled: Bool = (UserDefaults.standard.object(forKey: "agentMonitor.cursorEnabled") as? Bool) ?? true {
+        didSet {
+            UserDefaults.standard.set(cursorEnabled, forKey: "agentMonitor.cursorEnabled")
+            // Tear the providers' watchers/heartbeat down when off so a disabled
+            // source stops waking the app every 30s; bring them back on when re-enabled.
+            setProvidersActive(cursorEnabled)
+            rebuildView()
+        }
+    }
     @Published var pushNotifier = PushNotifier()
     @Published var localNotifier = LocalNotifier()
 
@@ -1850,6 +2422,9 @@ final class AgentStore: ObservableObject {
     private var hasLoadedInitial = false
     private let transcriptReader = TranscriptReader()
     private let titleGenerator = TitleGenerator()
+    // Pluggable sources for non-Claude tools. Claude Code stays the built-in
+    // hook-driven path above; everything here is merged into the published list.
+    private var providers: [SessionProvider] = []
     private let liveStatusGenerator = LiveStatusGenerator()
     let housekeepingGenerator = HousekeepingGenerator()
 
@@ -1958,9 +2533,36 @@ final class AgentStore: ObservableObject {
             .store(in: &cancellables)
         loadGhosttyMap()
         loadCustomNames()
+        registerProviders()
         ingestAgentsFile()
         rebuildView()
         startWatching()
+    }
+
+    /// Builds the external-source registry. To add a tool, append its provider here.
+    /// Providers are registered regardless of the toggle, but only *started* when
+    /// their source is enabled (see `setProvidersActive`).
+    private func registerProviders() {
+        let cursor = CursorProvider()
+        guard cursor.isAvailable else { return }
+        providers.append(cursor)
+        if cursorEnabled { cursor.start(onChange: { [weak self] in self?.rebuildView() }) }
+    }
+
+    /// Starts or stops every external provider's watchers. `stop()`-then-`start()`
+    /// on activation keeps it idempotent (no duplicate watchers if called twice).
+    private func setProvidersActive(_ active: Bool) {
+        for p in providers {
+            p.stop()
+            if active { p.start(onChange: { [weak self] in self?.rebuildView() }) }
+        }
+    }
+
+    /// Current agents contributed by external providers, honoring the per-tool
+    /// toggle. Empty when the source is disabled.
+    private func externalAgents(now: Date) -> [Agent] {
+        guard cursorEnabled else { return [] }
+        return providers.flatMap { $0.currentAgents(now: now) }
     }
 
     private var ghosttyMapURL: URL {
@@ -2000,7 +2602,8 @@ final class AgentStore: ObservableObject {
     /// throttled so a session that never matches a Ghostty tab can't spin.
     private func reconcileGhostty() {
         guard Ghostty.isInstalled else { return }
-        let live = agents.filter { $0.parentSessionId == nil && $0.status != .inactive }
+        // Only Claude sessions map to Ghostty tabs; Cursor sessions live in-app.
+        let live = agents.filter { $0.parentSessionId == nil && $0.status != .inactive && $0.source == .claudeCode }
         let liveIds = Set(live.map(\.id))
         var desiredTitle: [String: String] = [:]
         for a in live { desiredTitle[a.id] = a.bubbleTitle }
@@ -2151,7 +2754,10 @@ final class AgentStore: ObservableObject {
             ingestAgentsFile()
         }
 
-        let sorted = byId.values.sorted { a, b in
+        // Merge Claude (byId) with external providers (Cursor, …) into one pool
+        // before ordering, so all sources sort/group/render uniformly.
+        let pool = Array(byId.values) + externalAgents(now: Date())
+        let sorted = pool.sorted { a, b in
             if statusRank(a.status) != statusRank(b.status) {
                 return statusRank(a.status) < statusRank(b.status)
             }
@@ -2382,6 +2988,14 @@ final class AgentStore: ObservableObject {
     }
 
     func dismiss(_ sessionId: String) {
+        // Cursor rows are regenerated from the store each poll, so a cleared event
+        // wouldn't stick — route the dismiss to the provider, which hides it until
+        // the composer is touched again.
+        if let a = agents.first(where: { $0.id == sessionId }), a.source == .cursor {
+            let ms = (Self.iso8601.date(from: a.lastUpdate) ?? Date()).timeIntervalSince1970 * 1000
+            for case let p as CursorProvider in providers { p.dismiss(sessionId, lastUpdatedMs: ms) }
+            return
+        }
         let ts = ISO8601.formatter.string(from: Date())
         appendEvent(AgentEvent(
             event: .cleared, sessionId: sessionId,
@@ -2605,6 +3219,20 @@ final class AgentStore: ObservableObject {
     private func enrichWithTranscripts(_ agents: [Agent]) -> [Agent] {
         let now = Date()
         return agents.map { a in
+            // External-source agents (Cursor, …) arrive fully formed from their
+            // provider — title, live status, cwd and status are already final, and
+            // they have no Claude transcript to read. They still get a housekeeping
+            // fold (over their own delta source), then pass through untouched.
+            guard a.source == .claudeCode else {
+                if a.parentSessionId == nil, a.agentType == nil {
+                    housekeepingGenerator.consider(
+                        sessionId: a.id, source: .cursor(composerId: a.id),
+                        cwd: a.cwd, status: a.status
+                    )
+                }
+                return a
+            }
+
             var copy = a
             copy.generatedTitle = titleGenerator.titles[a.id]
 
@@ -2640,8 +3268,9 @@ final class AgentStore: ObservableObject {
             // Housekeeping fold — top-level sessions only (subagents share the parent's
             // transcript). Gates internally on trigger + new delta; cheap when idle.
             if a.parentSessionId == nil, a.agentType == nil {
+                let src = a.transcriptPath.flatMap { $0.isEmpty ? nil : HousekeepingSource.transcript(path: $0) }
                 housekeepingGenerator.consider(
-                    sessionId: a.id, transcriptPath: a.transcriptPath,
+                    sessionId: a.id, source: src,
                     cwd: a.cwd, status: a.status
                 )
             }
@@ -2652,8 +3281,14 @@ final class AgentStore: ObservableObject {
     /// Manual housekeeping trigger (from the row button) — folds on demand regardless
     /// of the heartbeat/stop gate.
     func forceHousekeeping(_ agent: Agent) {
+        let src: HousekeepingSource?
+        if agent.source == .cursor {
+            src = .cursor(composerId: agent.id)
+        } else {
+            src = agent.transcriptPath.flatMap { $0.isEmpty ? nil : HousekeepingSource.transcript(path: $0) }
+        }
         housekeepingGenerator.consider(
-            sessionId: agent.id, transcriptPath: agent.transcriptPath,
+            sessionId: agent.id, source: src,
             cwd: agent.cwd, status: agent.status, force: true
         )
     }
@@ -2698,7 +3333,9 @@ final class AgentStore: ObservableObject {
             // parent's sibling index.
             if a.parentSessionId != nil { continue }
             guard let cwd = a.cwd, !cwd.isEmpty else { continue }
-            byCwd[cwd, default: []].append(a)
+            // Scope by source so a Claude and a Cursor session in the same folder
+            // aren't numbered as if they were the same tool's siblings.
+            byCwd["\(a.source.rawValue)\u{0}\(cwd)", default: []].append(a)
         }
         var indexById: [String: Int] = [:]
         for (_, group) in byCwd where group.count > 1 {
@@ -3351,6 +3988,14 @@ struct AgentRow: View {
                             .font(.caption2)
                             .foregroundStyle(.tint)
                     }
+                    if !agent.source.badge.isEmpty {
+                        Text(agent.source.badge)
+                            .font(.system(size: 9, weight: .semibold))
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 1)
+                            .background(Color.secondary.opacity(0.18), in: Capsule())
+                            .foregroundStyle(.secondary)
+                    }
                     rowTitleText
                         .font(.system(.body, design: .monospaced))
                         .lineLimit(1)
@@ -3797,6 +4442,12 @@ struct SettingsView: View {
                 Section("AI") {
                     Toggle("Generate session titles (Haiku)", isOn: $store.titleGenerationEnabled)
                     Text("Tags are generated on demand via the ✨ button when you name an agent.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+
+                Section("Sources") {
+                    Toggle("Monitor Cursor sessions", isOn: $store.cursorEnabled)
+                    Text("Reads Cursor's local session store (read-only) and shows its agents alongside Claude Code. Title and live status come straight from Cursor.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
 
