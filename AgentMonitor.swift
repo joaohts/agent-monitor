@@ -1718,6 +1718,13 @@ protocol SessionProvider: AnyObject {
     /// A fresh snapshot of this provider's sessions, statuses derived as of `now`.
     /// Must be cheap — it runs on every merge/rebuild.
     func currentAgents(now: Date) -> [Agent]
+    /// Bring this session's tool/window forward (row click-to-jump).
+    func focus(agent: Agent)
+    /// Hide the session until it's next touched (rows regenerate each poll, so a
+    /// cleared event can't stick — the hide lives here).
+    func dismiss(agent: Agent)
+    /// Where this session's housekeeping delta comes from (nil if none).
+    func housekeepingSource(for agent: Agent) -> HousekeepingSource?
 }
 
 // MARK: - Cursor: read-only access to its SQLite session store
@@ -2029,12 +2036,29 @@ final class CursorProvider: SessionProvider {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: work)
     }
 
-    /// Hides a composer until it's next touched. Triggers a rebuild via the change
-    /// callback so the row disappears immediately.
-    func dismiss(_ composerId: String, lastUpdatedMs: Double) {
-        dismissed[composerId] = lastUpdatedMs
+    /// Stamps the dismissal at the composer's lastUpdatedAt; the row re-shows once
+    /// it's touched again (lastUpdatedAt advances past the stamp).
+    func dismiss(agent: Agent) {
+        let lastUpdatedMs = (ISO8601.formatter.date(from: agent.lastUpdate) ?? Date())
+            .timeIntervalSince1970 * 1000
+        dismissed[agent.id] = lastUpdatedMs
         saveDismissed()
         onChange?()
+    }
+
+    /// Best-effort: open the project folder in Cursor (no public deep-link to a
+    /// specific composer).
+    func focus(agent: Agent) {
+        guard let cwd = agent.cwd, !cwd.isEmpty else { return }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        p.arguments = ["-a", "Cursor", cwd]
+        try? p.run()
+    }
+
+    /// Cursor's housekeeping delta is read from its SQLite messages by index.
+    func housekeepingSource(for agent: Agent) -> HousekeepingSource? {
+        .cursor(composerId: agent.id)
     }
 
     private func loadDismissed() {
@@ -2341,14 +2365,9 @@ final class AgentStore: ObservableObject {
 
     func focus(agent: Agent) {
         guard let cwd = agent.cwd, !cwd.isEmpty else { return }
-        // Cursor sessions live in the Cursor app, not a Ghostty tab. Best-effort:
-        // bring the project window forward by opening its folder in Cursor.
-        // (Deep-linking to a specific composer isn't publicly supported.)
-        if agent.source == .cursor {
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-            p.arguments = ["-a", "Cursor", cwd]
-            try? p.run()
+        // Non-Claude sessions live in their own tool, not a Ghostty tab.
+        if agent.source != .claudeCode {
+            provider(for: agent.source)?.focus(agent: agent)
             return
         }
         // Subagents share the parent's terminal. Prefer the hook-reported id
@@ -2563,6 +2582,12 @@ final class AgentStore: ObservableObject {
     private func externalAgents(now: Date) -> [Agent] {
         guard cursorEnabled else { return [] }
         return providers.flatMap { $0.currentAgents(now: now) }
+    }
+
+    /// The registered provider owning `source` — routes focus/dismiss/housekeeping
+    /// without the store knowing any concrete type.
+    private func provider(for source: AgentSource) -> SessionProvider? {
+        providers.first { $0.source == source }
     }
 
     private var ghosttyMapURL: URL {
@@ -2988,12 +3013,10 @@ final class AgentStore: ObservableObject {
     }
 
     func dismiss(_ sessionId: String) {
-        // Cursor rows are regenerated from the store each poll, so a cleared event
-        // wouldn't stick — route the dismiss to the provider, which hides it until
-        // the composer is touched again.
-        if let a = agents.first(where: { $0.id == sessionId }), a.source == .cursor {
-            let ms = (Self.iso8601.date(from: a.lastUpdate) ?? Date()).timeIntervalSince1970 * 1000
-            for case let p as CursorProvider in providers { p.dismiss(sessionId, lastUpdatedMs: ms) }
+        // Non-Claude rows regenerate each poll, so a cleared event can't stick —
+        // route to the provider, which hides it until the session is touched again.
+        if let a = agents.first(where: { $0.id == sessionId }), a.source != .claudeCode {
+            provider(for: a.source)?.dismiss(agent: a)
             return
         }
         let ts = ISO8601.formatter.string(from: Date())
@@ -3226,7 +3249,8 @@ final class AgentStore: ObservableObject {
             guard a.source == .claudeCode else {
                 if a.parentSessionId == nil, a.agentType == nil {
                     housekeepingGenerator.consider(
-                        sessionId: a.id, source: .cursor(composerId: a.id),
+                        sessionId: a.id,
+                        source: provider(for: a.source)?.housekeepingSource(for: a),
                         cwd: a.cwd, status: a.status
                     )
                 }
@@ -3282,10 +3306,10 @@ final class AgentStore: ObservableObject {
     /// of the heartbeat/stop gate.
     func forceHousekeeping(_ agent: Agent) {
         let src: HousekeepingSource?
-        if agent.source == .cursor {
-            src = .cursor(composerId: agent.id)
-        } else {
+        if agent.source == .claudeCode {
             src = agent.transcriptPath.flatMap { $0.isEmpty ? nil : HousekeepingSource.transcript(path: $0) }
+        } else {
+            src = provider(for: agent.source)?.housekeepingSource(for: agent)
         }
         housekeepingGenerator.consider(
             sessionId: agent.id, source: src,
@@ -3988,14 +4012,12 @@ struct AgentRow: View {
                             .font(.caption2)
                             .foregroundStyle(.tint)
                     }
-                    if !agent.source.badge.isEmpty {
-                        Text(agent.source.badge)
-                            .font(.system(size: 9, weight: .semibold))
-                            .padding(.horizontal, 4)
-                            .padding(.vertical, 1)
-                            .background(Color.secondary.opacity(0.18), in: Capsule())
-                            .foregroundStyle(.secondary)
-                    }
+                    Text(agent.source.badge)
+                        .font(.system(size: 9, weight: .semibold))
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 1)
+                        .background(Color.secondary.opacity(0.18), in: Capsule())
+                        .foregroundStyle(.secondary)
                     rowTitleText
                         .font(.system(.body, design: .monospaced))
                         .lineLimit(1)
