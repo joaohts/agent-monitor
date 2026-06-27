@@ -644,6 +644,50 @@ enum ClaudeP {
     }
 }
 
+// MARK: - Transcript text normalization
+
+/// Claude Code records slash commands and `!` bash runs as XML-ish wrappers in the
+/// user turn's text — e.g. `<command-name>/model</command-name>\n<command-message>…`
+/// for `/model`, or `<bash-input>…</bash-input>` for `!ls`. Left raw, these leak
+/// into titles, `initialTask`, and the live subtitle as literal `<command-name>`
+/// tags (that's the `<command-name>/model</command-name>` you see in a row). Collapse
+/// them to a readable form, or return nil when there's nothing but command output.
+func unwrapTranscriptText(_ raw: String) -> String? {
+    func capture(_ s: String, _ tag: String) -> String? {
+        guard let open = s.range(of: "<\(tag)>"),
+              let close = s.range(of: "</\(tag)>", range: open.upperBound..<s.endIndex)
+        else { return nil }
+        return String(s[open.upperBound..<close.lowerBound])
+    }
+    func strip(_ s: String, _ tag: String) -> String {
+        var out = s
+        while let open = out.range(of: "<\(tag)>"),
+              let close = out.range(of: "</\(tag)>", range: open.upperBound..<out.endIndex) {
+            out.replaceSubrange(open.lowerBound..<close.upperBound, with: "")
+        }
+        return out
+    }
+
+    // Slash command → "/model" (with args appended when present).
+    if let name = capture(raw, "command-name") {
+        let cmd = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let args = (capture(raw, "command-args") ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let label = args.isEmpty ? cmd : "\(cmd) \(args)"
+        return label.isEmpty ? nil : label
+    }
+    // `!` bash run → "! ls -la".
+    if let input = capture(raw, "bash-input") {
+        let cmd = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        return cmd.isEmpty ? nil : "! \(cmd)"
+    }
+    // Otherwise drop stray command-output blocks but keep any surrounding prose.
+    var s = raw
+    for tag in ["local-command-stdout", "bash-stdout", "bash-stderr"] { s = strip(s, tag) }
+    s = s.trimmingCharacters(in: .whitespacesAndNewlines)
+    return s.isEmpty ? nil : s
+}
+
 // MARK: - Transcript reader (with mtime cache)
 
 struct TranscriptInfo {
@@ -854,13 +898,13 @@ final class TranscriptReader {
     private func extractText(_ message: Any?) -> String? {
         guard let msg = message as? [String: Any] else { return nil }
         let content = msg["content"]
-        if let s = content as? String, !s.isEmpty { return s }
+        if let s = content as? String, !s.isEmpty { return unwrapTranscriptText(s) }
         if let arr = content as? [[String: Any]] {
             var pieces: [String] = []
             for item in arr {
                 if let t = item["text"] as? String, !t.isEmpty { pieces.append(t) }
             }
-            if !pieces.isEmpty { return pieces.joined(separator: "\n") }
+            if !pieces.isEmpty { return unwrapTranscriptText(pieces.joined(separator: "\n")) }
         }
         return nil
     }
@@ -1010,11 +1054,11 @@ enum HousekeepingDelta {
 
     private static func extractText(_ message: Any?) -> String? {
         guard let msg = message as? [String: Any] else { return nil }
-        if let s = msg["content"] as? String, !s.isEmpty { return s }
+        if let s = msg["content"] as? String, !s.isEmpty { return unwrapTranscriptText(s) }
         if let arr = msg["content"] as? [[String: Any]] {
             let pieces = arr.compactMap { ($0["type"] as? String) == "text" ? $0["text"] as? String : nil }
                 .filter { !$0.isEmpty }
-            return pieces.isEmpty ? nil : pieces.joined(separator: " ")
+            return pieces.isEmpty ? nil : unwrapTranscriptText(pieces.joined(separator: " "))
         }
         return nil
     }
