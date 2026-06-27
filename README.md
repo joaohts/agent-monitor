@@ -1,6 +1,6 @@
 # Agent Monitor
 
-A native macOS floating window that shows live status of every running Claude Code session across your machine. Status, runtime, AI-generated titles, and live "what's happening now" descriptions, all driven by Claude Code hooks writing JSON-line events.
+A native macOS floating window that shows live status of every running coding-agent session across your machine — **Claude Code and Cursor**, side by side in one list. Status, runtime, AI-generated titles, and live "what's happening now" descriptions. Claude Code is driven by hooks writing JSON-line events; Cursor is read live from its local SQLite store (no hooks needed). Each row is tagged with its source (`Claude` / `Cursor`).
 
 Built in a single Swift file with no external dependencies (no Xcode project, no Swift Package Manager). Compiles to a `.app` bundle in ~3 seconds.
 
@@ -51,7 +51,7 @@ It's a drop-in upgrade — **rebuild and you're done:**
 
 ## What it does
 
-- **Always-on-top floating window** that lists every Claude Code session you have open
+- **Always-on-top floating window** that lists every Claude Code **and Cursor** session you have open, each tagged with its source
 - Live status per session: `running`, `away`, `needs attention`, `idle`, `inactive`
 - Per-turn runtime timer that ticks while running and freezes on stop
 - AI-generated session titles via a side-car `claude -p` call
@@ -67,7 +67,62 @@ It's a drop-in upgrade — **rebuild and you're done:**
 
 See **[docs/features-and-setup.md](docs/features-and-setup.md)** for details on these and how they degrade without Ghostty.
 
-All state lives in `~/.claude/agents.jsonl`. Claude Code hooks append events; the app reads and renders. State transitions that aren't fired by hooks (`.away`, `.inactive`, post-permission resume) are detected by transcript-mtime polling and persisted as synthetic events so the log captures the full timeline.
+All Claude Code state lives in `~/.claude/agents.jsonl`. Claude Code hooks append events; the app reads and renders. State transitions that aren't fired by hooks (`.away`, `.inactive`, post-permission resume) are detected by transcript-mtime polling and persisted as synthetic events so the log captures the full timeline.
+
+---
+
+## Multiple tools: Claude Code + Cursor
+
+Agent Monitor is **multi-source**. Every tool plugs in behind one `SessionProvider`
+protocol and is merged into the same `Agent` list — so the window, bubbles, stats,
+and notifications all work identically regardless of which tool a session belongs to.
+Each row carries a small **source tag** (`Claude` / `Cursor`) so you can tell them apart.
+
+### Claude Code (built-in, hook-driven)
+
+The original path: hooks append events to `~/.claude/agents.jsonl`, the app reads
+transcripts for titles and live status. Nothing about this changed.
+
+### Cursor (read-only, polled)
+
+Cursor has **no hooks**, so its state is reconstructed by reading Cursor's own global
+SQLite store directly:
+
+- **Storage:** `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb`,
+  opened `READONLY` (Cursor is the only writer; WAL mode lets us read committed state
+  live). The app **never writes** to it — every access is best-effort, so a missing
+  install or a schema shift just degrades to an empty list instead of crashing.
+- **Liveness:** the WAL sidecar (`state.vscdb-wal`) is kqueue-watched — its mtime
+  advances on every Cursor write — plus a slow 30s heartbeat for time-based decay
+  (`idle → inactive`) that has no write to ride on.
+- **Cheap reads:** rows render from the lightweight `composer.composerHeaders` index;
+  the multi-hundred-MB blob table is never touched on the hot path. Generating state
+  is read with `json_extract` for only the few recently-touched composers.
+- **Status derivation** (no hooks, so inferred from the store):
+
+  | Status | When |
+  |---|---|
+  | `running` | composer is generating and the store was touched recently |
+  | `away` | generating but silent past the away cutoff |
+  | `needs attention` | `hasBlockingPendingActions` (waiting on you) |
+  | `idle` | finished and recently active |
+  | `inactive` | finished and silent past the inactive cutoff |
+
+- **Recency window:** Cursor keeps every composer forever, so only sessions touched in
+  the **last 12 hours** are surfaced (anything active is recent by definition).
+- **Subagents:** Cursor's "explore"/task sub-composers are linked to their parent and
+  shown with their own row + agent-type label, mirroring Claude subagents.
+- **Dismiss:** per-row hide is persisted to
+  `~/.claude/agent-monitor-cursor-dismissed.json`; a row reappears when its composer is
+  touched again (just like a Claude session reappearing on a new event).
+
+**No setup for Cursor** — if Cursor is installed, its sessions appear automatically.
+Nothing to register, no `settings.json` changes. If Cursor isn't installed, the
+provider reports unavailable and is skipped.
+
+> **Adding another tool (Zed, Windsurf, …):** add an `AgentSource` case, implement a
+> `SessionProvider` that reads that tool's storage and derives `[Agent]`, and register
+> it in `AgentStore`. The view layer, stats, bubbles, and notifications need no changes.
 
 ---
 
@@ -116,6 +171,8 @@ Hooks are external shell scripts. Appending one JSON line is trivial (`echo >> f
 | `~/.claude/settings.json` | Where the hooks are registered globally |
 | `~/.claude/projects/*/*.jsonl` | Claude's own per-session transcripts (we read for titles) |
 | `~/.claude/agent-monitor-debug.log` | Hook + `claude -p` debug output |
+| `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb` | Cursor's SQLite store (read-only; source for Cursor rows) |
+| `~/.claude/agent-monitor-cursor-dismissed.json` | Persisted per-row dismiss state for Cursor sessions |
 
 ---
 
@@ -571,6 +628,7 @@ static let summaryCharCap     = 1200                // truncate auto-summary if 
 - **Photo Library / Desktop prompts** can fire even though we don't touch them — false positives from macOS being aggressive about locally-signed apps. Click *Don't Allow* every time; the app keeps working.
 - **AI generation depends on `claude` CLI being authed.** If `claude -p` fails (network, auth), titles silently don't update; check `~/.claude/agent-monitor-debug.log`.
 - **Non-Anthropic Claude Code clients are not supported** — the hook payload format and transcript schema are specific to Claude Code.
+- **Cursor is read live from its local SQLite store** (`state.vscdb`), opened read-only. The app never writes to it, but the schema is Cursor's own and undocumented — a future Cursor update could shift it, in which case Cursor rows degrade to empty rather than break the rest of the app. Cursor sessions are surfaced only for the last 12 hours of activity, and per-row dismiss (not hooks) controls visibility.
 
 ---
 
@@ -580,7 +638,10 @@ static let summaryCharCap     = 1200                // truncate auto-summary if 
 |---|---|
 | `AgentMonitorApp` | App entry point; configures floating window via `WindowAccessor` |
 | `WindowAccessor` | Bridges SwiftUI to AppKit `NSWindow` to set level/collectionBehavior |
-| `AgentStore` | Reads `agents.jsonl`, applies events, runs staleness, holds generators |
+| `AgentStore` | Reads `agents.jsonl`, applies events, runs staleness, holds generators; owns the `SessionProvider` registry and merges every source into one list |
+| `SessionProvider` | Protocol every non-Claude tool conforms to (currentAgents / focus / dismiss / housekeeping) |
+| `CursorReader` | Read-only SQLite access to Cursor's `state.vscdb` (headers + generating state) |
+| `CursorProvider` | `SessionProvider` for Cursor: WAL-watched polling → `Agent`/`AgentStatus` |
 | `Agent` | Per-session state struct |
 | `AgentEvent` | One line in `agents.jsonl` |
 | `TranscriptReader` | Parses Claude's transcript JSONL with mtime-keyed cache |
