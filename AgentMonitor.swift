@@ -2364,6 +2364,24 @@ final class AgentStore: ObservableObject {
     @Published var showInactive: Bool = (UserDefaults.standard.object(forKey: "agentMonitor.showInactive") as? Bool) ?? false {
         didSet { UserDefaults.standard.set(showInactive, forKey: "agentMonitor.showInactive") }
     }
+    // Small groups (≤ this many subagents) start expanded; larger ones fold by
+    // default so a big fan-out doesn't swamp the overlay.
+    static let autoExpandSubagentLimit = 2
+
+    // Explicit user fold/unfold choices, keyed by parent session id. Absent ⇒ fall
+    // back to the count-based default above. In-memory only.
+    @Published var bubbleExpansionOverride: [String: Bool] = [:]
+
+    /// Whether a parent's subagents are shown: the user's explicit choice if any,
+    /// else open for small groups and folded for large ones.
+    func isGroupExpanded(parentId: String, childCount: Int) -> Bool {
+        if let choice = bubbleExpansionOverride[parentId] { return choice }
+        return childCount <= Self.autoExpandSubagentLimit
+    }
+
+    func toggleBubbleExpansion(_ parentId: String, childCount: Int) {
+        bubbleExpansionOverride[parentId] = !isGroupExpanded(parentId: parentId, childCount: childCount)
+    }
     // User-assigned display names (per session). Shown in the bubble + main
     // window only — the Ghostty tab title is left alone. Persisted.
     @Published private(set) var customNames: [String: String] = [:]
@@ -2447,17 +2465,56 @@ final class AgentStore: ObservableObject {
     }
 
     // ── Jump-to-session ──
-    // The ordered list shown in the bubbles overlay. The hotkeys (⌥1…9) and
-    // the bubble number badges both index into THIS exact ordering, so the
-    // number you see is the key you press.
+    /// Visible subagents grouped under their parent session id. The parent bubble
+    /// shows the count; the children render (indented) only while expanded. Keyed
+    /// by parentSessionId regardless of whether that parent is itself visible.
+    var bubbleChildren: [String: [Agent]] {
+        var m: [String: [Agent]] = [:]
+        for a in agents where (showInactive || a.status != .inactive) && a.parentSessionId != nil {
+            m[a.parentSessionId!, default: []].append(a)
+        }
+        return m
+    }
+
+    /// The ordered, flattened list of bubbles actually shown in the overlay (also
+    /// the index space for the ⌥1-9 / ⌥` hotkeys). Subagents are folded under
+    /// their parent: a parent appears as a single row carrying a count badge, and
+    /// its children follow immediately after it only while it's expanded.
     var bubbleAgents: [Agent] {
-        agents
-            .filter { showInactive || $0.status != .inactive }
-            .sorted { a, b in
-                let pa = bubblePriority(a.status), pb = bubblePriority(b.status)
-                if pa != pb { return pa < pb }
-                return a.firstSeen < b.firstSeen
+        let childrenByParent = bubbleChildren
+        let allById = Dictionary(agents.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        let visible = agents.filter { showInactive || $0.status != .inactive }
+
+        // Top-level rows: anything that isn't a child of a known parent. A child
+        // whose parent exists (even if the parent is filtered out of `visible`)
+        // is left for its parent's group; a truly orphaned child (parent gone) is
+        // promoted so it never vanishes.
+        var topLevel = visible.filter { a in
+            guard let pid = a.parentSessionId else { return true }
+            return allById[pid] == nil
+        }
+        // A parent that was itself filtered out but still has visible children is
+        // surfaced as the group header so the dropdown has something to hang on.
+        let visibleIds = Set(visible.map(\.id))
+        for pid in childrenByParent.keys where !visibleIds.contains(pid) {
+            if let parent = allById[pid] { topLevel.append(parent) }
+        }
+
+        let tops = topLevel.sorted { a, b in
+            let pa = bubblePriority(a.status), pb = bubblePriority(b.status)
+            if pa != pb { return pa < pb }
+            return a.firstSeen < b.firstSeen
+        }
+
+        var result: [Agent] = []
+        for t in tops {
+            result.append(t)
+            if let kids = childrenByParent[t.id],
+               isGroupExpanded(parentId: t.id, childCount: kids.count) {
+                result.append(contentsOf: kids.sorted { $0.firstSeen < $1.firstSeen })
             }
+        }
+        return result
     }
 
     private var cycleCursor = 0
@@ -5490,17 +5547,30 @@ struct BubblesView: View {
 
     var body: some View {
         let bubbles = store.bubbleAgents
+        let children = store.bubbleChildren
+        // Ids that render as a group header (present in the list and holding at
+        // least one visible subagent). A row is a child iff its parent is one.
+        let headerIds = Set(bubbles.filter { !(children[$0.id]?.isEmpty ?? true) }.map(\.id))
+        let indentOnLeading = store.bubbleCorner.horizontalAlignment == .leading
         ZStack(alignment: store.bubbleCorner.alignment) {
             // Non-hittable so empty overlay area stays click-through (only the
             // bubbles themselves capture clicks).
             Color.clear.allowsHitTesting(false)
             VStack(alignment: store.bubbleCorner.horizontalAlignment, spacing: 9) {
                 ForEach(Array(bubbles.enumerated()), id: \.element.id) { idx, agent in
+                    let kids = children[agent.id] ?? []
+                    let isChild = agent.parentSessionId.map { headerIds.contains($0) } ?? false
                     // 1-based number; only the first 9 get a ⌥N hotkey.
                     BubbleView(agent: agent,
                                number: idx < 9 ? idx + 1 : nil,
                                customName: store.customName(for: agent.id),
-                               onTap: { store.focus(agent: agent) })
+                               childCount: kids.count,
+                               childAccent: groupAccent(kids),
+                               expanded: store.isGroupExpanded(parentId: agent.id, childCount: kids.count),
+                               isChild: isChild,
+                               onTap: { store.focus(agent: agent) },
+                               onToggle: { store.toggleBubbleExpansion(agent.id, childCount: kids.count) })
+                        .padding(indentOnLeading ? .leading : .trailing, isChild ? 22 : 0)
                         .transition(.scale(scale: 0.85).combined(with: .opacity))
                 }
             }
@@ -5511,25 +5581,51 @@ struct BubblesView: View {
         .animation(.easeInOut(duration: 0.25), value: bubbles.map(\.id))
         .onPreferenceChange(BubbleFramesKey.self) { store.bubbleHitRects = $0 }
     }
+
+    /// Tints a folded parent's count badge with its most urgent child's colour, so
+    /// a group with a running/attention subagent still reads as alive while folded.
+    private func groupAccent(_ kids: [Agent]) -> Color? {
+        guard let top = kids.min(by: { bubblePriority($0.status) < bubblePriority($1.status) }) else { return nil }
+        switch top.status {
+        case .needsAttention, .running: return statusColor(top.status)
+        default: return nil
+        }
+    }
 }
 
 struct BubbleView: View {
     let agent: Agent
     var number: Int? = nil
     var customName: String? = nil
+    // Subagent folding: a parent carries childCount > 0 and a tappable disclosure;
+    // childAccent tints the count badge while folded so an active group reads as
+    // alive. isChild marks a row that's a nested subagent (rendered quieter).
+    var childCount: Int = 0
+    var childAccent: Color? = nil
+    var expanded: Bool = false
+    var isChild: Bool = false
     var onTap: () -> Void = {}
+    var onToggle: () -> Void = {}
     @State private var pulse = false
     @State private var hovering = false
 
     private var color: Color { statusColor(agent.status) }
 
-    // Expanded inactive sessions render smaller + dimmer (a quieter tier).
-    private var compact: Bool { agent.status == .inactive }
+    // Inactive sessions and nested subagents render smaller (a quieter tier);
+    // only inactive ones are also dimmed — live subagents stay fully visible.
+    private var compact: Bool { agent.status == .inactive || isChild }
+    private var dimmed: Bool { agent.status == .inactive }
     private var dotInner: CGFloat { compact ? 8 : 10 }
     private var dotOuter: CGFloat { compact ? 13 : 16 }
 
     // Custom name is a tag; the project label always trails as dimmed context.
     private var titleText: Text {
+        // A nested subagent sits under its parent's project label already — show
+        // just its agent type so the indented row stays terse.
+        if isChild {
+            let label = (agent.agentType?.isEmpty == false) ? agent.agentType! : agent.bubbleTitle
+            return Text(label).foregroundColor(.white.opacity(0.92))
+        }
         if let customName, !customName.isEmpty {
             return Text(customName).foregroundColor(.white)
                  + Text("  ·  \(agent.bubbleTitle)").foregroundColor(.white.opacity(0.72))
@@ -5563,6 +5659,7 @@ struct BubbleView: View {
                 .truncationMode(.middle)
                 .frame(maxWidth: compact ? 190 : 230, alignment: .leading)
             elapsed
+            disclosure
         }
         .padding(.horizontal, compact ? 10 : 13)
         .padding(.vertical, compact ? 6 : 9)
@@ -5574,7 +5671,7 @@ struct BubbleView: View {
             }
         )
         .shadow(color: .black.opacity(0.3), radius: 6, y: 2)
-        .opacity(compact ? (hovering ? 0.85 : 0.55) : 1)
+        .opacity(dimmed ? (hovering ? 0.85 : 0.55) : 1)
         .scaleEffect(hovering ? 1.04 : 1)
         .fixedSize()
         // Whole capsule is the click target → jump to this session's terminal.
@@ -5591,6 +5688,28 @@ struct BubbleView: View {
                     .preference(key: BubbleFramesKey.self, value: [geo.frame(in: .global)])
             }
         )
+    }
+
+    // High-priority tap so the badge folds/unfolds without triggering the
+    // capsule's focus tap underneath it.
+    @ViewBuilder
+    private var disclosure: some View {
+        if childCount > 0 {
+            HStack(spacing: 3) {
+                Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                    .font(.system(size: 8, weight: .bold))
+                Text("\(childCount)")
+                    .font(.system(size: 10, weight: .bold, design: .rounded))
+            }
+            .foregroundStyle(.white.opacity(0.92))
+            .padding(.horizontal, 6)
+            .frame(height: 18)
+            .background(Capsule().fill((childAccent ?? .white).opacity(childAccent == nil ? 0.16 : 0.32)))
+            .overlay(Capsule().strokeBorder(Color.white.opacity(0.4), lineWidth: 1))
+            .contentShape(Capsule())
+            .highPriorityGesture(TapGesture().onEnded { onToggle() })
+            .help(expanded ? "Hide subagents" : "Show \(childCount) subagent\(childCount == 1 ? "" : "s")")
+        }
     }
 
     private var dot: some View {
