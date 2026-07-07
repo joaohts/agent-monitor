@@ -25,6 +25,7 @@ enum AgentEventKind: String, Codable {
     case started           // UserPromptSubmit: a run began
     case needsAttention = "needs_attention"
     case stopped           // Stop: turn finished
+    case apiError = "api_error"  // StopFailure: turn ended due to an API error
     case cleared           // SessionEnd: session terminated
     // Synthetic events emitted by the app itself (not by hooks) so the event
     // log captures all state transitions, including the ones derived from
@@ -91,6 +92,7 @@ enum AgentStatus: String {
     case needsAttention   = "needs attention"
     case idle             = "idle"             // recently active (just opened or just finished a turn)
     case inactive         = "inactive"         // idle for >5min, abandoned
+    case apiError         = "API error"        // turn ended on an API error (overloaded, rate_limit, …)
 }
 
 struct Agent: Identifiable {
@@ -323,6 +325,7 @@ enum StatsCompute {
                 if !isSubagent { stepInc = 1 }
             case .needsAttention:    newState = .needsAttention
             case .stopped:           newState = .idle
+            case .apiError:          newState = .apiError
             case .cleared:           newState = nil
             // Synthetic continuation events only make sense as transitions OF an
             // already-tracked session. If the session isn't currently tracked
@@ -3033,9 +3036,10 @@ final class AgentStore: ObservableObject {
                 continue
             }
 
-            // .idle → .inactive after 5min of NO activity (events OR transcript
-            // writes). Doesn't require a transcript file — covers fresh sessions.
-            if a.status == .idle {
+            // .idle / .apiError → .inactive after 5min of NO activity (events OR
+            // transcript writes). Doesn't require a transcript file — covers fresh
+            // sessions and errored ones that were abandoned without a retry.
+            if a.status == .idle || a.status == .apiError {
                 var lastActivity = Self.iso8601.date(from: a.lastUpdate) ?? .distantPast
                 if let path = a.transcriptPath, !path.isEmpty,
                    let mtime = transcriptReader.read(path: path).lastModified {
@@ -3102,7 +3106,7 @@ final class AgentStore: ObservableObject {
             return date(a.lastUpdate)?.addingTimeInterval(Self.subagentClearAfterStoppedSec)
         }
         switch a.status {
-        case .idle:
+        case .idle, .apiError:
             var last = date(a.lastUpdate) ?? .distantPast
             if let path = a.transcriptPath, !path.isEmpty,
                let mtime = transcriptReader.read(path: path).lastModified {
@@ -3151,7 +3155,7 @@ final class AgentStore: ObservableObject {
         var desired = Set<String>()
         for a in agents {
             switch a.status {
-            case .running, .away, .needsAttention, .idle:
+            case .running, .away, .needsAttention, .idle, .apiError:
                 if let path = a.transcriptPath, !path.isEmpty { desired.insert(path) }
             default:
                 break
@@ -3232,6 +3236,15 @@ final class AgentStore: ObservableObject {
             let body = detail.isEmpty ? "Turn complete" : detail
             pushNotifier.send(title: title, message: body, category: "urgent")
             localNotifier.notify(title: title, body: body)
+        case .apiError:
+            // Same treatment as idle (it's a turn end), but RED-flavored and
+            // carrying the error type so the user knows it stalled, not finished.
+            guard old == .running || old == .away || old == .needsAttention else { return }
+            let errType = agent.lastMessage ?? "unknown"
+            let title = "🔴 \(project) — API error"
+            let body = "Turn ended: \(errType)"
+            pushNotifier.send(title: title, message: body, category: "urgent")
+            localNotifier.notify(title: title, body: body)
         default:
             return
         }
@@ -3261,6 +3274,11 @@ final class AgentStore: ObservableObject {
             }
         case .running:
             if old == nil { NSSound(named: "Tink")?.play() }
+        case .apiError:
+            // Same as idle (a turn end) — Hero when coming from an active state.
+            if old == .running || old == .needsAttention || old == .away {
+                NSSound(named: "Hero")?.play()
+            }
         case .away, .inactive:
             break  // automatic state changes, no sound
         }
@@ -3268,11 +3286,12 @@ final class AgentStore: ObservableObject {
 
     private func statusRank(_ s: AgentStatus) -> Int {
         switch s {
-        case .needsAttention: return 0
-        case .running:        return 1
-        case .away:           return 2
-        case .idle:           return 3
-        case .inactive:       return 4
+        case .apiError:       return 0
+        case .needsAttention: return 1
+        case .running:        return 2
+        case .away:           return 3
+        case .idle:           return 4
+        case .inactive:       return 5
         }
     }
 
@@ -3359,6 +3378,23 @@ final class AgentStore: ObservableObject {
                 if let tp = rec.transcriptPath, !tp.isEmpty { a.transcriptPath = tp }
                 byId[rec.sessionId] = a
             }
+        case .apiError:
+            // StopFailure hook → the turn ended on an API error. Like .stopped we
+            // freeze the running timer, but surface a distinct RED state so a stalled
+            // session (529 overloaded, rate_limit, …) is visible rather than looking
+            // like a clean finish. rec.message carries the error type. Decays like
+            // .idle (→ .inactive after 5min); a new prompt clears it back to running.
+            if var a = byId[rec.sessionId] {
+                if a.status == .running, let started = a.runStartedAt {
+                    a.accumulatedSeconds += max(0, recDate.timeIntervalSince(started))
+                    a.runStartedAt = nil
+                }
+                a.status = .apiError
+                a.lastUpdate = rec.ts
+                a.lastMessage = rec.message ?? a.lastMessage
+                if let tp = rec.transcriptPath, !tp.isEmpty { a.transcriptPath = tp }
+                byId[rec.sessionId] = a
+            }
         case .cleared:
             byId.removeValue(forKey: rec.sessionId)
 
@@ -3403,7 +3439,7 @@ final class AgentStore: ObservableObject {
             // Synthetic: detectStaleness flagged .idle/.away → .inactive.
             // Guard against stale events: only honor it if the status is still
             // one of the source states.
-            if var a = byId[rec.sessionId], a.status == .idle || a.status == .away {
+            if var a = byId[rec.sessionId], a.status == .idle || a.status == .away || a.status == .apiError {
                 a.status = .inactive
                 a.lastUpdate = rec.ts
                 byId[rec.sessionId] = a
@@ -3906,6 +3942,7 @@ struct ReportView: View {
         case .away: return .yellow
         case .needsAttention: return .orange
         case .idle: return .blue
+        case .apiError: return .red
         default: return .gray
         }
     }
@@ -4391,6 +4428,7 @@ struct AgentRow: View {
         case .needsAttention: return .orange
         case .idle:           return .blue
         case .inactive:       return .gray
+        case .apiError:       return .red
         }
     }
 }
@@ -5363,17 +5401,19 @@ func statusColor(_ s: AgentStatus) -> Color {
     case .needsAttention: return .orange
     case .idle:           return .blue
     case .inactive:       return .gray
+    case .apiError:       return .red
     }
 }
 
 /// Sort/visibility priority for the bubbles overlay (most urgent first).
 func bubblePriority(_ s: AgentStatus) -> Int {
     switch s {
-    case .needsAttention: return 0
-    case .running:        return 1
-    case .away:           return 2
-    case .idle:           return 3
-    case .inactive:       return 4
+    case .apiError:       return 0
+    case .needsAttention: return 1
+    case .running:        return 2
+    case .away:           return 3
+    case .idle:           return 4
+    case .inactive:       return 5
     }
 }
 
@@ -5587,7 +5627,7 @@ struct BubblesView: View {
     private func groupAccent(_ kids: [Agent]) -> Color? {
         guard let top = kids.min(by: { bubblePriority($0.status) < bubblePriority($1.status) }) else { return nil }
         switch top.status {
-        case .needsAttention, .running: return statusColor(top.status)
+        case .apiError, .needsAttention, .running: return statusColor(top.status)
         default: return nil
         }
     }

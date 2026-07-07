@@ -60,10 +60,14 @@ case "$HOOK" in
         MSG="turn complete"
         ;;
     StopFailure)
-        # Turn ended due to an API error. Without this, the session would sit
-        # in .running until transcript-mtime polling flips it to .away.
-        EVENT="stopped"
-        MSG=$(echo "$INPUT" | jq -r '.error // "turn errored"' 2>/dev/null)
+        # Turn ended due to an API error (529 overloaded, rate_limit, server_error,
+        # billing_error, etc). Emits a dedicated api_error event so the app can show
+        # a distinct RED status instead of looking like a clean turn end. The catch-all
+        # StopFailure registration (no matcher) means every error type lands here; the
+        # specific type travels in MSG. Field is error_type per the hooks docs; older
+        # payloads used .error, so fall back to it.
+        EVENT="api_error"
+        MSG=$(echo "$INPUT" | jq -r '.error_type // .error // "unknown"' 2>/dev/null)
         ;;
     Elicitation)
         # MCP server is asking the user for input — same flavor of "blocked
