@@ -3251,12 +3251,20 @@ final class AgentStore: ObservableObject {
     }
 
     private func projectName(for agent: Agent) -> String {
+        var name: String
         if let cwd = agent.cwd, !cwd.isEmpty {
             let base = (cwd as NSString).lastPathComponent
-            if let idx = agent.siblingIndex { return "\(base) #\(idx)" }
-            return base
+            name = agent.siblingIndex.map { "\(base) #\($0)" } ?? base
+        } else {
+            name = String(agent.id.prefix(8))
         }
-        return String(agent.id.prefix(8))
+        // A session on the comms board is better identified by the role it
+        // plays than by the repo alone — two tabs on segura-api are the same
+        // directory but not the same job.
+        if let alias = CommsPresence.alias(forSession: agent.id) {
+            name += " · \(alias)"
+        }
+        return name
     }
 
     private func playTransitionSound(from old: AgentStatus?, to new: AgentStatus) {
@@ -4376,6 +4384,9 @@ struct AgentRow: View {
         if let idx = agent.siblingIndex {
             name = "\(base) #\(idx)"
         }
+        if let alias = CommsPresence.alias(forSession: agent.id) {
+            name += " · \(alias)"
+        }
         if let type = agent.agentType, !type.isEmpty {
             return "\(name) ↳ \(type)"
         }
@@ -5438,6 +5449,9 @@ extension Agent {
         }
         var name = base
         if let idx = siblingIndex { name = "\(base) #\(idx)" }
+        // Two tabs on the same repo are the same directory but not the same
+        // job — the comms alias is what tells them apart.
+        if let alias = CommsPresence.alias(forSession: id) { name += " · \(alias)" }
         if let type = agentType, !type.isEmpty { return "\(name) ↳ \(type)" }
         return name
     }
@@ -5448,6 +5462,46 @@ extension Agent {
 /// Talks to Ghostty over its AppleScript dictionary. Terminals carry a stable
 /// `id`, so once a session is locked to a terminal id, focus + title-setting
 /// are exact regardless of tab order or what else writes the title.
+/// Reads the LOCAL file-based `comms` board (~/.claude/comms), which is
+/// unrelated to CommsAgent above — that one talks to a remote broker over
+/// COMMS_API. This one just labels a session that joined it can be labelled
+/// with its role. The board is plain JSON under ~/.claude/comms/presence, one
+/// file per alias, each carrying the Claude Code session id that owns it.
+///
+/// Read-only and best-effort: comms is optional, and a session that never
+/// joined simply has no alias. Cached briefly because titles are recomputed on
+/// every reconcile pass and the board changes at human speed.
+enum CommsPresence {
+    private static var cache: [String: String] = [:]   // sessionId -> alias
+    private static var lastRead: Date = .distantPast
+    private static let ttl: TimeInterval = 2
+
+    static func alias(forSession sessionId: String) -> String? {
+        guard !sessionId.isEmpty else { return nil }
+        refreshIfStale()
+        return cache[sessionId]
+    }
+
+    private static func refreshIfStale() {
+        guard Date().timeIntervalSince(lastRead) > ttl else { return }
+        lastRead = Date()
+        var map: [String: String] = [:]
+        let dir = NSString(string: "~/.claude/comms/presence").expandingTildeInPath
+        if let names = try? FileManager.default.contentsOfDirectory(atPath: dir) {
+            for name in names where name.hasSuffix(".json") {
+                let path = (dir as NSString).appendingPathComponent(name)
+                guard let data = FileManager.default.contents(atPath: path),
+                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let alias = obj["alias"] as? String, !alias.isEmpty,
+                      let session = obj["session"] as? String, !session.isEmpty
+                else { continue }
+                map[session] = alias
+            }
+        }
+        cache = map
+    }
+}
+
 enum Ghostty {
     /// Whether Ghostty is installed at all. Gates the jump hotkeys, reconcile,
     /// and title-setting so non-Ghostty users don't lose ⌥-digit keys or run
