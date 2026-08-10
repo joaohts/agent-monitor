@@ -2632,6 +2632,17 @@ final class AgentStore: ObservableObject {
     @Published var folding: Set<String> = []      // sessions with a summary fold in flight
 
     // Classic view: the original two-column live list, no summaries (and no folds run).
+    /// Append the local comms alias to session titles. Defaults ON, but only
+    /// has an effect for sessions that actually joined a board — everyone else
+    /// sees no difference, so there is nothing to opt into for them.
+    @Published var commsRoleInTitle: Bool = UserDefaults.standard.object(forKey: "agentMonitor.commsRoleInTitle") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(commsRoleInTitle, forKey: "agentMonitor.commsRoleInTitle")
+            CommsPresence.enabled = commsRoleInTitle
+            objectWillChange.send()
+        }
+    }
+
     @Published var classicView: Bool = UserDefaults.standard.bool(forKey: "agentMonitor.classicView") {
         didSet { UserDefaults.standard.set(classicView, forKey: "agentMonitor.classicView") }
     }
@@ -4952,6 +4963,9 @@ struct SettingsView: View {
                     Toggle("Classic view (live list, no summaries)", isOn: $store.classicView)
                     Text("Shows the original two-column list and disables the summary agent entirely (no folds, no token use).")
                         .font(.caption).foregroundStyle(.secondary)
+                    Toggle("Show comms role in session titles", isOn: $store.commsRoleInTitle)
+                    Text("Appends the local comms alias to the title, so \"segura-api\" becomes \"segura-api · orch\". Reads ~/.claude/comms/presence; sessions that never joined a board are unaffected.")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
 
                 Section("Housekeeping") {
@@ -5476,8 +5490,13 @@ enum CommsPresence {
     private static var lastRead: Date = .distantPast
     private static let ttl: TimeInterval = 2
 
+    /// Mirrors the user setting. Static because the title builders are value-type
+    /// computed properties with no access to the store; the store writes it on
+    /// change and at launch.
+    static var enabled: Bool = UserDefaults.standard.object(forKey: "agentMonitor.commsRoleInTitle") as? Bool ?? true
+
     static func alias(forSession sessionId: String) -> String? {
-        guard !sessionId.isEmpty else { return nil }
+        guard enabled, !sessionId.isEmpty else { return nil }
         refreshIfStale()
         return cache[sessionId]
     }
