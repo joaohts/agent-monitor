@@ -2844,7 +2844,11 @@ final class AgentStore: ObservableObject {
     private func reconcileGhostty() {
         guard Ghostty.isInstalled else { return }
         // Only Claude sessions map to Ghostty tabs; Cursor sessions live in-app.
-        let live = agents.filter { $0.parentSessionId == nil && $0.status != .inactive && $0.source == .claudeCode }
+        // .inactive sessions still own their tab and keep its title — the claude
+        // process is merely idle, not gone. A session releases its tab only when
+        // it truly ends (SessionEnd → .cleared removes it from `agents`, so it
+        // drops out of this filter and the prune below resets the title).
+        let live = agents.filter { $0.parentSessionId == nil && $0.source == .claudeCode }
         let liveIds = Set(live.map(\.id))
         var desiredTitle: [String: String] = [:]
         // A user-assigned name wins verbatim; otherwise the "project #N" default.
@@ -2928,7 +2932,10 @@ final class AgentStore: ObservableObject {
                 if appliedTtyTitles[tty] != title, Ghostty.writeTitle(title, toTty: tty) {
                     appliedTtyTitles[tty] = title
                 }
-            } else {
+            } else if a.status != .inactive {
+                // Only sessions with recent signs of life start a handshake: an
+                // inactive session whose binding is gone (tab closed) must not
+                // chase its tty — the name may have been recycled by a new tab.
                 let marker = "\(title) [\(a.id.prefix(4))]"
                 if Ghostty.writeTitle(marker, toTty: tty) {
                     pendingMarkers[tty] = (sid: a.id, marker: marker)
