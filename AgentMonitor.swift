@@ -34,6 +34,9 @@ enum AgentEventKind: String, Codable {
     case awayEnd             = "away_end"
     case needsAttentionEnd   = "needs_attention_end"
     case inactiveStart       = "inactive_start"
+    // Emitted by the comms CLI (not a hook): the session self-registered on the
+    // inter-agent board under an alias. Carries no status transition.
+    case alias
 }
 
 struct AgentEvent: Codable {
@@ -55,6 +58,9 @@ struct AgentEvent: Codable {
     // Controlling tty of the claude process (e.g. "ttys013"), reported by the
     // hook on every event. Names the exact tab the session runs in.
     var tty: String? = nil
+    // Set on .alias events: the comms-board alias this session registered under
+    // (empty string = alias dropped, e.g. comms close).
+    var alias: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case event
@@ -67,6 +73,7 @@ struct AgentEvent: Codable {
         case parentSessionId = "parent_session_id"
         case terminalId = "terminal_id"
         case tty
+        case alias
     }
 }
 
@@ -124,6 +131,9 @@ struct Agent: Identifiable {
     // Controlling tty of the session's claude process, reported by the hook.
     // The authoritative identity for which tab the session runs in.
     var tty: String? = nil
+    // Alias the session registered on the inter-agent comms board (via
+    // `comms open`). Wins over the user-set custom name and the default title.
+    var commsAlias: String? = nil
     // Which tool this session belongs to. Defaults to .claudeCode so every existing
     // construction site (and the hook pipeline) is unchanged; non-Claude providers
     // set it explicitly.
@@ -344,6 +354,7 @@ enum StatsCompute {
             case .awayEnd:           newState = (oldState == nil) ? nil : .running
             case .needsAttentionEnd: newState = (oldState == nil) ? nil : .running
             case .inactiveStart:     newState = (oldState == nil) ? nil : .inactive
+            case .alias:             newState = oldState   // metadata only, no transition
             }
             if let new = newState {
                 sessionState[sid] = new
@@ -2402,6 +2413,13 @@ final class AgentStore: ObservableObject {
         return n
     }
 
+    /// The session's display name: comms-board alias (agent self-registered,
+    /// wins while present) > user-set custom name > nil (caller falls back to
+    /// the "project #N" default).
+    func displayName(for agent: Agent) -> String? {
+        agent.commsAlias ?? customName(for: agent.id)
+    }
+
     func setCustomName(_ name: String?, for id: String) {
         let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if trimmed.isEmpty { customNames.removeValue(forKey: id) }
@@ -2851,8 +2869,8 @@ final class AgentStore: ObservableObject {
         let live = agents.filter { $0.parentSessionId == nil && $0.source == .claudeCode }
         let liveIds = Set(live.map(\.id))
         var desiredTitle: [String: String] = [:]
-        // A user-assigned name wins verbatim; otherwise the "project #N" default.
-        for a in live { desiredTitle[a.id] = customName(for: a.id) ?? a.bubbleTitle }
+        // Comms alias > user-assigned name (verbatim) > "project #N" default.
+        for a in live { desiredTitle[a.id] = displayName(for: a) ?? a.bubbleTitle }
 
         // sid → tty for live sessions. A tty belongs to exactly one tab, so if
         // two live sessions ever report the same tty (claude restarted in a tab
@@ -2987,8 +3005,8 @@ final class AgentStore: ObservableObject {
             guard matches.count == 1, let t = matches.first else {
                 bindFailures[tty, default: 0] += 1
                 // Don't leave the marker on the tab while unbound.
-                let title = customName(for: pending.sid)
-                    ?? agents.first(where: { $0.id == pending.sid })?.bubbleTitle
+                let agent = agents.first(where: { $0.id == pending.sid })
+                let title = agent.flatMap { displayName(for: $0) } ?? agent?.bubbleTitle
                 if let title, Ghostty.writeTitle(title, toTty: tty) {
                     appliedTtyTitles[tty] = title
                 }
@@ -3000,8 +3018,8 @@ final class AgentStore: ObservableObject {
                 sessionTerminal.removeValue(forKey: sid)
             }
             sessionTerminal[pending.sid] = t.id
-            let title = customName(for: pending.sid)
-                ?? agents.first(where: { $0.id == pending.sid })?.bubbleTitle
+            let agent = agents.first(where: { $0.id == pending.sid })
+            let title = agent.flatMap { displayName(for: $0) } ?? agent?.bubbleTitle
             if let title, Ghostty.writeTitle(title, toTty: tty) {
                 appliedTtyTitles[tty] = title
                 appliedTitles[t.id] = title
@@ -3567,6 +3585,16 @@ final class AgentStore: ObservableObject {
             if var a = byId[rec.sessionId], a.status == .idle || a.status == .away || a.status == .apiError {
                 a.status = .inactive
                 a.lastUpdate = rec.ts
+                byId[rec.sessionId] = a
+            }
+
+        case .alias:
+            // Comms-board registration: adopt the alias as the session's name
+            // (empty alias = registration dropped via comms close). Metadata
+            // only — status and lastUpdate stay untouched.
+            if var a = byId[rec.sessionId] {
+                let alias = rec.alias?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                a.commsAlias = alias.isEmpty ? nil : alias
                 byId[rec.sessionId] = a
             }
         }
@@ -4462,7 +4490,7 @@ struct AgentRow: View {
         if let tag = tag, !tag.isEmpty { nameDraft = tag }
     }
 
-    private var customName: String? { store.customName(for: agent.id) }
+    private var customName: String? { store.displayName(for: agent) }
 
     // Tag name (if any) followed by the project label as dimmed context.
     private var rowTitleText: Text {
@@ -5742,7 +5770,7 @@ struct BubblesView: View {
                     // 1-based number; only the first 9 get a ⌥N hotkey.
                     BubbleView(agent: agent,
                                number: idx < 9 ? idx + 1 : nil,
-                               customName: store.customName(for: agent.id),
+                               customName: store.displayName(for: agent),
                                childCount: kids.count,
                                childAccent: groupAccent(kids),
                                expanded: store.isGroupExpanded(parentId: agent.id, childCount: kids.count),
