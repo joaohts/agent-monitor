@@ -103,7 +103,10 @@ esac
 # Capture the Ghostty terminal id for this session. At SessionStart /
 # UserPromptSubmit the user is acting in this exact tab, so the focused terminal
 # of the front window IS this session's terminal. Guarded by cwd so a stray
-# focus on another window doesn't record the wrong tab. Empty if not in Ghostty.
+# focus on another window doesn't record the wrong tab, and read twice 250ms
+# apart — if the user is mid-switch to another same-cwd tab the reads differ and
+# we record nothing (a wrong id corrupts the jump map; a missing one is retried
+# on the next prompt). Empty if not in Ghostty.
 TERMINAL_ID=""
 if { [ "$HOOK" = "SessionStart" ] || [ "$HOOK" = "UserPromptSubmit" ]; } \
    && [ "$TERM_PROGRAM" = "ghostty" ] && command -v osascript >/dev/null 2>&1; then
@@ -112,8 +115,12 @@ on run argv
     set targetCwd to item 1 of argv
     tell application "Ghostty"
         try
-            set t to focused terminal of selected tab of front window
-            if (working directory of t) is targetCwd then return (id of t)
+            set t1 to focused terminal of selected tab of front window
+            if (working directory of t1) is not targetCwd then return ""
+            set id1 to id of t1
+            delay 0.25
+            set t2 to focused terminal of selected tab of front window
+            if (id of t2) is id1 then return id1
         end try
     end tell
     return ""

@@ -11,12 +11,12 @@ them are portable across users and terminals.
 |---|---|
 | **Floating bubbles overlay** | A separate always-on-top, click-through panel showing a bubble per live agent. Coexists with the regular main window (which is a normal-level window). Floats over fullscreen apps on other Spaces. |
 | **Bubble styling** | Status dot (green=running, gray=idle/away, orange=needs-attention), pulse while running, white border, gray capsule background. |
-| **Custom names / tags** | Per-session freeform tag, shown as `tag · project #N` in the bubble + main row. Right-click a row → "Name this agent…". Persisted to `~/.claude/agent-monitor-names.json`. The Ghostty tab title is left as `project #N` (names are agent-monitor-only). |
+| **Custom names / tags** | Per-session freeform tag, shown as `tag · project #N` in the bubble + main row. Right-click a row → "Name this agent…". Persisted to `~/.claude/agent-monitor-names.json`. A named session's Ghostty tab title becomes the name verbatim (unnamed sessions keep `project #N`). |
 | **AI tag generation** | ✨ in the rename popover calls `claude -p --model claude-haiku-4-5` with the full transcript as context and returns a 1–3 word tag. Reuses the existing `claude -p` runner (OAuth, no API key, tools disabled). |
 | **Native notifications** | macOS Notification Center banners on needs-attention / turn-end, via `UNUserNotificationCenter`. Toolbar toggle, off by default. Requires the app to be code-signed (see "Stable signing" below). |
 | **Expand inactive** | `⌥⌘E` / `moon.zzz` toggle adds inactive sessions to the overlay, rendered smaller + dimmed. |
 | **Jump to session** | `⌥1…9` focus the Nth bubble's Ghostty tab; `` ⌥` `` cycles. Exact: each session is locked to its Ghostty terminal's stable id (reported by the hook). |
-| **agent-monitor owns the tab title** | Sets the Ghostty tab title to `project #N` via the `set_surface_title` action, so the tab matches the bubble. |
+| **agent-monitor owns the tab title** | Sets the Ghostty tab title via the `set_surface_title` action — the custom name if one is set, else `project #N` — so the tab matches the bubble. When a session dies or gets remapped, its old tab is reset to the plain directory name so stale agent titles don't linger. |
 
 ### Hotkeys
 | Key | Action | Needs Ghostty? |

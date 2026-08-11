@@ -2386,7 +2386,7 @@ final class AgentStore: ObservableObject {
         bubbleExpansionOverride[parentId] = !isGroupExpanded(parentId: parentId, childCount: childCount)
     }
     // User-assigned display names (per session). Shown in the bubble + main
-    // window only — the Ghostty tab title is left alone. Persisted.
+    // window, and pushed verbatim as the Ghostty tab title. Persisted.
     @Published private(set) var customNames: [String: String] = [:]
 
     func customName(for id: String) -> String? {
@@ -2399,6 +2399,10 @@ final class AgentStore: ObservableObject {
         if trimmed.isEmpty { customNames.removeValue(forKey: id) }
         else { customNames[id] = trimmed }
         persistCustomNames()
+        // Push the new name to the Ghostty tab right away (bypass the throttle —
+        // this is a direct user action, not a background tick).
+        lastGhosttyReconcile = .distantPast
+        reconcileGhostty()
     }
 
     /// Asks Haiku for a short identifier-style tag (1-3 words) describing the
@@ -2545,10 +2549,11 @@ final class AgentStore: ObservableObject {
             provider(for: agent.source)?.focus(agent: agent)
             return
         }
-        // Subagents share the parent's terminal. Prefer the hook-reported id
-        // (authoritative), then the heuristic map, then occurrence-th tab.
+        // Subagents share the parent's terminal. Prefer the reconciled map — it
+        // absorbs hook-reported ids AND is pruned when terminals vanish — then
+        // the raw hook id (may be stale), then occurrence-th tab.
         let key = agent.parentSessionId ?? agent.id
-        let tid = agent.terminalId ?? parentTerminalId(of: agent) ?? sessionTerminal[key]
+        let tid = sessionTerminal[key] ?? agent.terminalId ?? parentTerminalId(of: agent)
         Ghostty.focus(terminalId: tid, cwd: cwd, occurrence: agent.siblingIndex ?? 1)
     }
 
@@ -2565,6 +2570,9 @@ final class AgentStore: ObservableObject {
     private var appliedTitles: [String: String] = [:]   // terminal id → last title we set
     private var knownTerminalIds: Set<String> = []       // to detect newly-opened tabs
     private var lastGhosttyReconcile: Date = .distantPast
+    // Tabs released by a dead or remapped session: their title still shows that
+    // session's name, so they get reset to the plain directory name next pass.
+    private var pendingTitleResets: Set<String> = []
 
     @Published var stats: StatsBundle = .empty
     @Published var statsOverlayOpen: Bool = false {
@@ -2806,11 +2814,15 @@ final class AgentStore: ObservableObject {
         let live = agents.filter { $0.parentSessionId == nil && $0.status != .inactive && $0.source == .claudeCode }
         let liveIds = Set(live.map(\.id))
         var desiredTitle: [String: String] = [:]
-        for a in live { desiredTitle[a.id] = a.bubbleTitle }
+        // A user-assigned name wins verbatim; otherwise the "project #N" default.
+        for a in live { desiredTitle[a.id] = customName(for: a.id) ?? a.bubbleTitle }
 
-        // Prune dead sessions from the map.
-        for sid in sessionTerminal.keys where !liveIds.contains(sid) {
+        // Prune dead sessions from the map; their tabs keep a stale agent title
+        // until the reset below.
+        for (sid, tid) in sessionTerminal where !liveIds.contains(sid) {
             sessionTerminal.removeValue(forKey: sid)
+            appliedTitles.removeValue(forKey: tid)
+            pendingTitleResets.insert(tid)
         }
 
         // Apply hook-reported terminal ids (authoritative). Corrects mis-mappings
@@ -2820,7 +2832,10 @@ final class AgentStore: ObservableObject {
             for (sid, t) in sessionTerminal where t == tid && sid != a.id {
                 sessionTerminal.removeValue(forKey: sid)
             }
-            if let old = sessionTerminal[a.id] { appliedTitles.removeValue(forKey: old) }
+            if let old = sessionTerminal[a.id] {
+                appliedTitles.removeValue(forKey: old)
+                pendingTitleResets.insert(old)   // the abandoned tab keeps our title otherwise
+            }
             appliedTitles.removeValue(forKey: tid)   // force re-title of the correct tab
             sessionTerminal[a.id] = tid
         }
@@ -2830,7 +2845,7 @@ final class AgentStore: ObservableObject {
             guard let tid = sessionTerminal[a.id] else { return false }
             return appliedTitles[tid] != desiredTitle[a.id]
         }
-        guard needMapping || titleWork else { return }
+        guard needMapping || titleWork || !pendingTitleResets.isEmpty else { return }
 
         let now = Date()
         guard now.timeIntervalSince(lastGhosttyReconcile) >= 1.5 else { return }
@@ -2884,6 +2899,25 @@ final class AgentStore: ObservableObject {
                 appliedTitles[tid] = title
             }
         }
+        // Released tabs (dead or remapped session) get their plain directory name
+        // back, unless another live session claimed them above. An empty
+        // set_surface_title leaves a blank pinned title, so we set the dir name.
+        // Also sweep unmapped tabs still showing the exact "<dir> #N" title we
+        // generate — leftovers from sessions that died under a previous app run
+        // (the in-memory applied map didn't survive) — while any other title, e.g.
+        // one the user or shell set, can't match the pattern and is left alone.
+        pendingTitleResets.subtract(Set(sessionTerminal.values))
+        let ownedTids = Set(sessionTerminal.values)
+        for t in terminals where !ownedTids.contains(t.id) {
+            let base = (t.cwd as NSString).lastPathComponent
+            let stalePattern = "^\(NSRegularExpression.escapedPattern(for: base)) #\\d+$"
+            let isStale = pendingTitleResets.contains(t.id)
+                || t.name.range(of: stalePattern, options: .regularExpression) != nil
+            guard isStale, appliedTitles[t.id] != base else { continue }
+            toSet[t.id] = base
+            appliedTitles[t.id] = base
+        }
+        pendingTitleResets.removeAll()
         if !toSet.isEmpty { Ghostty.setTitles(toSet) }
 
         persistGhosttyMap()
@@ -5474,9 +5508,9 @@ enum Ghostty {
          .replacingOccurrences(of: "\"", with: "\\\"")
     }
 
-    /// Returns (terminalId, cwd) for every tab's focused terminal, in window→tab
-    /// order. Empty if Ghostty isn't running.
-    static func listTerminals() -> [(id: String, cwd: String)] {
+    /// Returns (terminalId, cwd, title) for every tab's focused terminal, in
+    /// window→tab order. Empty if Ghostty isn't running.
+    static func listTerminals() -> [(id: String, cwd: String, name: String)] {
         let script = """
         tell application "Ghostty"
             if it is not running then return ""
@@ -5485,7 +5519,7 @@ enum Ghostty {
                 repeat with tb in tabs of w
                     try
                         set t to focused terminal of tb
-                        set out to out & (id of t) & "\\t" & (working directory of t) & "\\n"
+                        set out to out & (id of t) & "\\t" & (working directory of t) & "\\t" & (name of t) & "\\n"
                     end try
                 end repeat
             end repeat
@@ -5495,8 +5529,9 @@ enum Ghostty {
         guard let raw = runScript(script), !raw.isEmpty else { return [] }
         return raw.split(separator: "\n").compactMap { line in
             let parts = line.components(separatedBy: "\t")
-            guard parts.count == 2 else { return nil }
-            return (id: parts[0], cwd: parts[1])
+            guard parts.count >= 3 else { return nil }
+            // A title could itself contain tabs; rejoin everything past cwd.
+            return (id: parts[0], cwd: parts[1], name: parts[2...].joined(separator: "\t"))
         }
     }
 
