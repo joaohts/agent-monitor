@@ -3272,10 +3272,7 @@ final class AgentStore: ObservableObject {
         // A session on the comms board is better identified by the role it
         // plays than by the repo alone — two tabs on segura-api are the same
         // directory but not the same job.
-        if let alias = CommsPresence.alias(forSession: agent.id) {
-            name += " · \(alias)"
-        }
-        return name
+        return CommsPresence.decorate(name, forSession: agent.id)
     }
 
     private func playTransitionSound(from old: AgentStatus?, to new: AgentStatus) {
@@ -4395,9 +4392,7 @@ struct AgentRow: View {
         if let idx = agent.siblingIndex {
             name = "\(base) #\(idx)"
         }
-        if let alias = CommsPresence.alias(forSession: agent.id) {
-            name += " · \(alias)"
-        }
+        name = CommsPresence.decorate(name, forSession: agent.id)
         if let type = agent.agentType, !type.isEmpty {
             return "\(name) ↳ \(type)"
         }
@@ -4964,7 +4959,7 @@ struct SettingsView: View {
                     Text("Shows the original two-column list and disables the summary agent entirely (no folds, no token use).")
                         .font(.caption).foregroundStyle(.secondary)
                     Toggle("Show comms role in session titles", isOn: $store.commsRoleInTitle)
-                    Text("Appends the local comms alias to the title, so \"segura-api\" becomes \"segura-api · orch\". Reads ~/.claude/comms/presence; sessions that never joined a board are unaffected.")
+                    Text("Marks sessions on the local comms board with a bell and their alias, so \"segura-api\" becomes \"🔔 segura-api · orch\", in the app and in the Ghostty tab title. Reads ~/.claude/comms/presence; sessions that never joined a board are unaffected.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
 
@@ -5464,8 +5459,10 @@ extension Agent {
         var name = base
         if let idx = siblingIndex { name = "\(base) #\(idx)" }
         // Two tabs on the same repo are the same directory but not the same
-        // job — the comms alias is what tells them apart.
-        if let alias = CommsPresence.alias(forSession: id) { name += " · \(alias)" }
+        // job — the comms alias is what tells them apart. This one also feeds
+        // the Ghostty tab title via reconcileGhostty(), so the bell lands in
+        // the terminal and in the app from a single decision.
+        name = CommsPresence.decorate(name, forSession: id)
         if let type = agentType, !type.isEmpty { return "\(name) ↳ \(type)" }
         return name
     }
@@ -5499,6 +5496,17 @@ enum CommsPresence {
         guard enabled, !sessionId.isEmpty else { return nil }
         refreshIfStale()
         return cache[sessionId]
+    }
+
+    /// The one place that decides what a session on the comms board looks like.
+    ///
+    /// Returns the name untouched when the session never joined a board or the
+    /// setting is off — a session outside comms gets no bell, no separator, no
+    /// marker of any kind. The bell leads because that is the position that
+    /// survives truncation in a narrow Ghostty tab.
+    static func decorate(_ name: String, forSession sessionId: String) -> String {
+        guard let alias = alias(forSession: sessionId) else { return name }
+        return "🔔 \(name) · \(alias)"
     }
 
     private static func refreshIfStale() {
