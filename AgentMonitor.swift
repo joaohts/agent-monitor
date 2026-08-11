@@ -2819,8 +2819,14 @@ final class AgentStore: ObservableObject {
         var desiredTitle: [String: String] = [:]
         for a in live { desiredTitle[a.id] = a.bubbleTitle }
 
-        // Prune dead sessions from the map.
+        // Prune dead sessions from the map. Dropping the mapping is not enough:
+        // nothing else ever rewrites a tab's title, so a tab whose session ended
+        // keeps advertising it — and after a handoff you get two tabs claiming
+        // the same session, one of them a dead shell. Remember those terminals
+        // and give them a plain title below.
+        var orphaned: Set<String> = []
         for sid in sessionTerminal.keys where !liveIds.contains(sid) {
+            if let tid = sessionTerminal[sid] { orphaned.insert(tid) }
             sessionTerminal.removeValue(forKey: sid)
         }
 
@@ -2841,7 +2847,7 @@ final class AgentStore: ObservableObject {
             guard let tid = sessionTerminal[a.id] else { return false }
             return appliedTitles[tid] != desiredTitle[a.id]
         }
-        guard needMapping || titleWork else { return }
+        guard needMapping || titleWork || !orphaned.isEmpty else { return }
 
         let now = Date()
         guard now.timeIntervalSince(lastGhosttyReconcile) >= 1.5 else { return }
@@ -2893,6 +2899,19 @@ final class AgentStore: ObservableObject {
             if appliedTitles[tid] != title {
                 toSet[tid] = title
                 appliedTitles[tid] = title
+            }
+        }
+        // Tabs that lost their session — and that no other session claimed in
+        // this same pass — go back to the plain project name. Setting an empty
+        // title does not hand the tab back to the shell (measured), so a
+        // concrete fallback is the only way to stop a stale claim.
+        let claimed = Set(sessionTerminal.values)
+        for tid in orphaned where existingIds.contains(tid) && !claimed.contains(tid) {
+            guard let t = terminals.first(where: { $0.id == tid }) else { continue }
+            let plain = (t.cwd as NSString).lastPathComponent
+            if appliedTitles[tid] != plain {
+                toSet[tid] = plain
+                appliedTitles[tid] = plain
             }
         }
         if !toSet.isEmpty { Ghostty.setTitles(toSet) }
