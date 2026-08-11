@@ -11,12 +11,13 @@ them are portable across users and terminals.
 |---|---|
 | **Floating bubbles overlay** | A separate always-on-top, click-through panel showing a bubble per live agent. Coexists with the regular main window (which is a normal-level window). Floats over fullscreen apps on other Spaces. |
 | **Bubble styling** | Status dot (green=running, gray=idle/away, orange=needs-attention), pulse while running, white border, gray capsule background. |
-| **Custom names / tags** | Per-session freeform tag, shown as `tag · project #N` in the bubble + main row. Right-click a row → "Name this agent…". Persisted to `~/.claude/agent-monitor-names.json`. The Ghostty tab title is left as `project #N` (names are agent-monitor-only). |
+| **Custom names / tags** | Per-session freeform tag, shown as `tag · project #N` in the bubble + main row. Right-click a row → "Name this agent…". Persisted to `~/.claude/agent-monitor-names.json`. A named session's Ghostty tab title becomes the name verbatim (unnamed sessions keep `project #N`). Naming precedence: comms-board alias (see below) > custom name > `project #N`. |
+| **Comms alias → name** | When a session registers on the inter-agent comms board (`comms open <alias>`), the CLI appends an `alias` event to `agents.jsonl` (keyed by `CLAUDE_CODE_SESSION_ID` from its env) and the alias becomes the session's display name + tab title, superseding a custom name until `comms close` clears it. |
 | **AI tag generation** | ✨ in the rename popover calls `claude -p --model claude-haiku-4-5` with the full transcript as context and returns a 1–3 word tag. Reuses the existing `claude -p` runner (OAuth, no API key, tools disabled). |
 | **Native notifications** | macOS Notification Center banners on needs-attention / turn-end, via `UNUserNotificationCenter`. Toolbar toggle, off by default. Requires the app to be code-signed (see "Stable signing" below). |
 | **Expand inactive** | `⌥⌘E` / `moon.zzz` toggle adds inactive sessions to the overlay, rendered smaller + dimmed. |
 | **Jump to session** | `⌥1…9` focus the Nth bubble's Ghostty tab; `` ⌥` `` cycles. Exact: each session is locked to its Ghostty terminal's stable id (reported by the hook). |
-| **agent-monitor owns the tab title** | Sets the Ghostty tab title to `project #N` via the `set_surface_title` action, so the tab matches the bubble. |
+| **agent-monitor owns the tab title** | Sets the Ghostty tab title — the custom name if one is set, else `project #N` — so the tab matches the bubble. Written directly through the session's tty (OSC), which also resolves the exact tab for ⌥N jump. When a session dies or gets remapped, its old tab is reset to the plain directory name so stale agent titles don't linger. |
 
 ### Hotkeys
 | Key | Action | Needs Ghostty? |
@@ -42,8 +43,16 @@ notifications, ad-hoc codesign, expand toggle, and the overlay-control hotkeys
 (`⌥⌘B/C/E`). No terminal coupling.
 
 ### Tier 2 — Ghostty-only (degrade gracefully elsewhere)
-Jump-to-session, tab-title ownership, and the hook's terminal-id capture.
-- The hook self-guards on `TERM_PROGRAM=ghostty` (no-op for other terminals).
+Jump-to-session, tab-title ownership, and the hook's tty capture.
+- The hook self-guards on `TERM_PROGRAM=ghostty` (no-op for other terminals). It
+  reports the claude process's controlling tty (a walk up the process tree — no
+  AppleScript, no dependence on which tab is focused). The app resolves
+  tty → Ghostty surface id once per tab by writing a uniquely-marked title
+  through the tty (OSC) and reading back which surface shows it; the binding is
+  cached in `~/.claude/agent-monitor-tty-map.json` and survives claude restarts
+  in the same tab.
+- Titles are thereafter written straight through the tty; AppleScript remains
+  for listing terminals, jumping, and resetting stale titles.
 - The app gates jump hotkeys + `reconcileGhostty()` on `Ghostty.isInstalled`, so
   non-Ghostty users lose no keys and run no pointless AppleScript.
 

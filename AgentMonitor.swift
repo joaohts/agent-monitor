@@ -34,6 +34,9 @@ enum AgentEventKind: String, Codable {
     case awayEnd             = "away_end"
     case needsAttentionEnd   = "needs_attention_end"
     case inactiveStart       = "inactive_start"
+    // Emitted by the comms CLI (not a hook): the session self-registered on the
+    // inter-agent board under an alias. Carries no status transition.
+    case alias
 }
 
 struct AgentEvent: Codable {
@@ -50,7 +53,14 @@ struct AgentEvent: Codable {
     var parentSessionId: String? = nil
     // Stable Ghostty terminal id, captured by the hook from the focused terminal
     // at SessionStart / UserPromptSubmit (when the user is in that exact tab).
+    // Legacy — superseded by tty, kept so old log lines still decode.
     var terminalId: String? = nil
+    // Controlling tty of the claude process (e.g. "ttys013"), reported by the
+    // hook on every event. Names the exact tab the session runs in.
+    var tty: String? = nil
+    // Set on .alias events: the comms-board alias this session registered under
+    // (empty string = alias dropped, e.g. comms close).
+    var alias: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case event
@@ -62,6 +72,8 @@ struct AgentEvent: Codable {
         case agentType = "agent_type"
         case parentSessionId = "parent_session_id"
         case terminalId = "terminal_id"
+        case tty
+        case alias
     }
 }
 
@@ -114,8 +126,14 @@ struct Agent: Identifiable {
     // parent in the list. Both nil for top-level sessions.
     var agentType: String? = nil
     var parentSessionId: String? = nil
-    // Authoritative Ghostty terminal id, reported by the hook (overrides heuristics).
+    // Ghostty terminal id reported by old-format hook events (legacy fallback).
     var terminalId: String? = nil
+    // Controlling tty of the session's claude process, reported by the hook.
+    // The authoritative identity for which tab the session runs in.
+    var tty: String? = nil
+    // Alias the session registered on the inter-agent comms board (via
+    // `comms open`). Wins over the user-set custom name and the default title.
+    var commsAlias: String? = nil
     // Which tool this session belongs to. Defaults to .claudeCode so every existing
     // construction site (and the hook pipeline) is unchanged; non-Claude providers
     // set it explicitly.
@@ -336,6 +354,7 @@ enum StatsCompute {
             case .awayEnd:           newState = (oldState == nil) ? nil : .running
             case .needsAttentionEnd: newState = (oldState == nil) ? nil : .running
             case .inactiveStart:     newState = (oldState == nil) ? nil : .inactive
+            case .alias:             newState = oldState   // metadata only, no transition
             }
             if let new = newState {
                 sessionState[sid] = new
@@ -2386,7 +2405,7 @@ final class AgentStore: ObservableObject {
         bubbleExpansionOverride[parentId] = !isGroupExpanded(parentId: parentId, childCount: childCount)
     }
     // User-assigned display names (per session). Shown in the bubble + main
-    // window only — the Ghostty tab title is left alone. Persisted.
+    // window, and pushed verbatim as the Ghostty tab title. Persisted.
     @Published private(set) var customNames: [String: String] = [:]
 
     func customName(for id: String) -> String? {
@@ -2394,11 +2413,22 @@ final class AgentStore: ObservableObject {
         return n
     }
 
+    /// The session's display name: comms-board alias (agent self-registered,
+    /// wins while present) > user-set custom name > nil (caller falls back to
+    /// the "project #N" default).
+    func displayName(for agent: Agent) -> String? {
+        agent.commsAlias ?? customName(for: agent.id)
+    }
+
     func setCustomName(_ name: String?, for id: String) {
         let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if trimmed.isEmpty { customNames.removeValue(forKey: id) }
         else { customNames[id] = trimmed }
         persistCustomNames()
+        // Push the new name to the Ghostty tab right away (bypass the throttle —
+        // this is a direct user action, not a background tick).
+        lastGhosttyReconcile = .distantPast
+        reconcileGhostty()
     }
 
     /// Asks Haiku for a short identifier-style tag (1-3 words) describing the
@@ -2545,10 +2575,13 @@ final class AgentStore: ObservableObject {
             provider(for: agent.source)?.focus(agent: agent)
             return
         }
-        // Subagents share the parent's terminal. Prefer the hook-reported id
-        // (authoritative), then the heuristic map, then occurrence-th tab.
+        // Subagents share the parent's terminal. Prefer the tty-derived binding
+        // (exact), then the reconciled map, then the legacy raw hook id, then
+        // occurrence-th tab.
         let key = agent.parentSessionId ?? agent.id
-        let tid = agent.terminalId ?? parentTerminalId(of: agent) ?? sessionTerminal[key]
+        let owner = agent.parentSessionId == nil ? agent : agents.first(where: { $0.id == key })
+        let viaTty = owner?.tty.flatMap { ttySurface[$0] }
+        let tid = viaTty ?? sessionTerminal[key] ?? agent.terminalId ?? parentTerminalId(of: agent)
         Ghostty.focus(terminalId: tid, cwd: cwd, occurrence: agent.siblingIndex ?? 1)
     }
 
@@ -2563,8 +2596,17 @@ final class AgentStore: ObservableObject {
     // cwd) and persisted so app restarts don't re-derive it.
     private var sessionTerminal: [String: String] = [:]
     private var appliedTitles: [String: String] = [:]   // terminal id → last title we set
-    private var knownTerminalIds: Set<String> = []       // to detect newly-opened tabs
+    // tty → surface id, resolved by the OSC title round-trip. The durable half
+    // of the mapping: a tab keeps its tty for life, so this survives session
+    // churn (claude restarted in the same tab) and app restarts. Persisted.
+    private var ttySurface: [String: String] = [:]
+    private var appliedTtyTitles: [String: String] = [:]  // tty → last title written
+    private var pendingMarkers: [String: (sid: String, marker: String)] = [:]
+    private var bindFailures: [String: Int] = [:]         // tty → failed handshakes
     private var lastGhosttyReconcile: Date = .distantPast
+    // Tabs released by a dead or remapped session: their title still shows that
+    // session's name, so they get reset to the plain directory name next pass.
+    private var pendingTitleResets: Set<String> = []
 
     @Published var stats: StatsBundle = .empty
     @Published var statsOverlayOpen: Bool = false {
@@ -2785,52 +2827,81 @@ final class AgentStore: ObservableObject {
         }
     }
 
+    private var ttyMapURL: URL {
+        fileURL.deletingLastPathComponent().appendingPathComponent("agent-monitor-tty-map.json")
+    }
+
     private func loadGhosttyMap() {
-        guard let data = try? Data(contentsOf: ghosttyMapURL),
-              let m = try? JSONDecoder().decode([String: String].self, from: data) else { return }
-        sessionTerminal = m
+        if let data = try? Data(contentsOf: ghosttyMapURL),
+           let m = try? JSONDecoder().decode([String: String].self, from: data) {
+            sessionTerminal = m
+        }
+        if let data = try? Data(contentsOf: ttyMapURL),
+           let m = try? JSONDecoder().decode([String: String].self, from: data) {
+            ttySurface = m
+        }
     }
 
     private func persistGhosttyMap() {
         if let data = try? JSONEncoder().encode(sessionTerminal) {
             try? data.write(to: ghosttyMapURL)
         }
+        if let data = try? JSONEncoder().encode(ttySurface) {
+            try? data.write(to: ttyMapURL)
+        }
     }
 
-    /// Locks live sessions to their Ghostty terminal id and pushes "project #N"
-    /// titles. Cheap-exits unless there's a session to map or a title to update;
-    /// throttled so a session that never matches a Ghostty tab can't spin.
+    /// Binds live sessions to their Ghostty tab and pushes titles (custom name
+    /// or "project #N"). Identity comes from the session's tty, reported by the
+    /// hook: the tty names the exact tab the claude process runs in, so there is
+    /// no focus- or ordering-based guessing anywhere in this path. tty → surface
+    /// id is resolved once per tab by writing the title through the tty (OSC)
+    /// and reading back which surface's name changed; the binding is cached and
+    /// survives session churn in the same tab. Cheap-exits unless there's real
+    /// work; throttled so an unresolvable session can't spin.
     private func reconcileGhostty() {
         guard Ghostty.isInstalled else { return }
         // Only Claude sessions map to Ghostty tabs; Cursor sessions live in-app.
-        let live = agents.filter { $0.parentSessionId == nil && $0.status != .inactive && $0.source == .claudeCode }
+        // .inactive sessions still own their tab and keep its title — the claude
+        // process is merely idle, not gone. A session releases its tab only when
+        // it truly ends (SessionEnd → .cleared removes it from `agents`, so it
+        // drops out of this filter and the prune below resets the title).
+        let live = agents.filter { $0.parentSessionId == nil && $0.source == .claudeCode }
         let liveIds = Set(live.map(\.id))
         var desiredTitle: [String: String] = [:]
-        for a in live { desiredTitle[a.id] = a.bubbleTitle }
+        // Comms alias > user-assigned name (verbatim) > "project #N" default.
+        for a in live { desiredTitle[a.id] = displayName(for: a) ?? a.bubbleTitle }
 
-        // Prune dead sessions from the map.
-        for sid in sessionTerminal.keys where !liveIds.contains(sid) {
-            sessionTerminal.removeValue(forKey: sid)
-        }
-
-        // Apply hook-reported terminal ids (authoritative). Corrects mis-mappings
-        // and evicts any other session wrongly holding the same terminal.
+        // sid → tty for live sessions. A tty belongs to exactly one tab, so if
+        // two live sessions ever report the same tty (claude restarted in a tab
+        // while the old session hasn't expired yet), the most recent one owns it.
+        var ttyOf: [String: String] = [:]
+        var ttyOwner: [String: Agent] = [:]
         for a in live {
-            guard let tid = a.terminalId, !tid.isEmpty, sessionTerminal[a.id] != tid else { continue }
-            for (sid, t) in sessionTerminal where t == tid && sid != a.id {
-                sessionTerminal.removeValue(forKey: sid)
-            }
-            if let old = sessionTerminal[a.id] { appliedTitles.removeValue(forKey: old) }
-            appliedTitles.removeValue(forKey: tid)   // force re-title of the correct tab
-            sessionTerminal[a.id] = tid
+            guard let tty = a.tty, !tty.isEmpty else { continue }
+            if let other = ttyOwner[tty], other.lastUpdate > a.lastUpdate { continue }
+            if let other = ttyOwner[tty] { ttyOf.removeValue(forKey: other.id) }
+            ttyOwner[tty] = a
+            ttyOf[a.id] = tty
         }
 
-        let needMapping = live.contains { sessionTerminal[$0.id] == nil && !($0.cwd ?? "").isEmpty }
-        let titleWork = live.contains { a in
-            guard let tid = sessionTerminal[a.id] else { return false }
-            return appliedTitles[tid] != desiredTitle[a.id]
+        // Prune dead sessions from the map; their tabs keep a stale agent title
+        // until the reset below.
+        for (sid, tid) in sessionTerminal where !liveIds.contains(sid) {
+            sessionTerminal.removeValue(forKey: sid)
+            appliedTitles.removeValue(forKey: tid)
+            pendingTitleResets.insert(tid)
         }
-        guard needMapping || titleWork else { return }
+
+        let needBinding = live.contains { a in
+            guard let tty = ttyOf[a.id] else { return false }
+            return ttySurface[tty] == nil || sessionTerminal[a.id] != ttySurface[tty]
+        }
+        let titleWork = live.contains { a in
+            guard let tty = ttyOf[a.id] else { return false }
+            return appliedTtyTitles[tty] != desiredTitle[a.id]
+        }
+        guard needBinding || titleWork || !pendingTitleResets.isEmpty else { return }
 
         let now = Date()
         guard now.timeIntervalSince(lastGhosttyReconcile) >= 1.5 else { return }
@@ -2840,52 +2911,120 @@ final class AgentStore: ObservableObject {
         guard !terminals.isEmpty else { return }
         let existingIds = Set(terminals.map(\.id))
 
-        // Drop mappings whose terminal vanished (e.g. tab/Ghostty closed).
+        // Drop bindings whose surface vanished (tab closed). A closed tab also
+        // frees its tty for reuse by a future tab, so the cached pair is dead.
+        for (tty, tid) in ttySurface where !existingIds.contains(tid) {
+            ttySurface.removeValue(forKey: tty)
+            appliedTtyTitles.removeValue(forKey: tty)
+        }
         for (sid, tid) in sessionTerminal where !existingIds.contains(tid) {
             sessionTerminal.removeValue(forKey: sid)
             appliedTitles.removeValue(forKey: tid)
         }
 
-        // Map unmapped sessions to free terminals by cwd. Prefer a terminal that
-        // newly appeared since the last reconcile (the tab the user just opened
-        // for this session) — that's the precise, unambiguous signal. Only when
-        // no new tab is identifiable do we fall back to firstSeen ↔ tab order
-        // (cold start). `knownTerminalIds` empty on the very first pass, so the
-        // first reconcile is treated as cold start, not "everything is new".
-        let coldStart = knownTerminalIds.isEmpty
-        let mappedTids = Set(sessionTerminal.values)
-        var freshByCwd: [String: [String]] = [:]   // newly-appeared free tabs
-        var oldByCwd: [String: [String]] = [:]      // pre-existing free tabs
-        for t in terminals where !mappedTids.contains(t.id) {
-            if !coldStart && !knownTerminalIds.contains(t.id) {
-                freshByCwd[t.cwd, default: []].append(t.id)
-            } else {
-                oldByCwd[t.cwd, default: []].append(t.id)
-            }
-        }
-        for a in live.filter({ sessionTerminal[$0.id] == nil }).sorted(by: { $0.firstSeen < $1.firstSeen }) {
-            guard let cwd = a.cwd, !cwd.isEmpty else { continue }
-            if var fresh = freshByCwd[cwd], !fresh.isEmpty {
-                sessionTerminal[a.id] = fresh.removeFirst()
-                freshByCwd[cwd] = fresh
-            } else if var old = oldByCwd[cwd], !old.isEmpty {
-                sessionTerminal[a.id] = old.removeFirst()
-                oldByCwd[cwd] = old
-            }
-        }
-        knownTerminalIds = existingIds
-
-        // Apply changed titles in one pass.
-        var toSet: [String: String] = [:]
+        // Titles + bindings, all through the tty. Bound tabs get the title
+        // written directly (OSC wins over any pinned title). Unbound tabs get a
+        // uniquely-marked title first; finishGhosttyBinding reads back which
+        // surface shows the marker, locks the binding, and writes the clean
+        // title. Sessions without a tty yet (pre-upgrade events) stay untouched
+        // until their next hook event supplies one — unmapped is better than a
+        // guessed, possibly wrong, mapping.
         for a in live {
-            guard let tid = sessionTerminal[a.id], let title = desiredTitle[a.id] else { continue }
-            if appliedTitles[tid] != title {
-                toSet[tid] = title
-                appliedTitles[tid] = title
+            guard let tty = ttyOf[a.id], let title = desiredTitle[a.id] else { continue }
+            if let surface = ttySurface[tty] {
+                if sessionTerminal[a.id] != surface {
+                    for (sid, tid) in sessionTerminal where tid == surface && sid != a.id {
+                        sessionTerminal.removeValue(forKey: sid)
+                    }
+                    if let old = sessionTerminal[a.id] { pendingTitleResets.insert(old) }
+                    sessionTerminal[a.id] = surface
+                }
+                if appliedTtyTitles[tty] != title, Ghostty.writeTitle(title, toTty: tty) {
+                    appliedTtyTitles[tty] = title
+                    appliedTitles[surface] = title
+                }
+            } else if bindFailures[tty, default: 0] >= 3 {
+                // Binding keeps failing (e.g. the session lives in a split pane
+                // whose surface isn't a tab's focused terminal). Titles still
+                // work over the tty — only ⌥N jump precision is lost.
+                if appliedTtyTitles[tty] != title, Ghostty.writeTitle(title, toTty: tty) {
+                    appliedTtyTitles[tty] = title
+                }
+            } else if a.status != .inactive {
+                // Only sessions with recent signs of life start a handshake: an
+                // inactive session whose binding is gone (tab closed) must not
+                // chase its tty — the name may have been recycled by a new tab.
+                let marker = "\(title) [\(a.id.prefix(4))]"
+                if Ghostty.writeTitle(marker, toTty: tty) {
+                    pendingMarkers[tty] = (sid: a.id, marker: marker)
+                    appliedTtyTitles.removeValue(forKey: tty)
+                }
             }
         }
+
+        // Released tabs (dead or remapped session) get their plain directory name
+        // back, unless a live session claimed them above. Also sweep unmapped
+        // tabs still showing the exact "<dir> #N" title we generate — leftovers
+        // from sessions that died under a previous app run — while any other
+        // title, e.g. one the user or shell set, can't match and is left alone.
+        var toSet: [String: String] = [:]
+        pendingTitleResets.subtract(Set(sessionTerminal.values))
+        let ownedTids = Set(sessionTerminal.values)
+        for t in terminals where !ownedTids.contains(t.id) {
+            let base = (t.cwd as NSString).lastPathComponent
+            let stalePattern = "^\(NSRegularExpression.escapedPattern(for: base)) #\\d+$"
+            let isStale = pendingTitleResets.contains(t.id)
+                || t.name.range(of: stalePattern, options: .regularExpression) != nil
+            guard isStale, appliedTitles[t.id] != base else { continue }
+            toSet[t.id] = base
+            appliedTitles[t.id] = base
+        }
+        pendingTitleResets.removeAll()
         if !toSet.isEmpty { Ghostty.setTitles(toSet) }
 
+        if !pendingMarkers.isEmpty {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+                self?.finishGhosttyBinding()
+            }
+        }
+        persistGhosttyMap()
+    }
+
+    /// Second half of the tty → surface handshake: the marked titles written by
+    /// reconcileGhostty have reached Ghostty by now, so the surface whose name
+    /// shows a marker IS the tab attached to that tty. Lock the binding, then
+    /// replace the marker with the clean title.
+    private func finishGhosttyBinding() {
+        guard !pendingMarkers.isEmpty else { return }
+        let markers = pendingMarkers
+        pendingMarkers.removeAll()
+        let terminals = Ghostty.listTerminals()
+        guard !terminals.isEmpty else { return }
+        for (tty, pending) in markers {
+            let matches = terminals.filter { $0.name == pending.marker }
+            guard matches.count == 1, let t = matches.first else {
+                bindFailures[tty, default: 0] += 1
+                // Don't leave the marker on the tab while unbound.
+                let agent = agents.first(where: { $0.id == pending.sid })
+                let title = agent.flatMap { displayName(for: $0) } ?? agent?.bubbleTitle
+                if let title, Ghostty.writeTitle(title, toTty: tty) {
+                    appliedTtyTitles[tty] = title
+                }
+                continue
+            }
+            bindFailures.removeValue(forKey: tty)
+            ttySurface[tty] = t.id
+            for (sid, tid) in sessionTerminal where tid == t.id && sid != pending.sid {
+                sessionTerminal.removeValue(forKey: sid)
+            }
+            sessionTerminal[pending.sid] = t.id
+            let agent = agents.first(where: { $0.id == pending.sid })
+            let title = agent.flatMap { displayName(for: $0) } ?? agent?.bubbleTitle
+            if let title, Ghostty.writeTitle(title, toTty: tty) {
+                appliedTtyTitles[tty] = title
+                appliedTitles[t.id] = title
+            }
+        }
         persistGhosttyMap()
     }
 
@@ -3307,6 +3446,10 @@ final class AgentStore: ObservableObject {
                 a.terminalId = tid
                 byId[rec.sessionId] = a
             }
+            if let tty = rec.tty, !tty.isEmpty, var a = byId[rec.sessionId] {
+                a.tty = tty
+                byId[rec.sessionId] = a
+            }
         }
 
         switch rec.event {
@@ -3442,6 +3585,16 @@ final class AgentStore: ObservableObject {
             if var a = byId[rec.sessionId], a.status == .idle || a.status == .away || a.status == .apiError {
                 a.status = .inactive
                 a.lastUpdate = rec.ts
+                byId[rec.sessionId] = a
+            }
+
+        case .alias:
+            // Comms-board registration: adopt the alias as the session's name
+            // (empty alias = registration dropped via comms close). Metadata
+            // only — status and lastUpdate stay untouched.
+            if var a = byId[rec.sessionId] {
+                let alias = rec.alias?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                a.commsAlias = alias.isEmpty ? nil : alias
                 byId[rec.sessionId] = a
             }
         }
@@ -4337,7 +4490,7 @@ struct AgentRow: View {
         if let tag = tag, !tag.isEmpty { nameDraft = tag }
     }
 
-    private var customName: String? { store.customName(for: agent.id) }
+    private var customName: String? { store.displayName(for: agent) }
 
     // Tag name (if any) followed by the project label as dimmed context.
     private var rowTitleText: Text {
@@ -5474,9 +5627,9 @@ enum Ghostty {
          .replacingOccurrences(of: "\"", with: "\\\"")
     }
 
-    /// Returns (terminalId, cwd) for every tab's focused terminal, in window→tab
-    /// order. Empty if Ghostty isn't running.
-    static func listTerminals() -> [(id: String, cwd: String)] {
+    /// Returns (terminalId, cwd, title) for every tab's focused terminal, in
+    /// window→tab order. Empty if Ghostty isn't running.
+    static func listTerminals() -> [(id: String, cwd: String, name: String)] {
         let script = """
         tell application "Ghostty"
             if it is not running then return ""
@@ -5485,7 +5638,7 @@ enum Ghostty {
                 repeat with tb in tabs of w
                     try
                         set t to focused terminal of tb
-                        set out to out & (id of t) & "\\t" & (working directory of t) & "\\n"
+                        set out to out & (id of t) & "\\t" & (working directory of t) & "\\t" & (name of t) & "\\n"
                     end try
                 end repeat
             end repeat
@@ -5495,9 +5648,23 @@ enum Ghostty {
         guard let raw = runScript(script), !raw.isEmpty else { return [] }
         return raw.split(separator: "\n").compactMap { line in
             let parts = line.components(separatedBy: "\t")
-            guard parts.count == 2 else { return nil }
-            return (id: parts[0], cwd: parts[1])
+            guard parts.count >= 3 else { return nil }
+            // A title could itself contain tabs; rejoin everything past cwd.
+            return (id: parts[0], cwd: parts[1], name: parts[2...].joined(separator: "\t"))
         }
+    }
+
+    /// Writes a title straight to a tab's tty as an OSC 2 escape — no
+    /// AppleScript, no ambiguity about which tab receives it, and it overrides
+    /// a previously pinned (set_surface_title) title. Control characters are
+    /// stripped so a hostile custom name can't smuggle extra escapes.
+    static func writeTitle(_ title: String, toTty tty: String) -> Bool {
+        let clean = title.unicodeScalars.filter { $0.value >= 0x20 }.map(String.init).joined()
+        guard let handle = FileHandle(forWritingAtPath: "/dev/\(tty)"),
+              let data = "\u{1B}]2;\(clean)\u{07}".data(using: .utf8) else { return false }
+        defer { try? handle.close() }
+        handle.write(data)
+        return true
     }
 
     /// Sets tab titles in one pass: a dictionary of terminalId → title.
@@ -5603,7 +5770,7 @@ struct BubblesView: View {
                     // 1-based number; only the first 9 get a ⌥N hotkey.
                     BubbleView(agent: agent,
                                number: idx < 9 ? idx + 1 : nil,
-                               customName: store.customName(for: agent.id),
+                               customName: store.displayName(for: agent),
                                childCount: kids.count,
                                childAccent: groupAccent(kids),
                                expanded: store.isGroupExpanded(parentId: agent.id, childCount: kids.count),
