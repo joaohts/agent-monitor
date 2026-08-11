@@ -100,33 +100,23 @@ case "$HOOK" in
         ;;
 esac
 
-# Capture the Ghostty terminal id for this session. At SessionStart /
-# UserPromptSubmit the user is acting in this exact tab, so the focused terminal
-# of the front window IS this session's terminal. Guarded by cwd so a stray
-# focus on another window doesn't record the wrong tab, and read twice 250ms
-# apart — if the user is mid-switch to another same-cwd tab the reads differ and
-# we record nothing (a wrong id corrupts the jump map; a missing one is retried
-# on the next prompt). Empty if not in Ghostty.
-TERMINAL_ID=""
-if { [ "$HOOK" = "SessionStart" ] || [ "$HOOK" = "UserPromptSubmit" ]; } \
-   && [ "$TERM_PROGRAM" = "ghostty" ] && command -v osascript >/dev/null 2>&1; then
-    TERMINAL_ID=$(osascript - "$CWD" <<'OSA' 2>/dev/null
-on run argv
-    set targetCwd to item 1 of argv
-    tell application "Ghostty"
-        try
-            set t1 to focused terminal of selected tab of front window
-            if (working directory of t1) is not targetCwd then return ""
-            set id1 to id of t1
-            delay 0.25
-            set t2 to focused terminal of selected tab of front window
-            if (id of t2) is id1 then return id1
-        end try
-    end tell
-    return ""
-end run
-OSA
-)
+# Report the controlling tty of the claude process (our ancestor) — the exact
+# tab this session runs in, independent of what's focused. This replaced the
+# old focused-window AppleScript capture, which recorded a same-cwd neighbor's
+# terminal whenever the user switched tabs right after submitting a prompt.
+# The app resolves tty → Ghostty surface id itself. Empty if not in Ghostty.
+TERMINAL_TTY=""
+if [ "$TERM_PROGRAM" = "ghostty" ]; then
+    P=$PPID
+    HOPS=0
+    while [ -n "$P" ] && [ "$P" != "0" ] && [ "$P" != "1" ] && [ "$HOPS" -lt 6 ]; do
+        T=$(ps -o tty= -p "$P" 2>/dev/null | tr -d ' ')
+        case "$T" in
+            ttys*) TERMINAL_TTY="$T"; break ;;
+        esac
+        P=$(ps -o ppid= -p "$P" 2>/dev/null | tr -d ' ')
+        HOPS=$((HOPS + 1))
+    done
 fi
 
 jq -nc \
@@ -138,11 +128,11 @@ jq -nc \
     --arg transcript "$TRANSCRIPT" \
     --arg agent_type "$AGENT_TYPE" \
     --arg parent_sid "$PARENT_SID" \
-    --arg terminal_id "$TERMINAL_ID" \
+    --arg tty "$TERMINAL_TTY" \
     '{event: $event, session_id: $session_id, cwd: $cwd, ts: $ts, message: $message, transcript_path: $transcript}
      + (if $agent_type  != "" then {agent_type: $agent_type} else {} end)
      + (if $parent_sid  != "" then {parent_session_id: $parent_sid} else {} end)
-     + (if $terminal_id != "" then {terminal_id: $terminal_id} else {} end)' \
+     + (if $tty         != "" then {tty: $tty} else {} end)' \
     >> "$OUT" 2>/dev/null
 
 exit 0

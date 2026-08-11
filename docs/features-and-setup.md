@@ -16,7 +16,7 @@ them are portable across users and terminals.
 | **Native notifications** | macOS Notification Center banners on needs-attention / turn-end, via `UNUserNotificationCenter`. Toolbar toggle, off by default. Requires the app to be code-signed (see "Stable signing" below). |
 | **Expand inactive** | `⌥⌘E` / `moon.zzz` toggle adds inactive sessions to the overlay, rendered smaller + dimmed. |
 | **Jump to session** | `⌥1…9` focus the Nth bubble's Ghostty tab; `` ⌥` `` cycles. Exact: each session is locked to its Ghostty terminal's stable id (reported by the hook). |
-| **agent-monitor owns the tab title** | Sets the Ghostty tab title via the `set_surface_title` action — the custom name if one is set, else `project #N` — so the tab matches the bubble. When a session dies or gets remapped, its old tab is reset to the plain directory name so stale agent titles don't linger. |
+| **agent-monitor owns the tab title** | Sets the Ghostty tab title — the custom name if one is set, else `project #N` — so the tab matches the bubble. Written directly through the session's tty (OSC), which also resolves the exact tab for ⌥N jump. When a session dies or gets remapped, its old tab is reset to the plain directory name so stale agent titles don't linger. |
 
 ### Hotkeys
 | Key | Action | Needs Ghostty? |
@@ -42,8 +42,16 @@ notifications, ad-hoc codesign, expand toggle, and the overlay-control hotkeys
 (`⌥⌘B/C/E`). No terminal coupling.
 
 ### Tier 2 — Ghostty-only (degrade gracefully elsewhere)
-Jump-to-session, tab-title ownership, and the hook's terminal-id capture.
-- The hook self-guards on `TERM_PROGRAM=ghostty` (no-op for other terminals).
+Jump-to-session, tab-title ownership, and the hook's tty capture.
+- The hook self-guards on `TERM_PROGRAM=ghostty` (no-op for other terminals). It
+  reports the claude process's controlling tty (a walk up the process tree — no
+  AppleScript, no dependence on which tab is focused). The app resolves
+  tty → Ghostty surface id once per tab by writing a uniquely-marked title
+  through the tty (OSC) and reading back which surface shows it; the binding is
+  cached in `~/.claude/agent-monitor-tty-map.json` and survives claude restarts
+  in the same tab.
+- Titles are thereafter written straight through the tty; AppleScript remains
+  for listing terminals, jumping, and resetting stale titles.
 - The app gates jump hotkeys + `reconcileGhostty()` on `Ghostty.isInstalled`, so
   non-Ghostty users lose no keys and run no pointless AppleScript.
 
