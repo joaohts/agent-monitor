@@ -3281,17 +3281,17 @@ final class AgentStore: ObservableObject {
     }
 
     private func projectName(for agent: Agent) -> String {
-        var name: String
+        let base: String
         if let cwd = agent.cwd, !cwd.isEmpty {
-            let base = (cwd as NSString).lastPathComponent
-            name = agent.siblingIndex.map { "\(base) #\($0)" } ?? base
+            base = (cwd as NSString).lastPathComponent
         } else {
-            name = String(agent.id.prefix(8))
+            base = String(agent.id.prefix(8))
         }
         // A session on the comms board is better identified by the role it
         // plays than by the repo alone — two tabs on segura-api are the same
         // directory but not the same job.
-        return CommsPresence.decorate(name, forSession: agent.id)
+        return CommsPresence.decorate(base, sibling: agent.siblingIndex,
+                                      forSession: agent.id)
     }
 
     private func playTransitionSound(from old: AgentStatus?, to new: AgentStatus) {
@@ -4407,11 +4407,8 @@ struct AgentRow: View {
         } else {
             base = String(agent.id.prefix(8))
         }
-        var name = base
-        if let idx = agent.siblingIndex {
-            name = "\(base) #\(idx)"
-        }
-        name = CommsPresence.decorate(name, forSession: agent.id)
+        var name = CommsPresence.decorate(base, sibling: agent.siblingIndex,
+                                          forSession: agent.id)
         if let type = agent.agentType, !type.isEmpty {
             return "\(name) ↳ \(type)"
         }
@@ -5466,8 +5463,9 @@ func formatClock(_ seconds: Double) -> String {
 }
 
 extension Agent {
-    /// One-line label for a bubble: the project (cwd) name plus its sibling
-    /// number, with a subagent-type qualifier when present.
+    /// One-line label for a bubble: the project (cwd) name, disambiguated by
+    /// the comms alias when there is one and by a sibling number when there is
+    /// not, with a subagent-type qualifier when present.
     var bubbleTitle: String {
         let base: String
         if let cwd = cwd, !cwd.isEmpty {
@@ -5475,13 +5473,12 @@ extension Agent {
         } else {
             base = String(id.prefix(8))
         }
-        var name = base
-        if let idx = siblingIndex { name = "\(base) #\(idx)" }
         // Two tabs on the same repo are the same directory but not the same
         // job — the comms alias is what tells them apart. This one also feeds
         // the Ghostty tab title via reconcileGhostty(), so the bell lands in
         // the terminal and in the app from a single decision.
-        name = CommsPresence.decorate(name, forSession: id)
+        let name = CommsPresence.decorate(base, sibling: siblingIndex,
+                                          forSession: id)
         if let type = agentType, !type.isEmpty { return "\(name) ↳ \(type)" }
         return name
     }
@@ -5517,15 +5514,25 @@ enum CommsPresence {
         return cache[sessionId]
     }
 
-    /// The one place that decides what a session on the comms board looks like.
+    /// The one place that decides what a session's title looks like.
     ///
-    /// Returns the name untouched when the session never joined a board or the
-    /// setting is off — a session outside comms gets no bell, no separator, no
-    /// marker of any kind. The bell leads because that is the position that
-    /// survives truncation in a narrow Ghostty tab.
-    static func decorate(_ name: String, forSession sessionId: String) -> String {
-        guard let alias = alias(forSession: sessionId) else { return name }
-        return "🔔 \(name) · \(alias)"
+    /// Takes the bare project name and the sibling number, because the two
+    /// decisions are the same decision: the number exists only to tell apart
+    /// tabs that would otherwise read identically, and an alias already does
+    /// that — better, since `· ai` says what the session IS and `#2` only says
+    /// it was second. So a session on the board gets the alias and no number;
+    /// a session outside comms keeps the number, which is all it has.
+    ///
+    /// Outside comms — or with the setting off — the name comes back with no
+    /// bell, no separator, no marker of any kind. The bell leads because that
+    /// is the position that survives truncation in a narrow Ghostty tab.
+    static func decorate(_ base: String, sibling: Int?,
+                         forSession sessionId: String) -> String {
+        guard let alias = alias(forSession: sessionId) else {
+            guard let sibling else { return base }
+            return "\(base) #\(sibling)"
+        }
+        return "🔔 \(base) · \(alias)"
     }
 
     private static func refreshIfStale() {
