@@ -134,6 +134,10 @@ struct Agent: Identifiable {
     // Alias the session registered on the inter-agent comms board (via
     // `comms open`). Wins over the user-set custom name and the default title.
     var commsAlias: String? = nil
+    // When that alias was registered. An alias can be taken over by a newer
+    // session (same name, fresh `comms open`), so board presence is attributed
+    // to the most recent registrant — never to the dead session still showing it.
+    var commsAliasAt: String? = nil
     // Which tool this session belongs to. Defaults to .claudeCode so every existing
     // construction site (and the hook pipeline) is unchanged; non-Claude providers
     // set it explicitly.
@@ -2734,6 +2738,19 @@ final class AgentStore: ObservableObject {
     // overlay is visible, never on the live hot path.
     private var statsRefreshTimer: Timer?
 
+    // ── Comms-board presence ──
+    // The board's `/who`, polled on a slow tick so a bubble can show whether that
+    // session is actually *listening* (holding a doorbell) and not merely
+    // registered. Keyed by bare alias on THIS host — bubbles are local sessions,
+    // so no other host's ids can match one. Value = doorbell armed.
+    @Published private(set) var commsPresence: [String: Bool] = [:]
+    private var commsPollTimer: Timer?
+    private var commsPollFailures = 0
+    static let commsPresenceInterval: TimeInterval = 10
+    // Tolerate a couple of blips (broker restart / tunnel hiccup) before blanking
+    // the indicators — otherwise every restart flickers every bubble.
+    static let commsPresenceFailuresBeforeBlank = 3
+
     // Claude Code doesn't fire any hook on Ctrl+C/ESC. We detect interrupts
     // via transcript mtime + tool-pending state, with grace periods tuned to
     // avoid false positives during thinking and tool waits.
@@ -2773,6 +2790,75 @@ final class AgentStore: ObservableObject {
         ingestAgentsFile()
         rebuildView()
         startWatching()
+        startCommsPolling()
+    }
+
+    /// Slow `/who` poll feeding the bubbles' comms indicator. One GET per tick,
+    /// and a no-op while no broker is configured.
+    private func startCommsPolling() {
+        refreshCommsPresence()
+        commsPollTimer = Timer.scheduledTimer(withTimeInterval: Self.commsPresenceInterval,
+                                              repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.refreshCommsPresence() }
+        }
+    }
+
+    private func refreshCommsPresence() {
+        guard let c = commsCredentials(), let url = URL(string: c.api + "/who") else {
+            commsPollFailures = 0
+            if !commsPresence.isEmpty { commsPresence = [:] }
+            return
+        }
+        var r = URLRequest(url: url)
+        r.setValue("Bearer \(c.token)", forHTTPHeaderField: "Authorization")
+        r.setValue("comms-cli/1.0", forHTTPHeaderField: "User-Agent")  // Cloudflare blocks default UAs
+        r.timeoutInterval = 8
+        URLSession.shared.dataTask(with: r) { d, resp, _ in
+            var presence: [String: Bool]? = nil
+            if let d, (resp as? HTTPURLResponse)?.statusCode == 200,
+               let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+               let arr = o["agents"] as? [[String: Any]] {
+                var m: [String: Bool] = [:]
+                for a in arr {
+                    let parts = (a["id"] as? String ?? "").components(separatedBy: ":")
+                    guard parts.count == 2, parts[0] == c.host else { continue }
+                    m[parts[1]] = a["armed"] as? Bool ?? false
+                }
+                presence = m
+            }
+            Task { @MainActor [weak self] in self?.applyCommsPresence(presence) }
+        }.resume()
+    }
+
+    private func applyCommsPresence(_ presence: [String: Bool]?) {
+        guard let presence else {
+            commsPollFailures += 1
+            if commsPollFailures >= Self.commsPresenceFailuresBeforeBlank, !commsPresence.isEmpty {
+                commsPresence = [:]   // board unreachable long enough that "armed" would be a lie
+            }
+            return
+        }
+        commsPollFailures = 0
+        if presence != commsPresence { commsPresence = presence }
+    }
+
+    /// Where a session sits on the comms board: `.armed` = holding a doorbell, so
+    /// mail wakes it; `.present` = registered but with no live `comms wait`, i.e.
+    /// deaf until it re-arms; `.gone` = not on the board at all.
+    func commsTier(for agent: Agent) -> PresenceTier {
+        guard let alias = agent.commsAlias, ownsAlias(agent, alias: alias),
+              let armed = commsPresence[alias] else { return .gone }
+        return armed ? .armed : .present
+    }
+
+    /// An alias belongs to whichever session registered it last — a dead session
+    /// keeps showing its old alias, and must not borrow the board presence of the
+    /// newer session that took the name over.
+    private func ownsAlias(_ agent: Agent, alias: String) -> Bool {
+        let newest = agents
+            .filter { $0.commsAlias == alias }
+            .max(by: { ($0.commsAliasAt ?? "") < ($1.commsAliasAt ?? "") })
+        return newest?.id == agent.id
     }
 
     /// Builds the external-source registry. To add a tool, append its provider here.
@@ -3595,6 +3681,7 @@ final class AgentStore: ObservableObject {
             if var a = byId[rec.sessionId] {
                 let alias = rec.alias?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                 a.commsAlias = alias.isEmpty ? nil : alias
+                a.commsAliasAt = alias.isEmpty ? nil : rec.ts
                 byId[rec.sessionId] = a
             }
         }
@@ -4590,6 +4677,19 @@ struct AgentRow: View {
 
 // MARK: - Comms board dashboard (viewer of the inter-agent comms broker)
 
+/// The broker connection, read live from `~/.claude/settings.json` env (the same
+/// place Claude Code sessions inherit it from) — nothing is hardcoded or cached,
+/// so reconnecting in Settings takes effect on the next poll.
+func commsCredentials() -> (api: String, token: String, host: String)? {
+    let url = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".claude/settings.json")
+    guard let data = try? Data(contentsOf: url),
+          let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let env = root["env"] as? [String: Any],
+          let api = env["COMMS_API"] as? String, !api.isEmpty,
+          let token = env["COMMS_TOKEN"] as? String, !token.isEmpty else { return nil }
+    return (api, token, env["COMMS_HOST"] as? String ?? "")
+}
+
 struct CommsAgent: Identifiable {
     let id: String        // full host:alias
     let host: String
@@ -4909,14 +5009,8 @@ struct CommsDashboardView: View {
     }
 
     // ---- networking ----
-    private func commsCreds() -> (api: String, token: String)? {
-        let url = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".claude/settings.json")
-        guard let data = try? Data(contentsOf: url),
-              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let env = root["env"] as? [String: Any],
-              let api = env["COMMS_API"] as? String, !api.isEmpty,
-              let token = env["COMMS_TOKEN"] as? String, !token.isEmpty else { return nil }
-        return (api, token)
+    private func commsCreds() -> (api: String, token: String, host: String)? {
+        commsCredentials()
     }
 
     private func get(_ path: String, _ done: @escaping ([String: Any]?) -> Void) {
@@ -5775,6 +5869,7 @@ struct BubblesView: View {
                                childAccent: groupAccent(kids),
                                expanded: store.isGroupExpanded(parentId: agent.id, childCount: kids.count),
                                isChild: isChild,
+                               comms: store.commsTier(for: agent),
                                onTap: { store.focus(agent: agent) },
                                onToggle: { store.toggleBubbleExpansion(agent.id, childCount: kids.count) })
                         .padding(indentOnLeading ? .leading : .trailing, isChild ? 22 : 0)
@@ -5811,6 +5906,8 @@ struct BubbleView: View {
     var childAccent: Color? = nil
     var expanded: Bool = false
     var isChild: Bool = false
+    // Comms-board presence for this session (.gone = not on the board).
+    var comms: PresenceTier = .gone
     var onTap: () -> Void = {}
     var onToggle: () -> Void = {}
     @State private var pulse = false
@@ -5865,6 +5962,7 @@ struct BubbleView: View {
                 .lineLimit(1)
                 .truncationMode(.middle)
                 .frame(maxWidth: compact ? 190 : 230, alignment: .leading)
+            commsBadge
             elapsed
             disclosure
         }
@@ -5895,6 +5993,25 @@ struct BubbleView: View {
                     .preference(key: BubbleFramesKey.self, value: [geo.frame(in: .global)])
             }
         )
+    }
+
+    // Comms-board indicator — only for sessions registered on the board.
+    // Green antenna: a doorbell is armed, so a message wakes this session right
+    // now. Amber slashed antenna: it's on the board but nothing is listening —
+    // it either forgot to re-arm (deaf) or is mid-turn handling the last ring.
+    @ViewBuilder
+    private var commsBadge: some View {
+        if comms != .gone {
+            Image(systemName: comms == .armed
+                  ? "antenna.radiowaves.left.and.right"
+                  : "antenna.radiowaves.left.and.right.slash")
+                .font(.system(size: compact ? 9.5 : 11, weight: .semibold))
+                .foregroundStyle(comms.color)
+                .shadow(color: comms.color.opacity(0.7), radius: 3)
+                .help(comms == .armed
+                      ? "Listening on the comms board — doorbell armed"
+                      : "On the comms board but no doorbell armed — it won't be woken")
+        }
     }
 
     // High-priority tap so the badge folds/unfolds without triggering the
