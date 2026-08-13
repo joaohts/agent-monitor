@@ -132,7 +132,7 @@ struct Agent: Identifiable {
     // The authoritative identity for which tab the session runs in.
     var tty: String? = nil
     // Alias the session registered on the inter-agent comms board (via
-    // `comms open`). Wins over the user-set custom name and the default title.
+    // `comms open`). Wins over `/name`, the user-set custom name and the default.
     var commsAlias: String? = nil
     // When that alias was registered. An alias can be taken over by a newer
     // session (same name, fresh `comms open`), so board presence is attributed
@@ -2418,10 +2418,14 @@ final class AgentStore: ObservableObject {
     }
 
     /// The session's display name: comms-board alias (agent self-registered,
-    /// wins while present) > user-set custom name > nil (caller falls back to
-    /// the "project #N" default).
+    /// wins while present) > `/name` set inside the session > user-set custom
+    /// name > nil (caller falls back to the "project #N" default).
+    ///
+    /// The alias stays on top because it's the identity other agents address the
+    /// session by, and it's explicitly released on `comms close`. `/name` sits
+    /// above the name set here because it's the fresher in-session signal.
     func displayName(for agent: Agent) -> String? {
-        agent.commsAlias ?? customName(for: agent.id)
+        agent.commsAlias ?? sessionNames[agent.id] ?? customName(for: agent.id)
     }
 
     func setCustomName(_ name: String?, for id: String) {
@@ -2751,6 +2755,13 @@ final class AgentStore: ObservableObject {
     // the indicators — otherwise every restart flickers every bubble.
     static let commsPresenceFailuresBeforeBlank = 3
 
+    // ── Session names set inside the session (`/name`) ──
+    // Claude Code keeps its own registry at ~/.claude/sessions/<pid>.json, which
+    // carries the name the user gave the session. Keyed by session id, so it
+    // lines up with `Agent.id` directly. Refreshed on the same slow tick as the
+    // comms poll — no hook fires on `/name`, so this has to be polled.
+    @Published private(set) var sessionNames: [String: String] = [:]
+
     // Claude Code doesn't fire any hook on Ctrl+C/ESC. We detect interrupts
     // via transcript mtime + tool-pending state, with grace periods tuned to
     // avoid false positives during thinking and tool waits.
@@ -2790,17 +2801,58 @@ final class AgentStore: ObservableObject {
         ingestAgentsFile()
         rebuildView()
         startWatching()
-        startCommsPolling()
+        startSlowPolling()
     }
 
-    /// Slow `/who` poll feeding the bubbles' comms indicator. One GET per tick,
-    /// and a no-op while no broker is configured.
-    private func startCommsPolling() {
+    /// The one slow tick, carrying everything that has no event to hang off:
+    /// the board's `/who` (comms indicator) and Claude's session registry
+    /// (`/name`). One GET plus a small local dir read per tick.
+    private func startSlowPolling() {
         refreshCommsPresence()
+        refreshSessionNames()
         commsPollTimer = Timer.scheduledTimer(withTimeInterval: Self.commsPresenceInterval,
                                               repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.refreshCommsPresence() }
+            Task { @MainActor [weak self] in
+                self?.refreshCommsPresence()
+                self?.refreshSessionNames()
+            }
         }
+    }
+
+    /// Reads Claude Code's session registry for names the user set with `/name`.
+    /// A `nameSource` of "derived" marks Claude's own auto-tag ("doodle-f1") —
+    /// skipped, since the bubble's "project #N" default already says that better.
+    /// The files are rewritten while the session runs, so a rename lands within
+    /// a tick.
+    private func refreshSessionNames() {
+        let dir = fileURL.deletingLastPathComponent().appending(path: "sessions")
+        guard let files = try? FileManager.default.contentsOfDirectory(
+                at: dir, includingPropertiesForKeys: nil) else {
+            if !sessionNames.isEmpty { sessionNames = [:] }
+            return
+        }
+        // Entries are keyed by pid and outlive the process, so a resumed session
+        // leaves two files for one session id — the later start wins. Everything
+        // else stale is harmless: only ids we already track are ever looked up.
+        var names: [String: String] = [:]
+        var startedAt: [String: Double] = [:]
+        for f in files where f.pathExtension == "json" {
+            guard let data = try? Data(contentsOf: f),
+                  let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let sid = o["sessionId"] as? String else { continue }
+            let started = (o["startedAt"] as? Double) ?? 0
+            if let prev = startedAt[sid], prev > started { continue }
+            startedAt[sid] = started
+            let name = (o["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if name.isEmpty || (o["nameSource"] as? String) == "derived" {
+                names.removeValue(forKey: sid)   // a rename cleared on resume
+            } else {
+                names[sid] = name
+            }
+        }
+        guard names != sessionNames else { return }
+        sessionNames = names
+        rebuildView()   // re-render the bubbles and push the name to the Ghostty tab
     }
 
     private func refreshCommsPresence() {
@@ -2955,7 +3007,7 @@ final class AgentStore: ObservableObject {
         let live = agents.filter { $0.parentSessionId == nil && $0.source == .claudeCode }
         let liveIds = Set(live.map(\.id))
         var desiredTitle: [String: String] = [:]
-        // Comms alias > user-assigned name (verbatim) > "project #N" default.
+        // Comms alias > `/name` > user-assigned name (verbatim) > "project #N".
         for a in live { desiredTitle[a.id] = displayName(for: a) ?? a.bubbleTitle }
 
         // sid → tty for live sessions. A tty belongs to exactly one tab, so if
