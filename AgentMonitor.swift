@@ -2678,6 +2678,17 @@ final class AgentStore: ObservableObject {
     @Published var folding: Set<String> = []      // sessions with a summary fold in flight
 
     // Classic view: the original two-column live list, no summaries (and no folds run).
+    /// Append the local comms alias to session titles. Defaults ON, but only
+    /// has an effect for sessions that actually joined a board — everyone else
+    /// sees no difference, so there is nothing to opt into for them.
+    @Published var commsRoleInTitle: Bool = UserDefaults.standard.object(forKey: "agentMonitor.commsRoleInTitle") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(commsRoleInTitle, forKey: "agentMonitor.commsRoleInTitle")
+            CommsPresence.enabled = commsRoleInTitle
+            objectWillChange.send()
+        }
+    }
+
     @Published var classicView: Bool = UserDefaults.standard.bool(forKey: "agentMonitor.classicView") {
         didSet { UserDefaults.standard.set(classicView, forKey: "agentMonitor.classicView") }
     }
@@ -3058,9 +3069,8 @@ final class AgentStore: ObservableObject {
         let ownedTids = Set(sessionTerminal.values)
         for t in terminals where !ownedTids.contains(t.id) {
             let base = (t.cwd as NSString).lastPathComponent
-            let stalePattern = "^\(NSRegularExpression.escapedPattern(for: base)) #\\d+$"
             let isStale = pendingTitleResets.contains(t.id)
-                || t.name.range(of: stalePattern, options: .regularExpression) != nil
+                || CommsPresence.isGeneratedTitle(t.name, forDirectory: base)
             guard isStale, appliedTitles[t.id] != base else { continue }
             toSet[t.id] = base
             appliedTitles[t.id] = base
@@ -3476,12 +3486,17 @@ final class AgentStore: ObservableObject {
     }
 
     private func projectName(for agent: Agent) -> String {
+        let base: String
         if let cwd = agent.cwd, !cwd.isEmpty {
-            let base = (cwd as NSString).lastPathComponent
-            if let idx = agent.siblingIndex { return "\(base) #\(idx)" }
-            return base
+            base = (cwd as NSString).lastPathComponent
+        } else {
+            base = String(agent.id.prefix(8))
         }
-        return String(agent.id.prefix(8))
+        // A session on the comms board is better identified by the role it
+        // plays than by the repo alone — two tabs on segura-api are the same
+        // directory but not the same job.
+        return CommsPresence.decorate(base, sibling: agent.siblingIndex,
+                                      forSession: agent.id)
     }
 
     private func playTransitionSound(from old: AgentStatus?, to new: AgentStatus) {
@@ -4612,10 +4627,8 @@ struct AgentRow: View {
         } else {
             base = String(agent.id.prefix(8))
         }
-        var name = base
-        if let idx = agent.siblingIndex {
-            name = "\(base) #\(idx)"
-        }
+        let name = CommsPresence.decorate(base, sibling: agent.siblingIndex,
+                                          forSession: agent.id)
         if let type = agent.agentType, !type.isEmpty {
             return "\(name) ↳ \(type)"
         }
@@ -5188,6 +5201,9 @@ struct SettingsView: View {
                     Toggle("Classic view (live list, no summaries)", isOn: $store.classicView)
                     Text("Shows the original two-column list and disables the summary agent entirely (no folds, no token use).")
                         .font(.caption).foregroundStyle(.secondary)
+                    Toggle("Show comms role in session titles", isOn: $store.commsRoleInTitle)
+                    Text("Marks sessions on the local comms board with a bell and their alias, so \"segura-api\" becomes \"🔔 segura-api · orch\", in the app and in the Ghostty tab title. Reads ~/.claude/comms/presence; sessions that never joined a board are unaffected.")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
 
                 Section("Housekeeping") {
@@ -5674,8 +5690,9 @@ func formatClock(_ seconds: Double) -> String {
 }
 
 extension Agent {
-    /// One-line label for a bubble: the project (cwd) name plus its sibling
-    /// number, with a subagent-type qualifier when present.
+    /// One-line label for a bubble: the project (cwd) name, disambiguated by
+    /// the comms alias when there is one and by a sibling number when there is
+    /// not, with a subagent-type qualifier when present.
     var bubbleTitle: String {
         let base: String
         if let cwd = cwd, !cwd.isEmpty {
@@ -5683,8 +5700,12 @@ extension Agent {
         } else {
             base = String(id.prefix(8))
         }
-        var name = base
-        if let idx = siblingIndex { name = "\(base) #\(idx)" }
+        // Two tabs on the same repo are the same directory but not the same
+        // job — the comms alias is what tells them apart. This one also feeds
+        // the Ghostty tab title via reconcileGhostty(), so the bell lands in
+        // the terminal and in the app from a single decision.
+        let name = CommsPresence.decorate(base, sibling: siblingIndex,
+                                          forSession: id)
         if let type = agentType, !type.isEmpty { return "\(name) ↳ \(type)" }
         return name
     }
@@ -5695,6 +5716,91 @@ extension Agent {
 /// Talks to Ghostty over its AppleScript dictionary. Terminals carry a stable
 /// `id`, so once a session is locked to a terminal id, focus + title-setting
 /// are exact regardless of tab order or what else writes the title.
+/// Reads the LOCAL file-based `comms` board (~/.claude/comms), which is
+/// unrelated to CommsAgent above — that one talks to a remote broker over
+/// COMMS_API. This one just labels a session that joined it can be labelled
+/// with its role. The board is plain JSON under ~/.claude/comms/presence, one
+/// file per alias, each carrying the Claude Code session id that owns it.
+///
+/// Read-only and best-effort: comms is optional, and a session that never
+/// joined simply has no alias. Cached briefly because titles are recomputed on
+/// every reconcile pass and the board changes at human speed.
+enum CommsPresence {
+    private static var cache: [String: String] = [:]   // sessionId -> alias
+    private static var lastRead: Date = .distantPast
+    private static let ttl: TimeInterval = 2
+
+    /// Mirrors the user setting. Static because the title builders are value-type
+    /// computed properties with no access to the store; the store writes it on
+    /// change and at launch.
+    static var enabled: Bool = UserDefaults.standard.object(forKey: "agentMonitor.commsRoleInTitle") as? Bool ?? true
+
+    static func alias(forSession sessionId: String) -> String? {
+        guard enabled, !sessionId.isEmpty else { return nil }
+        refreshIfStale()
+        return cache[sessionId]
+    }
+
+    /// The one place that decides what a session's title looks like.
+    ///
+    /// Takes the bare project name and the sibling number, because the two
+    /// decisions are the same decision: the number exists only to tell apart
+    /// tabs that would otherwise read identically, and an alias already does
+    /// that — better, since `· ai` says what the session IS and `#2` only says
+    /// it was second. So a session on the board gets the alias and no number;
+    /// a session outside comms keeps the number, which is all it has.
+    ///
+    /// Outside comms — or with the setting off — the name comes back with no
+    /// bell, no separator, no marker of any kind. The bell leads because that
+    /// is the position that survives truncation in a narrow Ghostty tab.
+    static func decorate(_ base: String, sibling: Int?,
+                         forSession sessionId: String) -> String {
+        guard let alias = alias(forSession: sessionId) else {
+            guard let sibling else { return base }
+            return "\(base) #\(sibling)"
+        }
+        return "🔔 \(base) · \(alias)"
+    }
+
+    /// Whether `title` is one this app wrote for a tab on `directory`.
+    ///
+    /// The sweep that returns a released tab to its plain directory name has to
+    /// tell our titles from one the user or the shell set, and it can only do
+    /// that by shape. Both shapes `decorate` can produce belong here — the
+    /// sweep was written when `<dir> #N` was the only one, and a comms tab that
+    /// died would have kept its bell forever once the decorated form existed.
+    /// Aliases are `[a-z0-9-]+` by the board's own validation, so the second
+    /// pattern cannot match a title someone chose by hand.
+    static func isGeneratedTitle(_ title: String, forDirectory directory: String) -> Bool {
+        let dir = NSRegularExpression.escapedPattern(for: directory)
+        for pattern in ["^\(dir) #\\d+$", "^🔔 \(dir) · [a-z0-9-]+$"] {
+            if title.range(of: pattern, options: .regularExpression) != nil {
+                return true
+            }
+        }
+        return false
+    }
+
+    private static func refreshIfStale() {
+        guard Date().timeIntervalSince(lastRead) > ttl else { return }
+        lastRead = Date()
+        var map: [String: String] = [:]
+        let dir = NSString(string: "~/.claude/comms/presence").expandingTildeInPath
+        if let names = try? FileManager.default.contentsOfDirectory(atPath: dir) {
+            for name in names where name.hasSuffix(".json") {
+                let path = (dir as NSString).appendingPathComponent(name)
+                guard let data = FileManager.default.contents(atPath: path),
+                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let alias = obj["alias"] as? String, !alias.isEmpty,
+                      let session = obj["session"] as? String, !session.isEmpty
+                else { continue }
+                map[session] = alias
+            }
+        }
+        cache = map
+    }
+}
+
 enum Ghostty {
     /// Whether Ghostty is installed at all. Gates the jump hotkeys, reconcile,
     /// and title-setting so non-Ghostty users don't lose ⌥-digit keys or run
