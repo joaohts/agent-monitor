@@ -1,6 +1,6 @@
 # Agent Monitor
 
-A native macOS floating window that shows live status of every running coding-agent session across your machine — **Claude Code and Cursor**, side by side in one list. Status, runtime, AI-generated titles, and live "what's happening now" descriptions. Claude Code is driven by hooks writing JSON-line events; Cursor is read live from its local SQLite store (no hooks needed). Each row is tagged with its source (`Claude` / `Cursor`).
+A native macOS floating window that shows live status of every running coding-agent session across your machine — **Claude Code, Codex, and Cursor**, side by side in one list. Status, runtime, AI-generated titles, and live "what's happening now" descriptions. Claude Code and Codex are driven by hooks writing JSON-line events; Cursor is read live from its local SQLite store (no hooks needed). Each row is tagged with its source.
 
 Built in a single Swift file with no external dependencies (no Xcode project, no Swift Package Manager). Compiles to a `.app` bundle in ~3 seconds.
 
@@ -34,12 +34,12 @@ It's a drop-in upgrade — **rebuild and you're done:**
 - **Installation is unchanged.** `./build.sh` as before. **No hook changes, no
   `settings.json` changes, no new dependencies/frameworks** — the only changed source is
   `AgentMonitor.swift`. Your existing hooks keep working as-is.
-- **No new hard requirements.** The summary agent uses your already-logged-in `claude`
-  CLI (the same prereq the AI titles/live-status already needed). An `ANTHROPIC_API_KEY`
-  is **optional** — if set, summaries use Haiku via the API instead of `claude -p`.
+- **No new hard requirements.** The summary agent uses an already logged-in `claude`
+  or `codex` CLI. Claude is preferred when both exist; Codex is a fully independent
+  fallback. An Anthropic API key file remains an optional metered Haiku route.
 - **⚠️ Summaries run automatically after you upgrade** — every monitored session gets
-  folded, which uses your Claude subscription (via `claude -p`) or API key. It's cheap
-  (Haiku-class, incremental) but it is real usage.
+  folded, which uses your selected local agent subscription or API key. It is incremental,
+  but it is real usage.
 - **Want the old experience? Use Classic view.** A toggle in the header (and
   Settings → Interface) switches back to the original two-column live list **and turns the
   summary agent fully off** — no folds, no token use. Pick your default and forget it.
@@ -51,7 +51,7 @@ It's a drop-in upgrade — **rebuild and you're done:**
 
 ## What it does
 
-- **Always-on-top floating window** that lists every Claude Code **and Cursor** session you have open, each tagged with its source
+- **Always-on-top floating window** that lists every Claude Code, Codex, and Cursor session you have open, each tagged with its source
 - Live status per session: `running`, `away`, `needs attention`, `idle`, `inactive`
 - Per-turn runtime timer that ticks while running and freezes on stop
 - AI-generated session titles via a side-car `claude -p` call
@@ -71,7 +71,7 @@ All Claude Code state lives in `~/.claude/agents.jsonl`. Claude Code hooks appen
 
 ---
 
-## Multiple tools: Claude Code + Cursor
+## Multiple tools: Claude Code + Codex + Cursor
 
 Agent Monitor is **multi-source**. Every tool plugs in behind one `SessionProvider`
 protocol and is merged into the same `Agent` list — so the window, bubbles, stats,
@@ -82,6 +82,22 @@ Each row carries a small **source tag** (`Claude` / `Cursor`) so you can tell th
 
 The original path: hooks append events to `~/.claude/agents.jsonl`, the app reads
 transcripts for titles and live status. Nothing about this changed.
+
+### Codex (hook-driven)
+
+Codex uses the same event/state pipeline as Claude Code. Global lifecycle hooks
+report session start/end, prompts, permission waits, turn completion, subagents,
+the transcript path, and the controlling TTY. Codex rollout transcripts under
+`~/.codex/sessions/` supply task text and model metadata for titles and summaries.
+Because Codex events land in the shared event log, its sessions contribute to the
+same activity statistics. In the bubble overlay, Claude and Codex use orange and
+blue right-edge stripes respectively; Cursor uses a dashed ring.
+
+Codex token-count events also supply live context-window and account rate-limit
+usage. These appear in the main session row and bubble tooltip without widening
+the bubble. The Stats overlay can filter activity to All, Claude, or Codex and
+shows detailed live Codex totals for input, cached input, output, reasoning,
+context fill, rate-window usage, and reset time.
 
 ### Cursor (read-only, polled)
 
@@ -183,7 +199,8 @@ Hooks are external shell scripts. Appending one JSON line is trivial (`echo >> f
 - macOS 13+ (uses `URL.appending(path:)`)
 - Xcode Command Line Tools (`swiftc`, `xcodebuild`) — install with `xcode-select --install`
 - `jq` — `brew install jq`
-- `claude` CLI logged in (for AI title and live-status features)
+- At least one logged-in agent CLI: `claude` or `codex`. When both are present,
+  Agent Monitor prefers Claude for local AI labels; Codex is the automatic fallback.
 
 ### One-shot install (recommended)
 
@@ -193,7 +210,7 @@ cd /path/to/agent-monitor
 ```
 
 This script:
-- Verifies prereqs (`swiftc`, `jq`, `claude` CLI) and prints install hints if any are missing
+- Verifies prereqs (`swiftc`, `jq`, and at least one of `claude` / `codex`) and prints install hints if anything required is missing
 - **Sets up a stable self-signed code-signing identity** (a dedicated keychain it owns — zero clicks, no login password) so macOS notification + Automation grants persist across rebuilds; idempotent, and `build.sh` falls back to ad-hoc if it's absent
 - Builds `AgentMonitor.app` via `build.sh`
 - Smoke-tests the hook script with sample input
@@ -202,7 +219,11 @@ This script:
   - Re-running won't duplicate our entries (detects our hook path is already registered)
   - Backup of `settings.json` saved as `settings.json.bak.YYYYMMDD_HHMMSS` before any change
   - If `jq` produces invalid JSON, the original is left untouched and the script exits non-zero
-- **Ghostty integration wizard** (only if Ghostty is installed): prompts to enable jump-to-tab + agent-monitor-owned tab titles, optionally setting `CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1` and adding `shell-integration-features = no-title` to your ghostty config (both with backups). Skips cleanly when Ghostty is absent. Prompts read from `/dev/tty` and fall back to defaults with no terminal, so piped/CI installs never hang.
+- Registers the equivalent supported lifecycle hooks in `~/.codex/hooks.json`
+  when Codex is installed, without requiring Claude or creating Claude configuration
+- On Codex-only machines, AI titles, live activity labels, and housekeeping summaries
+  run through the logged-in Codex subscription using isolated, ephemeral, read-only calls
+- **Ghostty integration wizard** (only if Ghostty is installed): prompts to enable jump-to-tab + agent-monitor-owned tab titles, setting Claude's `CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1` and/or Codex's `tui.terminal_title=[]` for the installed runtimes, then adding `shell-integration-features = no-title` to Ghostty (all with backups). Skips cleanly when Ghostty is absent.
 - Prints next-step instructions for TCC prompts (Automation on first jump; Notifications when first enabled)
 
 ### Uninstall

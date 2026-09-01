@@ -10,8 +10,11 @@ them are portable across users and terminals.
 | Feature | Summary |
 |---|---|
 | **Floating bubbles overlay** | A separate always-on-top, click-through panel showing a bubble per live agent. Coexists with the regular main window (which is a normal-level window). Floats over fullscreen apps on other Spaces. |
-| **Bubble styling** | Status dot (green=running, gray=idle/away, orange=needs-attention), pulse while running, white border, gray capsule background. |
-| **Custom names / tags** | Per-session freeform tag, shown as `tag · project #N` in the bubble + main row. Right-click a row → "Name this agent…". Persisted to `~/.claude/agent-monitor-names.json`. A named session's Ghostty tab title becomes the name verbatim (unnamed sessions keep `project #N`). Naming precedence: comms-board alias (see below) > custom name > `project #N`. |
+| **Bubble styling** | Status dot (green=running, gray=idle/away, orange=needs-attention), pulse while running, gray capsule background. Source cues add no width: Claude has an orange right-edge stripe, Codex a blue one, and Cursor a dashed ring. |
+| **Bubble size** | Configurable from Settings from 85% to 130%; the default is 108%. Text, dots, spacing, and source stripes scale together. |
+| **Custom names / tags** | Per-session freeform tag. Named bubbles show `tag · project` with the project smaller and omit `#N`; unnamed bubbles keep `project #N`. Right-click a row → "Name this agent…". Persisted to `~/.claude/agent-monitor-names.json`. A named session's Ghostty tab title becomes the name verbatim. Naming precedence: comms-board alias (see below) > custom name > `project #N`. |
+| **Source activity statistics** | The Stats overlay filters full-history hook activity by All, Claude, or Codex for every time window. Historical events from before source tagging remain attributed to Claude. Cursor is polled rather than event-logged, so it has no historical filter. |
+| **Codex usage** | Codex token-count events show context-window and rate-limit usage in the main row and bubble tooltip. Stats adds detailed live totals for input, cached input, output, reasoning output, total tokens, highest context fill, rate window, reset time, and plan. |
 | **Comms alias → name** | When a session registers on the inter-agent comms board (`comms open <alias>`), the CLI appends an `alias` event to `agents.jsonl` (keyed by `CLAUDE_CODE_SESSION_ID` from its env) and the alias becomes the session's display name + tab title, superseding a custom name until `comms close` clears it. |
 | **AI tag generation** | ✨ in the rename popover calls `claude -p --model claude-haiku-4-5` with the full transcript as context and returns a 1–3 word tag. Reuses the existing `claude -p` runner (OAuth, no API key, tools disabled). |
 | **Native notifications** | macOS Notification Center banners on needs-attention / turn-end, via `UNUserNotificationCenter`. Toolbar toggle, off by default. Requires the app to be code-signed (see "Stable signing" below). |
@@ -43,13 +46,13 @@ notifications, ad-hoc codesign, expand toggle, and the overlay-control hotkeys
 (`⌥⌘B/C/E`). No terminal coupling.
 
 ### Tier 2 — Ghostty-only (degrade gracefully elsewhere)
-Jump-to-session, tab-title ownership, and the hook's tty capture.
+Jump-to-session, tab-title ownership, and the hook's tty capture for Claude Code and Codex.
 - The hook self-guards on `TERM_PROGRAM=ghostty` (no-op for other terminals). It
-  reports the claude process's controlling tty (a walk up the process tree — no
+  reports the agent process's controlling tty (a walk up the process tree — no
   AppleScript, no dependence on which tab is focused). The app resolves
   tty → Ghostty surface id once per tab by writing a uniquely-marked title
   through the tty (OSC) and reading back which surface shows it; the binding is
-  cached in `~/.claude/agent-monitor-tty-map.json` and survives claude restarts
+  cached in `~/.claude/agent-monitor-tty-map.json` and survives agent restarts
   in the same tab.
 - Titles are thereafter written straight through the tty; AppleScript remains
   for listing terminals, jumping, and resetting stale titles.
@@ -60,6 +63,7 @@ Jump-to-session, tab-title ownership, and the hook's tty capture.
 Needed for the Ghostty title feature to be flicker-free (without them, jump still
 works — it's id-based — but agent-monitor fights Claude/Ghostty over the title):
 - `~/.claude/settings.json` → `env.CLAUDE_CODE_DISABLE_TERMINAL_TITLE = "1"`
+- `~/.codex/config.toml` → `[tui] terminal_title = []`
 - `~/.config/ghostty/config` → `shell-integration-features = no-title`
 
 ### Tier 4 — Permissions (one click each, cannot be scripted — macOS TCC)
@@ -98,11 +102,12 @@ of resetting each build (which is what pure ad-hoc signing caused).
 The wizard (defaults to Yes; falls back to defaults with no TTY so piped installs
 don't hang) asks whether to:
 1. enable jump-to-tab + owned titles,
-2. set `CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1`,
+2. disable native title writing for every installed runtime
+   (`CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1` and/or Codex `terminal_title=[]`),
 3. append `no-title` to the ghostty config (with backup; skips + warns if a
    `shell-integration-features` line already exists).
 
-Then: restart existing Claude sessions (env/title changes apply to new sessions),
+Then: restart existing Claude and Codex sessions (hooks/title changes apply to new sessions),
 and press `⌥1` once to grant the Automation permission.
 
 ### If Ghostty isn't installed

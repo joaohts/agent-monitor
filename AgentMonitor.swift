@@ -61,6 +61,8 @@ struct AgentEvent: Codable {
     // Set on .alias events: the comms-board alias this session registered under
     // (empty string = alias dropped, e.g. comms close).
     var alias: String? = nil
+    // Missing on historical events, which are Claude Code by definition.
+    var source: AgentSource? = nil
 
     enum CodingKeys: String, CodingKey {
         case event
@@ -74,6 +76,7 @@ struct AgentEvent: Codable {
         case terminalId = "terminal_id"
         case tty
         case alias
+        case source
     }
 }
 
@@ -85,12 +88,14 @@ struct AgentEvent: Codable {
 /// a new tool — nothing else in the view layer needs to know the difference.
 enum AgentSource: String, Codable {
     case claudeCode
+    case codex
     case cursor
 
     /// Short label shown in the row badge identifying which tool the session is from.
     var badge: String {
         switch self {
         case .claudeCode: return "Claude"
+        case .codex:      return "Codex"
         case .cursor:     return "Cursor"
         }
     }
@@ -120,6 +125,7 @@ struct Agent: Identifiable {
     var generatedTitle: String?
     var liveStatus: String?
     var model: String?
+    var codexUsage: CodexUsage? = nil
     var siblingIndex: Int? = nil
     // For subagents (sessions spawned via the Agent tool). agentType is what
     // the row is named after; parentSessionId is used to group it under its
@@ -132,7 +138,7 @@ struct Agent: Identifiable {
     // The authoritative identity for which tab the session runs in.
     var tty: String? = nil
     // Alias the session registered on the inter-agent comms board (via
-    // `comms open`). Wins over the user-set custom name and the default title.
+    // `comms open`). Wins over `/name`, the user-set custom name and the default.
     var commsAlias: String? = nil
     // When that alias was registered. An alias can be taken over by a newer
     // session (same name, fresh `comms open`), so board presence is attributed
@@ -154,6 +160,25 @@ struct Agent: Identifiable {
     }
 }
 
+struct CodexUsage {
+    var inputTokens: Int64 = 0
+    var totalTokens: Int64 = 0
+    var contextTokens: Int64 = 0
+    var contextWindow: Int64 = 0
+    var cachedInputTokens: Int64 = 0
+    var outputTokens: Int64 = 0
+    var reasoningTokens: Int64 = 0
+    var rateUsedPercent: Double?
+    var rateWindowMinutes: Int?
+    var rateResetsAt: Date?
+    var planType: String?
+
+    var contextPercent: Int? {
+        guard contextWindow > 0 else { return nil }
+        return Int((Double(contextTokens) / Double(contextWindow) * 100).rounded())
+    }
+}
+
 // MARK: - Stats
 
 enum StatsWindow: String, CaseIterable, Identifiable {
@@ -167,6 +192,12 @@ enum StatsWindow: String, CaseIterable, Identifiable {
         case .allTime:  return "All time"
         }
     }
+}
+
+enum StatsSourceFilter: String, CaseIterable, Identifiable {
+    case all, claude, codex
+    var id: String { rawValue }
+    var label: String { rawValue.capitalized }
 }
 
 struct WindowStats {
@@ -670,6 +701,59 @@ enum ClaudeP {
     }
 }
 
+// MARK: - Codex subscription runner / agent-independent local inference
+
+enum CodexP {
+    nonisolated static func run(prompt: String, systemPrompt: String? = nil) -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        let outputURL = FileManager.default.temporaryDirectory
+            .appending(path: "agent-monitor-codex-\(UUID().uuidString).txt")
+        defer { try? FileManager.default.removeItem(at: outputURL) }
+
+        process.arguments = [
+            "codex", "exec", "--ephemeral", "--ignore-user-config",
+            "--skip-git-repo-check", "--sandbox", "read-only", "--color", "never",
+            "--cd", "/tmp", "--output-last-message", outputURL.path, "-",
+        ]
+        let combined = [systemPrompt, prompt].compactMap { $0 }.joined(separator: "\n\n")
+        process.standardInput = Pipe()
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        var env = ProcessInfo.processInfo.environment
+        env["AGENT_MONITOR_INTERNAL"] = "1"
+        process.environment = env
+
+        do {
+            try process.run()
+            if let input = process.standardInput as? Pipe {
+                input.fileHandleForWriting.write(combined.data(using: .utf8) ?? Data())
+                try? input.fileHandleForWriting.close()
+            }
+            process.waitUntilExit()
+        } catch {
+            PushNotifier.debugLog("codex-p: RUN failed: \(error)")
+            return nil
+        }
+        guard process.terminationStatus == 0,
+              let result = try? String(contentsOf: outputURL, encoding: .utf8)
+        else {
+            PushNotifier.debugLog("codex-p: EXIT \(process.terminationStatus)")
+            return nil
+        }
+        return result
+    }
+}
+
+enum LocalAgentP {
+    /// Prefer Claude when both subscriptions are installed to preserve existing
+    /// behavior; a Codex-only machine gets the same features with no Claude dependency.
+    nonisolated static func run(prompt: String, systemPrompt: String? = nil) -> String? {
+        ClaudeP.run(prompt: prompt, systemPrompt: systemPrompt)
+            ?? CodexP.run(prompt: prompt, systemPrompt: systemPrompt)
+    }
+}
+
 // MARK: - Transcript text normalization
 
 /// Claude Code records slash commands and `!` bash runs as XML-ish wrappers in the
@@ -725,6 +809,7 @@ struct TranscriptInfo {
     let lastModified: Date?    // transcript file mtime
     let isToolPending: Bool    // last tool_use has no matching tool_result yet
     let model: String?         // most recent assistant message's model
+    let codexUsage: CodexUsage?
 }
 
 @MainActor
@@ -744,6 +829,7 @@ final class TranscriptReader {
         var userMessageCount: Int = 0   // tracked incrementally; turns may be trimmed
         var pendingToolUseIds: Set<String> = []
         var lastModel: String?
+        var codexUsage: CodexUsage?
     }
     private struct CacheEntry {
         let mtime: TimeInterval
@@ -753,7 +839,8 @@ final class TranscriptReader {
     private var cache: [String: CacheEntry] = [:]
     private static let empty = TranscriptInfo(
         initialTask: nil, latestSummary: nil, userMessageCount: 0,
-        titleExcerpt: "", liveExcerpt: "", lastModified: nil, isToolPending: false, model: nil
+        titleExcerpt: "", liveExcerpt: "", lastModified: nil, isToolPending: false,
+        model: nil, codexUsage: nil
     )
 
     func read(path: String) -> TranscriptInfo {
@@ -803,6 +890,12 @@ final class TranscriptReader {
         var summary: String?
         for lineData in data.split(separator: 0x0A, omittingEmptySubsequences: true) {
             guard let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] else { continue }
+            if let item = Self.codexMessage(obj),
+               let txt = item.text, !txt.isEmpty,
+               item.role == "user" || item.role == "assistant" {
+                turns.append((item.role == "user" ? "User" : "Assistant", txt))
+                continue
+            }
             switch obj["type"] as? String ?? "" {
             case "user":
                 if (obj["isMeta"] as? Bool) == true { break }
@@ -868,6 +961,54 @@ final class TranscriptReader {
 
     /// Folds a single decoded transcript line into the running parse state.
     private func ingestLine(_ obj: [String: Any], into state: inout ParseState) {
+        if obj["type"] as? String == "event_msg",
+           let payload = obj["payload"] as? [String: Any],
+           payload["type"] as? String == "token_count",
+           let info = payload["info"] as? [String: Any] {
+            let total = info["total_token_usage"] as? [String: Any] ?? [:]
+            let last = info["last_token_usage"] as? [String: Any] ?? [:]
+            let limits = payload["rate_limits"] as? [String: Any] ?? [:]
+            let primary = limits["primary"] as? [String: Any] ?? [:]
+            let reset = (primary["resets_at"] as? NSNumber)?.doubleValue
+            state.codexUsage = CodexUsage(
+                inputTokens: (total["input_tokens"] as? NSNumber)?.int64Value ?? 0,
+                totalTokens: (total["total_tokens"] as? NSNumber)?.int64Value ?? 0,
+                contextTokens: (last["total_tokens"] as? NSNumber)?.int64Value ?? 0,
+                contextWindow: (info["model_context_window"] as? NSNumber)?.int64Value ?? 0,
+                cachedInputTokens: (total["cached_input_tokens"] as? NSNumber)?.int64Value ?? 0,
+                outputTokens: (total["output_tokens"] as? NSNumber)?.int64Value ?? 0,
+                reasoningTokens: (total["reasoning_output_tokens"] as? NSNumber)?.int64Value ?? 0,
+                rateUsedPercent: (primary["used_percent"] as? NSNumber)?.doubleValue,
+                rateWindowMinutes: (primary["window_minutes"] as? NSNumber)?.intValue,
+                rateResetsAt: reset.map { Date(timeIntervalSince1970: $0) },
+                planType: limits["plan_type"] as? String
+            )
+            return
+        }
+        // Codex rollout transcripts wrap messages in response_item.payload.
+        if let item = Self.codexMessage(obj) {
+            if let txt = item.text, !txt.isEmpty {
+                if item.role == "user" {
+                    // Codex persists composed developer/environment inputs as user
+                    // messages too. They begin with markup or AGENTS injection and
+                    // are not the human's task/name seed.
+                    if !txt.hasPrefix("<") && !txt.hasPrefix("# AGENTS.md instructions") {
+                        state.turns.append((role: "User", text: txt))
+                        state.userMessageCount += 1
+                        if state.initialTask == nil { state.initialTask = txt }
+                    }
+                } else if item.role == "assistant" {
+                    state.turns.append((role: "Assistant", text: txt))
+                }
+            }
+            return
+        }
+        if (obj["type"] as? String == "session_meta" || obj["type"] as? String == "turn_context"),
+           let payload = obj["payload"] as? [String: Any],
+           let model = payload["model"] as? String, !model.isEmpty {
+            state.lastModel = model
+            return
+        }
         // Track unmatched tool_use ids regardless of message role
         if let msg = obj["message"] as? [String: Any],
            let content = msg["content"] as? [[String: Any]] {
@@ -902,6 +1043,20 @@ final class TranscriptReader {
         }
     }
 
+    private static func codexMessage(_ obj: [String: Any]) -> (role: String, text: String?)? {
+        guard obj["type"] as? String == "response_item",
+              let payload = obj["payload"] as? [String: Any],
+              payload["type"] as? String == "message",
+              let role = payload["role"] as? String,
+              let content = payload["content"] as? [[String: Any]] else { return nil }
+        let text = content.compactMap { block -> String? in
+            let type = block["type"] as? String ?? ""
+            guard type == "input_text" || type == "output_text" || type == "text" else { return nil }
+            return block["text"] as? String
+        }.joined(separator: "\n")
+        return (role, text.isEmpty ? nil : text)
+    }
+
     /// Derives the public TranscriptInfo from accumulated state. Cheap: counting
     /// and excerpt-slicing over already-parsed turns, no JSON work.
     private func buildInfo(from state: ParseState, lastModified: Date) -> TranscriptInfo {
@@ -917,7 +1072,8 @@ final class TranscriptReader {
             liveExcerpt: liveExcerpt,
             lastModified: lastModified,
             isToolPending: !state.pendingToolUseIds.isEmpty,
-            model: state.lastModel
+            model: state.lastModel,
+            codexUsage: state.codexUsage
         )
     }
 
@@ -1030,6 +1186,28 @@ enum HousekeepingDelta {
         for lineData in newData.prefix(completeCount).split(separator: 0x0A, omittingEmptySubsequences: true) {
             guard let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] else { continue }
             switch obj["type"] as? String ?? "" {
+            case "response_item":
+                guard let payload = obj["payload"] as? [String: Any] else { break }
+                switch payload["type"] as? String ?? "" {
+                case "message":
+                    let role = payload["role"] as? String ?? ""
+                    let content = payload["content"] as? [[String: Any]] ?? []
+                    let text = content.compactMap { item -> String? in
+                        let kind = item["type"] as? String ?? ""
+                        guard kind == "input_text" || kind == "output_text" || kind == "text" else { return nil }
+                        return item["text"] as? String
+                    }.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !text.isEmpty else { break }
+                    // Codex injects environment/operator context as user messages.
+                    // It is useful to the model but noise in the activity summary.
+                    if role == "user", (text.hasPrefix("<") || text.hasPrefix("# AGENTS.md instructions")) { break }
+                    if role == "user" { lines.append("U: \(cap(text, userCap))") }
+                    if role == "assistant" { lines.append("A: \(cap(text, asstCap))") }
+                case "custom_tool_call", "function_call":
+                    let name = payload["name"] as? String ?? "?"
+                    lines.append("T: \(name)")
+                default: break
+                }
             case "user":
                 if (obj["isMeta"] as? Bool) == true { break }      // hook/meta injection
                 if let t = extractText(obj["message"]) {            // skips tool_result-only turns
@@ -1290,7 +1468,7 @@ protocol HousekeepingProvider: Sendable {
     func fold(state: HousekeepingState, delta: [String]) async -> HousekeepingFold?
 }
 
-enum HousekeepingProviderKind: String { case auto, claudeP, haikuApi }
+enum HousekeepingProviderKind: String { case auto, claudeP, codexP, haikuApi }
 
 /// API key for the metered Haiku path. Read ONLY from a dedicated file
 /// (`~/.claude/agent-monitor-api-key`) — never from the environment, so a stray
@@ -1317,8 +1495,9 @@ enum HousekeepingProviders {
         switch kind {
         case .haikuApi: return HaikuAPIProvider()
         case .claudeP:  return ClaudePProvider()
+        case .codexP:   return CodexPProvider()
         case .auto:
-            return HousekeepingAPIKey.load().isEmpty ? ClaudePProvider() : HaikuAPIProvider()
+            return HousekeepingAPIKey.load().isEmpty ? LocalAgentPProvider() : HaikuAPIProvider()
         }
     }
 
@@ -1328,7 +1507,7 @@ enum HousekeepingProviders {
     static var useHaikuAPI: Bool {
         switch configuredKind {
         case .haikuApi: return true
-        case .claudeP:  return false
+        case .claudeP, .codexP: return false
         case .auto:     return !HousekeepingAPIKey.load().isEmpty
         }
     }
@@ -1341,6 +1520,28 @@ struct ClaudePProvider: HousekeepingProvider {
         let user = FoldPrompt.user(state: state, delta: delta)
         guard let out = ClaudeP.run(prompt: user, model: "claude-haiku-4-5",
                                     systemPrompt: FoldPrompt.system),
+              let data = FoldPrompt.extractJSON(out),
+              let fold = try? JSONDecoder().decode(HousekeepingFold.self, from: data)
+        else { return nil }
+        return fold
+    }
+}
+
+struct CodexPProvider: HousekeepingProvider {
+    func fold(state: HousekeepingState, delta: [String]) async -> HousekeepingFold? {
+        let user = FoldPrompt.user(state: state, delta: delta)
+        guard let out = CodexP.run(prompt: user, systemPrompt: FoldPrompt.system),
+              let data = FoldPrompt.extractJSON(out),
+              let fold = try? JSONDecoder().decode(HousekeepingFold.self, from: data)
+        else { return nil }
+        return fold
+    }
+}
+
+struct LocalAgentPProvider: HousekeepingProvider {
+    func fold(state: HousekeepingState, delta: [String]) async -> HousekeepingFold? {
+        let user = FoldPrompt.user(state: state, delta: delta)
+        guard let out = LocalAgentP.run(prompt: user, systemPrompt: FoldPrompt.system),
               let data = FoldPrompt.extractJSON(out),
               let fold = try? JSONDecoder().decode(HousekeepingFold.self, from: data)
         else { return nil }
@@ -1426,7 +1627,7 @@ enum HaikuShortText {
         }
         // claude -p is blocking; keep it off the calling actor.
         return await Task.detached(priority: .userInitiated) {
-            ClaudeP.run(prompt: prompt, systemPrompt: systemPrompt)
+            LocalAgentP.run(prompt: prompt, systemPrompt: systemPrompt)
         }.value
     }
 
@@ -1524,7 +1725,7 @@ final class TitleGenerator {
         \(excerpt)
         --- END ---
         """
-        guard let raw = ClaudeP.run(prompt: prompt, systemPrompt: systemPrompt) else { return nil }
+        guard let raw = LocalAgentP.run(prompt: prompt, systemPrompt: systemPrompt) else { return nil }
         return ClaudeP.sanitizeShortPhrase(raw)
     }
 }
@@ -1593,7 +1794,7 @@ final class LiveStatusGenerator {
         \(excerpt)
         --- END ---
         """
-        guard let raw = ClaudeP.run(prompt: prompt, systemPrompt: systemPrompt) else { return nil }
+        guard let raw = LocalAgentP.run(prompt: prompt, systemPrompt: systemPrompt) else { return nil }
         guard let phrase = ClaudeP.sanitizeShortPhrase(raw) else { return nil }
         if phrase.count <= 50 { return phrase }
         let idx = phrase.index(phrase.startIndex, offsetBy: 50)
@@ -2074,6 +2275,46 @@ enum CursorReader {
     }
 }
 
+// MARK: - Codex: read-only access to its thread registry
+
+/// Reads explicit names set on Codex threads. Titles are deliberately excluded:
+/// they are generated from the first prompt and belong in the subtitle, not in the
+/// user-controlled name slot.
+enum CodexReader {
+    static var stateDBURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appending(path: ".codex/state_5.sqlite")
+    }
+
+    static func sessionNames() -> [String: String] {
+        var db: OpaquePointer?
+        let flags = SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX
+        guard sqlite3_open_v2(stateDBURL.path, &db, flags, nil) == SQLITE_OK,
+              let db else {
+            if db != nil { sqlite3_close(db) }
+            return [:]
+        }
+        defer { sqlite3_close(db) }
+        sqlite3_busy_timeout(db, 200)
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db,
+                "SELECT id, name FROM threads WHERE name IS NOT NULL AND trim(name) <> ''",
+                -1, &stmt, nil) == SQLITE_OK,
+              let stmt else { return [:] }
+        defer { sqlite3_finalize(stmt) }
+
+        var result: [String: String] = [:]
+        while sqlite3_step(stmt) == SQLITE_ROW,
+              let idBytes = sqlite3_column_text(stmt, 0),
+              let nameBytes = sqlite3_column_text(stmt, 1) {
+            let name = String(cString: nameBytes).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !name.isEmpty { result[String(cString: idBytes)] = name }
+        }
+        return result
+    }
+}
+
 /// `SessionProvider` for Cursor. Polls the global SQLite store (kqueue-driven on
 /// the WAL sidecar, plus a slow heartbeat for time-based staleness) and derives
 /// the same `Agent`/`AgentStatus` model the rest of the app already renders.
@@ -2418,10 +2659,14 @@ final class AgentStore: ObservableObject {
     }
 
     /// The session's display name: comms-board alias (agent self-registered,
-    /// wins while present) > user-set custom name > nil (caller falls back to
-    /// the "project #N" default).
+    /// wins while present) > `/name` set inside the session > user-set custom
+    /// name > nil (caller falls back to the "project #N" default).
+    ///
+    /// The alias stays on top because it's the identity other agents address the
+    /// session by, and it's explicitly released on `comms close`. `/name` sits
+    /// above the name set here because it's the fresher in-session signal.
     func displayName(for agent: Agent) -> String? {
-        agent.commsAlias ?? customName(for: agent.id)
+        agent.commsAlias ?? sessionNames[agent.id] ?? customName(for: agent.id)
     }
 
     func setCustomName(_ name: String?, for id: String) {
@@ -2574,8 +2819,8 @@ final class AgentStore: ObservableObject {
 
     func focus(agent: Agent) {
         guard let cwd = agent.cwd, !cwd.isEmpty else { return }
-        // Non-Claude sessions live in their own tool, not a Ghostty tab.
-        if agent.source != .claudeCode {
+        // Cursor lives in its own app; terminal agents share the Ghostty path.
+        if agent.source == .cursor {
             provider(for: agent.source)?.focus(agent: agent)
             return
         }
@@ -2613,6 +2858,7 @@ final class AgentStore: ObservableObject {
     private var pendingTitleResets: Set<String> = []
 
     @Published var stats: StatsBundle = .empty
+    @Published var statsBySource: [AgentSource: StatsBundle] = [:]
     @Published var statsOverlayOpen: Bool = false {
         didSet {
             guard statsOverlayOpen != oldValue else { return }
@@ -2751,6 +2997,13 @@ final class AgentStore: ObservableObject {
     // the indicators — otherwise every restart flickers every bubble.
     static let commsPresenceFailuresBeforeBlank = 3
 
+    // ── Session names set inside the session (`/name`) ──
+    // Claude Code keeps its own registry at ~/.claude/sessions/<pid>.json, which
+    // carries the name the user gave the session. Keyed by session id, so it
+    // lines up with `Agent.id` directly. Refreshed on the same slow tick as the
+    // comms poll — no hook fires on `/name`, so this has to be polled.
+    @Published private(set) var sessionNames: [String: String] = [:]
+
     // Claude Code doesn't fire any hook on Ctrl+C/ESC. We detect interrupts
     // via transcript mtime + tool-pending state, with grace periods tuned to
     // avoid false positives during thinking and tool waits.
@@ -2790,17 +3043,57 @@ final class AgentStore: ObservableObject {
         ingestAgentsFile()
         rebuildView()
         startWatching()
-        startCommsPolling()
+        startSlowPolling()
     }
 
-    /// Slow `/who` poll feeding the bubbles' comms indicator. One GET per tick,
-    /// and a no-op while no broker is configured.
-    private func startCommsPolling() {
+    /// The one slow tick, carrying everything that has no event to hang off:
+    /// the board's `/who` (comms indicator) and the local Claude/Codex session
+    /// registries. One GET plus small local reads per tick.
+    private func startSlowPolling() {
         refreshCommsPresence()
+        refreshSessionNames()
         commsPollTimer = Timer.scheduledTimer(withTimeInterval: Self.commsPresenceInterval,
                                               repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.refreshCommsPresence() }
+            Task { @MainActor [weak self] in
+                self?.refreshCommsPresence()
+                self?.refreshSessionNames()
+            }
         }
+    }
+
+    /// Reads Claude Code's session registry for names the user set with `/name`,
+    /// then merges explicit Codex thread names from its read-only local database.
+    /// A `nameSource` of "derived" marks Claude's own auto-tag ("doodle-f1") —
+    /// skipped, since the bubble's "project #N" default already says that better.
+    /// The files are rewritten while the session runs, so a rename lands within
+    /// a tick.
+    private func refreshSessionNames() {
+        let dir = fileURL.deletingLastPathComponent().appending(path: "sessions")
+        let files = (try? FileManager.default.contentsOfDirectory(
+                at: dir, includingPropertiesForKeys: nil)) ?? []
+        // Entries are keyed by pid and outlive the process, so a resumed session
+        // leaves two files for one session id — the later start wins. Everything
+        // else stale is harmless: only ids we already track are ever looked up.
+        var names: [String: String] = [:]
+        var startedAt: [String: Double] = [:]
+        for f in files where f.pathExtension == "json" {
+            guard let data = try? Data(contentsOf: f),
+                  let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let sid = o["sessionId"] as? String else { continue }
+            let started = (o["startedAt"] as? Double) ?? 0
+            if let prev = startedAt[sid], prev > started { continue }
+            startedAt[sid] = started
+            let name = (o["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if name.isEmpty || (o["nameSource"] as? String) == "derived" {
+                names.removeValue(forKey: sid)   // a rename cleared on resume
+            } else {
+                names[sid] = name
+            }
+        }
+        names.merge(CodexReader.sessionNames()) { _, codexName in codexName }
+        guard names != sessionNames else { return }
+        sessionNames = names
+        rebuildView()   // re-render the bubbles and push the name to the Ghostty tab
     }
 
     private func refreshCommsPresence() {
@@ -2947,15 +3240,15 @@ final class AgentStore: ObservableObject {
     /// work; throttled so an unresolvable session can't spin.
     private func reconcileGhostty() {
         guard Ghostty.isInstalled else { return }
-        // Only Claude sessions map to Ghostty tabs; Cursor sessions live in-app.
+        // Claude and Codex sessions map to Ghostty tabs; Cursor lives in-app.
         // .inactive sessions still own their tab and keep its title — the claude
         // process is merely idle, not gone. A session releases its tab only when
         // it truly ends (SessionEnd → .cleared removes it from `agents`, so it
         // drops out of this filter and the prune below resets the title).
-        let live = agents.filter { $0.parentSessionId == nil && $0.source == .claudeCode }
+        let live = agents.filter { $0.parentSessionId == nil && $0.source != .cursor }
         let liveIds = Set(live.map(\.id))
         var desiredTitle: [String: String] = [:]
-        // Comms alias > user-assigned name (verbatim) > "project #N" default.
+        // Comms alias > `/name` > user-assigned name (verbatim) > "project #N".
         for a in live { desiredTitle[a.id] = displayName(for: a) ?? a.bubbleTitle }
 
         // sid → tty for live sessions. A tty belongs to exactly one tab, so if
@@ -2985,7 +3278,10 @@ final class AgentStore: ObservableObject {
         }
         let titleWork = live.contains { a in
             guard let tty = ttyOf[a.id] else { return false }
-            return appliedTtyTitles[tty] != desiredTitle[a.id]
+            // Codex animates and rewrites its own terminal title throughout a
+            // turn. Never trust our write cache for Codex: each transcript/hook
+            // reconciliation reasserts Agent Monitor's stable session title.
+            return a.source == .codex || appliedTtyTitles[tty] != desiredTitle[a.id]
         }
         guard needBinding || titleWork || !pendingTitleResets.isEmpty else { return }
 
@@ -3025,7 +3321,8 @@ final class AgentStore: ObservableObject {
                     if let old = sessionTerminal[a.id] { pendingTitleResets.insert(old) }
                     sessionTerminal[a.id] = surface
                 }
-                if appliedTtyTitles[tty] != title, Ghostty.writeTitle(title, toTty: tty) {
+                if (a.source == .codex || appliedTtyTitles[tty] != title),
+                   Ghostty.writeTitle(title, toTty: tty) {
                     appliedTtyTitles[tty] = title
                     appliedTitles[surface] = title
                 }
@@ -3033,7 +3330,8 @@ final class AgentStore: ObservableObject {
                 // Binding keeps failing (e.g. the session lives in a split pane
                 // whose surface isn't a tab's focused terminal). Titles still
                 // work over the tty — only ⌥N jump precision is lost.
-                if appliedTtyTitles[tty] != title, Ghostty.writeTitle(title, toTty: tty) {
+                if (a.source == .codex || appliedTtyTitles[tty] != title),
+                   Ghostty.writeTitle(title, toTty: tty) {
                     appliedTtyTitles[tty] = title
                 }
             } else if a.status != .inactive {
@@ -3226,7 +3524,21 @@ final class AgentStore: ObservableObject {
                   let rec = try? decoder.decode(AgentEvent.self, from: lineData) else { continue }
             allEvents.append(rec)
         }
-        stats = StatsCompute.compute(events: allEvents, now: Date())
+        let now = Date()
+        stats = StatsCompute.compute(events: allEvents, now: now)
+        // Source was added after the original event log format. A later sourced
+        // event identifies its whole session; truly historical sessions default
+        // to Claude, preserving the old log's meaning.
+        var sourceBySession: [String: AgentSource] = [:]
+        for event in allEvents where event.source != nil {
+            sourceBySession[event.sessionId] = event.source
+        }
+        statsBySource = Dictionary(uniqueKeysWithValues: [AgentSource.claudeCode, .codex].map { source in
+            let filtered = allEvents.filter {
+                (sourceBySession[$0.sessionId] ?? $0.source ?? .claudeCode) == source
+            }
+            return (source, StatsCompute.compute(events: filtered, now: now))
+        })
     }
 
     /// Detects state transitions that have no hook-fired event and returns the
@@ -3416,7 +3728,7 @@ final class AgentStore: ObservableObject {
     func dismiss(_ sessionId: String) {
         // Non-Claude rows regenerate each poll, so a cleared event can't stick —
         // route to the provider, which hides it until the session is touched again.
-        if let a = agents.first(where: { $0.id == sessionId }), a.source != .claudeCode {
+        if let a = agents.first(where: { $0.id == sessionId }), a.source == .cursor {
             provider(for: a.source)?.dismiss(agent: a)
             return
         }
@@ -3526,6 +3838,10 @@ final class AgentStore: ObservableObject {
         let recDate = Self.iso8601.date(from: rec.ts) ?? Date()
 
         defer {
+            if var a = byId[rec.sessionId] {
+                a.source = rec.source ?? a.source
+                byId[rec.sessionId] = a
+            }
             // Whenever the hook reports the focused terminal id, trust it — this
             // corrects any earlier mis-mapping the moment the user acts in the tab.
             if let tid = rec.terminalId, !tid.isEmpty, var a = byId[rec.sessionId] {
@@ -3690,11 +4006,11 @@ final class AgentStore: ObservableObject {
     private func enrichWithTranscripts(_ agents: [Agent]) -> [Agent] {
         let now = Date()
         return agents.map { a in
-            // External-source agents (Cursor, …) arrive fully formed from their
+            // Cursor agents arrive fully formed from their
             // provider — title, live status, cwd and status are already final, and
             // they have no Claude transcript to read. They still get a housekeeping
             // fold (over their own delta source), then pass through untouched.
-            guard a.source == .claudeCode else {
+            guard a.source != .cursor else {
                 if a.parentSessionId == nil, a.agentType == nil {
                     housekeepingGenerator.consider(
                         sessionId: a.id,
@@ -3720,6 +4036,7 @@ final class AgentStore: ObservableObject {
                 copy.initialTask = info.initialTask
                 copy.latestSummary = info.latestSummary
                 copy.model = info.model
+                copy.codexUsage = info.codexUsage
 
                 if titleGenerationEnabled {
                     titleGenerator.considerGenerating(
@@ -3754,7 +4071,7 @@ final class AgentStore: ObservableObject {
     /// of the heartbeat/stop gate.
     func forceHousekeeping(_ agent: Agent) {
         let src: HousekeepingSource?
-        if agent.source == .claudeCode {
+        if agent.source != .cursor {
             src = agent.transcriptPath.flatMap { $0.isEmpty ? nil : HousekeepingSource.transcript(path: $0) }
         } else {
             src = provider(for: agent.source)?.housekeepingSource(for: agent)
@@ -4483,6 +4800,18 @@ struct AgentRow: View {
                     Text(modelLabel)
                         .font(.caption2.monospaced())
                         .foregroundStyle(.tertiary)
+                    if let usage = agent.codexUsage, let context = usage.contextPercent {
+                        Text("·").foregroundStyle(.tertiary)
+                        Text("\(context)% ctx")
+                            .font(.caption2.monospaced())
+                            .foregroundStyle(.tertiary)
+                    }
+                    if let rate = agent.codexUsage?.rateUsedPercent {
+                        Text("·").foregroundStyle(.tertiary)
+                        Text("\(Int(rate.rounded()))% limit")
+                            .font(.caption2.monospaced())
+                            .foregroundStyle(.tertiary)
+                    }
                 }
 
                 if let sub = subtitle {
@@ -5121,6 +5450,7 @@ struct SettingsView: View {
     @AppStorage("agentMonitor.housekeepingProvider") private var hkProvider = "auto"
     @AppStorage("agentMonitor.housekeepingHeartbeatSec") private var hkHeartbeat = 1800.0
     @AppStorage("agentMonitor.housekeepingMarkdownDir") private var hkMarkdownDir = ""
+    @AppStorage("agentMonitor.bubbleScale") private var bubbleScale = 1.08
 
     // Comms board connection — persisted in ~/.claude/settings.json env, loaded on appear.
     @State private var commsApi = ""
@@ -5146,6 +5476,14 @@ struct SettingsView: View {
                 Section("Bubbles") {
                     Toggle("Show bubbles overlay", isOn: $store.bubblesVisible)
                     Toggle("Include inactive sessions", isOn: $store.showInactive)
+                    HStack {
+                        Text("Size")
+                        Slider(value: $bubbleScale, in: 0.85...1.30, step: 0.05)
+                        Text("\(Int((bubbleScale * 100).rounded()))%")
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                            .frame(width: 42, alignment: .trailing)
+                    }
                     Picker("Corner", selection: $store.bubbleCorner) {
                         ForEach(BubbleCorner.allCases) { Text($0.label).tag($0) }
                     }
@@ -5198,8 +5536,9 @@ struct SettingsView: View {
                             .font(.caption).foregroundStyle(.secondary)
                     }
                     Picker("Backend", selection: $hkProvider) {
-                        Text("Auto (key → Haiku, else claude -p)").tag("auto")
+                        Text("Auto (key → Haiku, else Claude/Codex)").tag("auto")
                         Text("claude -p (subscription)").tag("claudeP")
+                        Text("codex exec (subscription)").tag("codexP")
                         Text("Haiku API (needs API key)").tag("haikuApi")
                     }
                     .disabled(!hkEnabled)
@@ -5446,21 +5785,38 @@ struct DotLeader: View {
 struct StatsView: View {
     @EnvironmentObject var store: AgentStore
     @State private var selected: StatsWindow = .daily
+    @State private var selectedSource: StatsSourceFilter = .all
 
     var body: some View {
         VStack(spacing: 0) {
             header
             Divider()
-            Picker("", selection: $selected) {
-                ForEach(StatsWindow.allCases) { w in
-                    Text(w.label).tag(w)
+            HStack(spacing: 8) {
+                Picker("", selection: $selected) {
+                    ForEach(StatsWindow.allCases) { w in
+                        Text(w.label).tag(w)
+                    }
                 }
+                .pickerStyle(.segmented)
+                Picker("", selection: $selectedSource) {
+                    ForEach(StatsSourceFilter.allCases) { source in
+                        Text(source.label).tag(source)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 210)
             }
-            .pickerStyle(.segmented)
             .padding(8)
             Divider()
             ScrollView {
-                let s = store.stats.get(selected)
+                let bundle: StatsBundle = {
+                    switch selectedSource {
+                    case .all: return store.stats
+                    case .claude: return store.statsBySource[.claudeCode] ?? .empty
+                    case .codex: return store.statsBySource[.codex] ?? .empty
+                    }
+                }()
+                let s = bundle.get(selected)
                 VStack(spacing: 0) {
                     HStack(alignment: .top, spacing: 0) {
                         VStack(spacing: 0) {
@@ -5494,10 +5850,60 @@ struct StatsView: View {
                     }
                     Divider().padding(.top, 6)
                     hourHistogram(s)
+                    if selectedSource != .claude {
+                        Divider().padding(.top, 6)
+                        codexUsageSection
+                    }
                 }
                 .padding(.bottom, 8)
             }
         }
+    }
+
+    private var codexUsageSection: some View {
+        let usages = store.agents.filter { $0.source == .codex }.compactMap(\.codexUsage)
+        let total = usages.reduce(Int64(0)) { $0 + $1.totalTokens }
+        let input = usages.reduce(Int64(0)) { $0 + $1.inputTokens }
+        let cached = usages.reduce(Int64(0)) { $0 + $1.cachedInputTokens }
+        let output = usages.reduce(Int64(0)) { $0 + $1.outputTokens }
+        let reasoning = usages.reduce(Int64(0)) { $0 + $1.reasoningTokens }
+        let maxContext = usages.compactMap(\.contextPercent).max()
+        let latestRate = usages.compactMap { u -> CodexUsage? in
+            u.rateUsedPercent == nil ? nil : u
+        }.max { ($0.rateResetsAt ?? .distantPast) < ($1.rateResetsAt ?? .distantPast) }
+
+        var rows: [(String, String)] = [
+            ("Tracked sessions", "\(usages.count)"),
+            ("Total tokens", formatTokenCount(total)),
+            ("Input", formatTokenCount(input)),
+            ("Cached input", formatTokenCount(cached)),
+            ("Output", formatTokenCount(output)),
+            ("Reasoning output", formatTokenCount(reasoning)),
+            ("Highest context fill", maxContext.map { "\($0)%" } ?? "—")
+        ]
+        if let rate = latestRate?.rateUsedPercent {
+            let minutes = latestRate?.rateWindowMinutes ?? 0
+            rows.append((minutes > 0 ? "Rate limit (\(formatRateWindow(minutes)))" : "Rate limit",
+                         "\(Int(rate.rounded()))%"))
+        }
+        if let reset = latestRate?.rateResetsAt {
+            rows.append(("Rate limit resets", reset.formatted(date: .abbreviated, time: .shortened)))
+        }
+        if let plan = latestRate?.planType, !plan.isEmpty {
+            rows.append(("Plan", plan.capitalized))
+        }
+        return section("Live Codex token usage", rows: rows)
+    }
+
+    private func formatTokenCount(_ value: Int64) -> String {
+        value.formatted(.number.grouping(.automatic))
+    }
+
+    private func formatRateWindow(_ minutes: Int) -> String {
+        if minutes % 10_080 == 0 { return "\(minutes / 10_080)w" }
+        if minutes % 1_440 == 0 { return "\(minutes / 1_440)d" }
+        if minutes % 60 == 0 { return "\(minutes / 60)h" }
+        return "\(minutes)m"
     }
 
     private var header: some View {
@@ -5674,15 +6080,17 @@ func formatClock(_ seconds: Double) -> String {
 }
 
 extension Agent {
+    /// Project-only label, without the sibling discriminator used to distinguish
+    /// otherwise unnamed sessions.
+    var bubbleProject: String {
+        if let cwd = cwd, !cwd.isEmpty { return (cwd as NSString).lastPathComponent }
+        return String(id.prefix(8))
+    }
+
     /// One-line label for a bubble: the project (cwd) name plus its sibling
     /// number, with a subagent-type qualifier when present.
     var bubbleTitle: String {
-        let base: String
-        if let cwd = cwd, !cwd.isEmpty {
-            base = (cwd as NSString).lastPathComponent
-        } else {
-            base = String(id.prefix(8))
-        }
+        let base = bubbleProject
         var name = base
         if let idx = siblingIndex { name = "\(base) #\(idx)" }
         if let type = agentType, !type.isEmpty { return "\(name) ↳ \(type)" }
@@ -5845,6 +6253,7 @@ private struct BubbleFramesKey: PreferenceKey {
 
 struct BubblesView: View {
     @EnvironmentObject var store: AgentStore
+    @AppStorage("agentMonitor.bubbleScale") private var bubbleScale = 1.08
 
     var body: some View {
         let bubbles = store.bubbleAgents
@@ -5857,7 +6266,7 @@ struct BubblesView: View {
             // Non-hittable so empty overlay area stays click-through (only the
             // bubbles themselves capture clicks).
             Color.clear.allowsHitTesting(false)
-            VStack(alignment: store.bubbleCorner.horizontalAlignment, spacing: 9) {
+            VStack(alignment: store.bubbleCorner.horizontalAlignment, spacing: 8 * bubbleScale) {
                 ForEach(Array(bubbles.enumerated()), id: \.element.id) { idx, agent in
                     let kids = children[agent.id] ?? []
                     let isChild = agent.parentSessionId.map { headerIds.contains($0) } ?? false
@@ -5896,6 +6305,7 @@ struct BubblesView: View {
 }
 
 struct BubbleView: View {
+    @AppStorage("agentMonitor.bubbleScale") private var bubbleScale = 1.08
     let agent: Agent
     var number: Int? = nil
     var customName: String? = nil
@@ -5919,8 +6329,9 @@ struct BubbleView: View {
     // only inactive ones are also dimmed — live subagents stay fully visible.
     private var compact: Bool { agent.status == .inactive || isChild }
     private var dimmed: Bool { agent.status == .inactive }
-    private var dotInner: CGFloat { compact ? 8 : 10 }
-    private var dotOuter: CGFloat { compact ? 13 : 16 }
+    private var s: CGFloat { CGFloat(bubbleScale) }
+    private var dotInner: CGFloat { (compact ? 7 : 9) * s }
+    private var dotOuter: CGFloat { (compact ? 12 : 14) * s }
 
     // Custom name is a tag; the project label always trails as dimmed context.
     private var titleText: Text {
@@ -5928,13 +6339,21 @@ struct BubbleView: View {
         // just its agent type so the indented row stays terse.
         if isChild {
             let label = (agent.agentType?.isEmpty == false) ? agent.agentType! : agent.bubbleTitle
-            return Text(label).foregroundColor(.white.opacity(0.92))
+            return Text(label)
+                .font(.system(size: 10 * s, weight: .semibold, design: .rounded))
+                .foregroundColor(.white.opacity(0.92))
         }
         if let customName, !customName.isEmpty {
-            return Text(customName).foregroundColor(.white)
-                 + Text("  ·  \(agent.bubbleTitle)").foregroundColor(.white.opacity(0.72))
+            return Text(customName)
+                    .font(.system(size: (compact ? 10 : 12) * s, weight: .semibold, design: .rounded))
+                    .foregroundColor(.white)
+                 + Text("  ·  \(agent.bubbleProject)")
+                    .font(.system(size: (compact ? 8.5 : 10) * s, weight: .semibold, design: .rounded))
+                    .foregroundColor(.white.opacity(0.68))
         }
-        return Text(agent.bubbleTitle).foregroundColor(.white)
+        return Text(agent.bubbleTitle)
+            .font(.system(size: (compact ? 10 : 12) * s, weight: .semibold, design: .rounded))
+            .foregroundColor(.white)
     }
 
     // Idle and away bubbles read as neutral gray; active states keep their color.
@@ -5946,33 +6365,68 @@ struct BubbleView: View {
         return LinearGradient(colors: colors, startPoint: .topLeading, endPoint: .bottomTrailing)
     }
 
+    @ViewBuilder
+    private var sourceRing: some View {
+        switch agent.source {
+        case .claudeCode:
+            Capsule(style: .continuous)
+                .strokeBorder(Color.white.opacity(0.9), lineWidth: 1.5)
+        case .codex:
+            Capsule(style: .continuous)
+                .strokeBorder(Color.white.opacity(0.9), lineWidth: 1.5)
+        case .cursor:
+            Capsule(style: .continuous)
+                .stroke(Color.white.opacity(0.9), style: StrokeStyle(lineWidth: 1.5, dash: [5, 3]))
+        }
+    }
+
+    @ViewBuilder
+    private var sourceStripe: some View {
+        switch agent.source {
+        case .claudeCode:
+            HStack(spacing: 0) {
+                Spacer(minLength: 0)
+                Color.orange.frame(width: 7 * s)
+            }
+            .clipShape(Capsule(style: .continuous))
+        case .codex:
+            HStack(spacing: 0) {
+                Spacer(minLength: 0)
+                Color(red: 0.28, green: 0.64, blue: 1.0).frame(width: 7 * s)
+            }
+            .clipShape(Capsule(style: .continuous))
+        case .cursor:
+            EmptyView()
+        }
+    }
+
     var body: some View {
-        HStack(spacing: compact ? 7 : 9) {
+        HStack(spacing: (compact ? 6 : 8) * s) {
             if let number {
                 Text("\(number)")
-                    .font(.system(size: compact ? 9 : 11, weight: .bold, design: .rounded))
+                    .font(.system(size: (compact ? 8 : 10) * s, weight: .bold, design: .rounded))
                     .foregroundStyle(.white)
-                    .frame(width: compact ? 15 : 18, height: compact ? 15 : 18)
+                    .frame(width: (compact ? 14 : 17) * s, height: (compact ? 14 : 17) * s)
                     .background(Circle().fill(Color.white.opacity(0.16)))
                     .overlay(Circle().strokeBorder(Color.white.opacity(0.5), lineWidth: 1))
             }
             dot
             titleText
-                .font(.system(size: compact ? 11 : 13, weight: .semibold, design: .rounded))
                 .lineLimit(1)
                 .truncationMode(.middle)
-                .frame(maxWidth: compact ? 190 : 230, alignment: .leading)
+                .frame(maxWidth: (compact ? 180 : 215) * s, alignment: .leading)
             commsBadge
             elapsed
             disclosure
         }
-        .padding(.horizontal, compact ? 10 : 13)
-        .padding(.vertical, compact ? 6 : 9)
+        .padding(.horizontal, (compact ? 9 : 11) * s)
+        .padding(.vertical, (compact ? 5 : 7) * s)
         .background(
             ZStack {
                 Capsule(style: .continuous).fill(.ultraThinMaterial)
                 Capsule(style: .continuous).fill(tint)
-                Capsule(style: .continuous).strokeBorder(Color.white.opacity(0.85), lineWidth: 1)
+                sourceStripe
+                sourceRing
             }
         )
         .shadow(color: .black.opacity(0.3), radius: 6, y: 2)
@@ -5984,7 +6438,7 @@ struct BubbleView: View {
         .onTapGesture(perform: onTap)
         .onHover { hovering = $0 }
         .animation(.easeOut(duration: 0.12), value: hovering)
-        .help("Jump to this session's terminal")
+        .help(bubbleHelp)
         // Publish this bubble's frame so the overlay knows exactly where to be
         // interactive (everywhere else stays click-through).
         .background(
@@ -5993,6 +6447,15 @@ struct BubbleView: View {
                     .preference(key: BubbleFramesKey.self, value: [geo.frame(in: .global)])
             }
         )
+    }
+
+    private var bubbleHelp: String {
+        var parts = [agent.source.badge, "Jump to this session's terminal"]
+        if let usage = agent.codexUsage {
+            if let context = usage.contextPercent { parts.append("Context \(context)%") }
+            if let rate = usage.rateUsedPercent { parts.append("Limit \(Int(rate.rounded()))%") }
+        }
+        return parts.joined(separator: " · ")
     }
 
     // Comms-board indicator — only for sessions registered on the board.
@@ -6073,7 +6536,7 @@ struct BubbleView: View {
 
     private func timeText(_ seconds: Double) -> some View {
         Text(formatClock(seconds))
-            .font(.system(size: compact ? 9.5 : 11, weight: .medium, design: .monospaced))
+            .font(.system(size: (compact ? 9 : 10) * s, weight: .medium, design: .monospaced))
             .foregroundStyle(.white.opacity(0.7))
     }
 }

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Claude Code hook → appends one event to ~/.claude/agents.jsonl
+# Claude Code / Codex hook → appends one event to ~/.claude/agents.jsonl
 # Designed to never block or fail Claude Code: silent on errors, always exit 0.
 
 # Skip when invoked by Agent Monitor's own internal subprocesses (e.g., title generator)
@@ -15,6 +15,9 @@ SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // ""' 2>/dev/null)
 CWD=$(echo "$INPUT" | jq -r '.cwd // ""' 2>/dev/null)
 HOOK=$(echo "$INPUT" | jq -r '.hook_event_name // ""' 2>/dev/null)
 TRANSCRIPT=$(echo "$INPUT" | jq -r '.transcript_path // ""' 2>/dev/null)
+SOURCE="claudeCode"
+case "$TRANSCRIPT" in */.codex/sessions/*) SOURCE="codex" ;; esac
+[ -n "${CODEX_THREAD_ID:-}" ] && SOURCE="codex"
 [ -z "$SESSION_ID" ] && exit 0
 [ -z "$HOOK" ] && exit 0
 
@@ -129,10 +132,15 @@ jq -nc \
     --arg agent_type "$AGENT_TYPE" \
     --arg parent_sid "$PARENT_SID" \
     --arg tty "$TERMINAL_TTY" \
-    '{event: $event, session_id: $session_id, cwd: $cwd, ts: $ts, message: $message, transcript_path: $transcript}
+    --arg source "$SOURCE" \
+    '{event: $event, session_id: $session_id, cwd: $cwd, ts: $ts, message: $message, transcript_path: $transcript, source: $source}
      + (if $agent_type  != "" then {agent_type: $agent_type} else {} end)
      + (if $parent_sid  != "" then {parent_session_id: $parent_sid} else {} end)
      + (if $tty         != "" then {tty: $tty} else {} end)' \
     >> "$OUT" 2>/dev/null
+
+# Codex's Stop/SubagentStop hooks require a JSON response on successful exit.
+# An empty object means "observe only" and is accepted by every lifecycle hook.
+[ "$SOURCE" = "codex" ] && printf '{}\n'
 
 exit 0

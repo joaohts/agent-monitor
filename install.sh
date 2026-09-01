@@ -1,6 +1,6 @@
 #!/bin/bash
 # One-shot installer for Agent Monitor.
-# - Verifies prereqs (swiftc, jq, claude CLI)
+# - Verifies prereqs (swiftc, jq, and at least one of Claude Code / Codex)
 # - Builds AgentMonitor.app
 # - Merges hook config into ~/.claude/settings.json (idempotent, with backup)
 set -euo pipefail
@@ -9,6 +9,8 @@ cd "$(dirname "$0")"
 REPO_DIR="$(pwd)"
 HOOK_PATH="$REPO_DIR/hooks/agent-monitor-hook.sh"
 SETTINGS="$HOME/.claude/settings.json"
+CODEX_HOOKS="$HOME/.codex/hooks.json"
+CODEX_CONFIG="$HOME/.codex/config.toml"
 
 # Yes/No prompt. Prompt text goes to the tty (so it's not swallowed by command
 # substitution); only Y/N is emitted on stdout. Falls back to the default when
@@ -100,7 +102,9 @@ echo "==> Checking prerequisites..."
 missing=()
 command -v swiftc >/dev/null 2>&1 || missing+=("Swift compiler — run: xcode-select --install")
 command -v jq     >/dev/null 2>&1 || missing+=("jq — run: brew install jq")
-command -v claude >/dev/null 2>&1 || missing+=("claude CLI — install from https://claude.ai/code")
+if ! command -v claude >/dev/null 2>&1 && ! command -v codex >/dev/null 2>&1; then
+    missing+=("an agent CLI — install Claude Code or Codex")
+fi
 
 if [ ${#missing[@]} -gt 0 ]; then
     echo "    ✗ missing prerequisites:"
@@ -109,7 +113,10 @@ if [ ${#missing[@]} -gt 0 ]; then
     echo "Install the above and re-run ./install.sh"
     exit 1
 fi
-echo "    ✓ swiftc, jq, claude all found"
+agents=()
+command -v claude >/dev/null 2>&1 && agents+=("Claude Code")
+command -v codex  >/dev/null 2>&1 && agents+=("Codex")
+echo "    ✓ swiftc, jq, ${agents[*]} found"
 echo
 
 # ── 2. Stable signing identity (so the first build is signed with it) ───────
@@ -141,7 +148,8 @@ fi
 echo
 
 # ── 4. Merge hooks into ~/.claude/settings.json ─────────────────────────────
-echo "==> Configuring hooks in $SETTINGS..."
+if command -v claude >/dev/null 2>&1; then
+echo "==> Configuring Claude Code hooks in $SETTINGS..."
 mkdir -p "$(dirname "$SETTINGS")"
 [ -f "$SETTINGS" ] || echo '{}' > "$SETTINGS"
 
@@ -179,22 +187,92 @@ else
     exit 1
 fi
 echo
+else
+    echo "==> Claude Code not found — skipping Claude hook registration."
+    BACKUP="(not created — Claude Code is not installed)"
+    echo
+fi
 
-# ── 5. Ghostty integration (optional; only if Ghostty is installed) ─────────
+# ── 5. Merge supported hooks into ~/.codex/hooks.json ───────────────────────
+if command -v codex >/dev/null 2>&1; then
+    echo "==> Configuring Codex hooks in $CODEX_HOOKS..."
+    mkdir -p "$(dirname "$CODEX_HOOKS")"
+    [ -f "$CODEX_HOOKS" ] || echo '{"hooks":{}}' > "$CODEX_HOOKS"
+    CODEX_BACKUP="$CODEX_HOOKS.bak.$(date +%Y%m%d_%H%M%S)"
+    cp "$CODEX_HOOKS" "$CODEX_BACKUP"
+    echo "    backup saved: $CODEX_BACKUP"
+
+    TMP_CODEX=$(mktemp)
+    jq --arg cmd "$HOOK_PATH" '
+    def add_hook(name):
+        if ([.hooks[name][]?.hooks[]?.command] | any(. == $cmd)) then .
+        else .hooks[name] = ((.hooks[name] // []) + [{"hooks":[{"type":"command","command":$cmd}]}]) end;
+    (.hooks //= {})
+    | add_hook("SessionStart")
+    | add_hook("UserPromptSubmit")
+    | add_hook("PermissionRequest")
+    | add_hook("Stop")
+    | add_hook("SessionEnd")
+    | add_hook("SubagentStart")
+    | add_hook("SubagentStop")
+    ' "$CODEX_HOOKS" > "$TMP_CODEX"
+    if jq -e . "$TMP_CODEX" >/dev/null 2>&1; then
+        mv "$TMP_CODEX" "$CODEX_HOOKS"
+        echo "    ✓ registered: SessionStart, UserPromptSubmit, PermissionRequest, Stop, SessionEnd, SubagentStart, SubagentStop"
+    else
+        echo "    ✗ jq produced invalid JSON; hooks.json untouched"
+        rm -f "$TMP_CODEX"
+        exit 1
+    fi
+    echo
+else
+    echo "==> Codex CLI not found — skipping Codex hook registration."
+    echo
+fi
+
+# ── 6. Ghostty integration (optional; only if Ghostty is installed) ─────────
 GHOSTTY_APP="/Applications/Ghostty.app"
 GCFG="$HOME/.config/ghostty/config"
 if [ -d "$GHOSTTY_APP" ]; then
     echo "==> Ghostty detected — optional jump-to-tab / tab-title setup"
     if [ "$(ask 'Enable jump-to-tab + agent-monitor-owned tab titles (recommended)?' Y)" = "Y" ]; then
 
-        if [ "$(ask 'Let agent-monitor own the tab title? (sets CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1)' Y)" = "Y" ]; then
-            TMP2=$(mktemp)
-            if jq '.env = ((.env // {}) + {"CLAUDE_CODE_DISABLE_TERMINAL_TITLE":"1"})' "$SETTINGS" > "$TMP2" \
-               && jq -e . "$TMP2" >/dev/null 2>&1; then
-                mv "$TMP2" "$SETTINGS"
-                echo "    ✓ CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1 (applies to NEW sessions)"
-            else
-                rm -f "$TMP2"; echo "    ✗ couldn't update env; skipped"
+        if [ "$(ask 'Let agent-monitor own Claude/Codex tab titles?' Y)" = "Y" ]; then
+            if command -v claude >/dev/null 2>&1; then
+                TMP2=$(mktemp)
+                if jq '.env = ((.env // {}) + {"CLAUDE_CODE_DISABLE_TERMINAL_TITLE":"1"})' "$SETTINGS" > "$TMP2" \
+                   && jq -e . "$TMP2" >/dev/null 2>&1; then
+                    mv "$TMP2" "$SETTINGS"
+                    echo "    ✓ Claude terminal titles disabled (applies to NEW sessions)"
+                else
+                    rm -f "$TMP2"; echo "    ✗ couldn't update Claude title setting; skipped"
+                fi
+            fi
+            if command -v codex >/dev/null 2>&1; then
+                mkdir -p "$(dirname "$CODEX_CONFIG")"
+                [ -f "$CODEX_CONFIG" ] || : > "$CODEX_CONFIG"
+                cp "$CODEX_CONFIG" "$CODEX_CONFIG.bak.$(date +%Y%m%d_%H%M%S)"
+                TMP_CODEX_CONFIG=$(mktemp)
+                awk '
+                    BEGIN { in_tui=0; saw_tui=0; wrote=0 }
+                    /^\[tui\][[:space:]]*$/ { in_tui=1; saw_tui=1; print; next }
+                    /^\[/ {
+                        if (in_tui && !wrote) { print "terminal_title = []"; wrote=1 }
+                        in_tui=0
+                    }
+                    in_tui && /^[[:space:]]*terminal_title[[:space:]]*=/ {
+                        if (!wrote) { print "terminal_title = []"; wrote=1 }
+                        next
+                    }
+                    { print }
+                    END {
+                        if (in_tui && !wrote) print "terminal_title = []"
+                        else if (!saw_tui) print "\n[tui]\nterminal_title = []"
+                    }
+                ' "$CODEX_CONFIG" > "$TMP_CODEX_CONFIG"
+                mv "$TMP_CODEX_CONFIG" "$CODEX_CONFIG"
+                chmod 600 "$CODEX_CONFIG"
+                echo "    ✓ Codex terminal titles disabled (applies to NEW sessions)"
             fi
         fi
 
@@ -245,8 +323,8 @@ echo
 cat <<EOF
 ==> Installation complete.
 
-The floating window should now be visible. New Claude Code sessions you start in
-any terminal will appear in it automatically.
+The floating window should now be visible. New Claude Code and Codex sessions you
+start in any terminal will appear in it automatically.
 
 First-launch notes:
   - On first AI title generation, macOS may prompt for Full Disk Access.
@@ -260,6 +338,7 @@ Useful paths:
   debug:  ~/.claude/agent-monitor-debug.log
   config: $SETTINGS
   backup: $BACKUP
+  Codex hooks: $CODEX_HOOKS
 
 To rebuild after editing AgentMonitor.swift:
   ./build.sh
