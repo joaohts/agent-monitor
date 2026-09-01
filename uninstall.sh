@@ -19,6 +19,7 @@ KEEP_DATA=0
 REPO_DIR="$(pwd)"
 HOOK_PATH="$REPO_DIR/hooks/agent-monitor-hook.sh"
 SETTINGS="$HOME/.claude/settings.json"
+CODEX_HOOKS="$HOME/.codex/hooks.json"
 APP_LINK="$HOME/Applications/AgentMonitor.app"
 EVENTS_LOG="$HOME/.claude/agents.jsonl"
 DEBUG_LOG="$HOME/.claude/agent-monitor-debug.log"
@@ -58,7 +59,40 @@ else
 fi
 echo
 
-# ── 3. Remove our hook entries from settings.json ───────────────────────────
+# ── 3a. Remove our Codex hook entries ───────────────────────────────────────
+if [ -f "$CODEX_HOOKS" ] && command -v jq >/dev/null 2>&1; then
+    CODEX_BACKUP="$CODEX_HOOKS.bak.$(date +%Y%m%d_%H%M%S)"
+    cp "$CODEX_HOOKS" "$CODEX_BACKUP"
+    echo "==> Removing our hook entries from $CODEX_HOOKS..."
+    echo "    backup saved: $CODEX_BACKUP"
+    TMP_CODEX=$(mktemp)
+    jq --arg cmd "$HOOK_PATH" '
+    def filter_event(name):
+        if .hooks[name] then
+            .hooks[name] |= map(select((.hooks // []) | any(.command == $cmd) | not))
+            | if (.hooks[name] | length) == 0 then del(.hooks[name]) else . end
+        else . end;
+    filter_event("SessionStart")
+    | filter_event("UserPromptSubmit")
+    | filter_event("PermissionRequest")
+    | filter_event("Stop")
+    | filter_event("SessionEnd")
+    | filter_event("SubagentStart")
+    | filter_event("SubagentStop")
+    | if (.hooks // {}) == {} then del(.hooks) else . end
+    ' "$CODEX_HOOKS" > "$TMP_CODEX"
+    if jq -e . "$TMP_CODEX" >/dev/null 2>&1; then
+        mv "$TMP_CODEX" "$CODEX_HOOKS"
+        echo "    ✓ Codex hooks unregistered (other hooks preserved)"
+    else
+        echo "    ✗ jq produced invalid JSON; Codex hooks untouched"
+        rm -f "$TMP_CODEX"
+        exit 1
+    fi
+fi
+echo
+
+# ── 3b. Remove our Claude hook entries from settings.json ───────────────────
 if [ ! -f "$SETTINGS" ]; then
     echo "==> No $SETTINGS, skipping hook unregistration"
 else
