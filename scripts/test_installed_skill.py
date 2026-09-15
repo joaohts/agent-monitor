@@ -24,6 +24,22 @@ Codex starts with `comms codex`; then use `comms open`.
 
 
 class InstalledSkillTest(unittest.TestCase):
+    def test_existing_command_elsewhere_keeps_side_by_side_name(self):
+        source = (Path(__file__).resolve().parent / 'install-local-comms.sh').read_text()
+        discovery = source.split('# BEGIN COMMS_COMMAND_DISCOVERY\n', 1)[1].split('# END COMMS_COMMAND_DISCOVERY', 1)[0]
+        with tempfile.TemporaryDirectory(prefix='comms-command-discovery-') as directory:
+            missing_local = str(Path(directory) / 'not-installed/comms')
+            # Simulate command -v finding the existing command outside the
+            # destination directory, without changing PATH or running legacy code.
+            script = discovery + '''
+command() { [[ "$1" == -v && "$2" == comms ]] && printf '/usr/local/bin/comms\\n'; }
+comms_command_present "$1"
+'''
+            found = subprocess.run(['/bin/bash', '-c', script, 'test', missing_local])
+            self.assertEqual(found.returncode, 0)
+            absent = subprocess.run(['/bin/bash', '-c', discovery + '\ncommand() { return 1; }; comms_command_present "$1"', 'test', missing_local])
+            self.assertNotEqual(absent.returncode, 0)
+
     def test_side_by_side_resolver_and_launcher(self):
         repo = Path(__file__).resolve().parent.parent
         monitor = (repo / 'scripts/install-local-comms.sh').is_file()

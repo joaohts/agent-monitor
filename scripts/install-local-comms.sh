@@ -7,13 +7,19 @@ metadata="$config_dir/comms-install.json"
 command_name=comms
 skill_name=open-comms
 
+# BEGIN COMMS_COMMAND_DISCOVERY
+comms_command_present() {
+  [[ -e "$1" || -L "$1" ]] || command -v comms >/dev/null 2>&1
+}
+# END COMMS_COMMAND_DISCOVERY
+
 if [[ -f "$metadata" ]]; then
   command_name=$(python3 -c 'import json,pathlib,sys;print(pathlib.Path(json.load(open(sys.argv[1]))["command"]).name)' "$metadata")
   skill_name=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["skill"])' "$metadata")
 else
   # Existing installations remain usable during explicit migration. A new
   # command and skill avoid redirecting active legacy receivers silently.
-  if [[ -e "$HOME/.local/bin/comms" || -L "$HOME/.local/bin/comms" ]]; then command_name=comms-v1; fi
+  if comms_command_present "$HOME/.local/bin/comms"; then command_name=comms-v1; fi
   if [[ -f "$HOME/.claude/skills/open-comms/SKILL.md" || -f "${CODEX_HOME:-$HOME/.codex}/skills/open-comms/SKILL.md" ]]; then skill_name=open-comms-v1; fi
 fi
 case "$command_name:$skill_name" in *[!A-Za-z0-9:._-]*) printf 'Invalid saved comms installation metadata\n' >&2; exit 1 ;; esac
