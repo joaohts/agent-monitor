@@ -102,6 +102,7 @@ echo "==> Checking prerequisites..."
 missing=()
 command -v swiftc >/dev/null 2>&1 || missing+=("Swift compiler — run: xcode-select --install")
 command -v jq     >/dev/null 2>&1 || missing+=("jq — run: brew install jq")
+command -v python3 >/dev/null 2>&1 || missing+=("Python 3 — required by the verified comms installer")
 if ! command -v claude >/dev/null 2>&1 && ! command -v codex >/dev/null 2>&1; then
     missing+=("an agent CLI — install Claude Code or Codex")
 fi
@@ -127,7 +128,10 @@ echo
 # ── 3. Build ─────────────────────────────────────────────────────────────────
 echo "==> Building AgentMonitor.app..."
 chmod +x "$HOOK_PATH" build.sh
-./build.sh
+NO_LAUNCH=1 ./build.sh
+echo "==> Installing the bundled local comms node..."
+bash scripts/install-local-comms.sh "$REPO_DIR/AgentMonitor.app/Contents/Resources/CommsNode"
+open "$REPO_DIR/AgentMonitor.app"
 echo
 
 # ── 3. Verify hook script runs cleanly with sample input ────────────────────

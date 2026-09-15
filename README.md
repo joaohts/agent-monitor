@@ -2,7 +2,23 @@
 
 A native macOS floating window that shows live status of every running coding-agent session across your machine — **Claude Code, Codex, and Cursor**, side by side in one list. Status, runtime, AI-generated titles, and live "what's happening now" descriptions. Claude Code and Codex are driven by hooks writing JSON-line events; Cursor is read live from its local SQLite store (no hooks needed). Each row is tagged with its source.
 
-Built in a single Swift file with no external dependencies (no Xcode project, no Swift Package Manager). Compiles to a `.app` bundle in ~3 seconds.
+Built with native SwiftUI and a small comms integration module (no Xcode project or Swift Package Manager). The app bundles a pinned standalone comms node release; the node runs independently under the user's service supervisor.
+
+## Local agent communications
+
+Every installation includes local comms for Claude and supported Codex sessions.
+The Comms dashboard reads node presence, persistent identities, and message history;
+Settings manages the machine nickname, optional broker, pinned peer keys, and
+directional messaging/history grants. Local communication needs no broker account.
+
+- Claude receives through a stream owned by its Monitor tool.
+- Codex requires its supported app-server tool-output receiver; the GUI never types
+  peer text as a user message. Unsupported sessions show the required setup.
+- Closing, freezing, or rebuilding the viewer does not stop the node or its receivers.
+- Existing legacy commands, credentials, and history remain separate during migration.
+
+See [node setup and migration](docs/comms-connection.md) for release acquisition,
+installation paths, pairing, updates, rollback, and a direct independence test.
 
 > **New:** floating bubbles overlay, jump-to-session hotkeys (Ghostty), custom + AI-generated tags, and native macOS notifications. See **[docs/features-and-setup.md](docs/features-and-setup.md)** for the full feature map, portability tiers (what works without Ghostty), and the guided setup wizard.
 
@@ -31,9 +47,9 @@ self-updating report** of what each one is *doing*, in an IDE-style workspace.
 
 It's a drop-in upgrade — **rebuild and you're done:**
 
-- **Installation is unchanged.** `./build.sh` as before. **No hook changes, no
-  `settings.json` changes, no new dependencies/frameworks** — the only changed source is
-  `AgentMonitor.swift`. Your existing hooks keep working as-is.
+- **Existing activity hooks keep working.** `./build.sh` also bundles the pinned
+  comms release. Source builders need authorized release access or a provided
+  release directory; the finished app needs no GitHub credentials.
 - **No new hard requirements.** The summary agent uses an already logged-in `claude`
   or `codex` CLI. Claude is preferred when both exist; Codex is a fully independent
   fallback. An Anthropic API key file remains an optional metered Haiku route.
@@ -199,6 +215,9 @@ Hooks are external shell scripts. Appending one JSON line is trivial (`echo >> f
 - macOS 13+ (uses `URL.appending(path:)`)
 - Xcode Command Line Tools (`swiftc`, `xcodebuild`) — install with `xcode-select --install`
 - `jq` — `brew install jq`
+- Python 3 for release checksum verification and per-user service installation
+- Source builds: access to the pinned comms release through `gh`, or
+  `COMMS_RELEASE_DIR=/path/to/verified-release-files`
 - At least one logged-in agent CLI: `claude` or `codex`. When both are present,
   Agent Monitor prefers Claude for local AI labels; Codex is the automatic fallback.
 
@@ -275,6 +294,7 @@ The first time you trigger an AI title (or live status), macOS may prompt for **
 ```bash
 ./build.sh           # debug build (~3s, recommended for iteration)
 RELEASE=1 ./build.sh # optimized build (~15s)
+NO_LAUNCH=1 ./build.sh # verify without closing/launching the current GUI
 ```
 
 ---

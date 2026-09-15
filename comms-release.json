@@ -1,0 +1,9 @@
+{
+  "repository": "joaohts/comms",
+  "version": "v0.1.0",
+  "api_version": 1,
+  "sha256": {
+    "comms_Darwin_arm64.tar.gz": "",
+    "comms_Darwin_amd64.tar.gz": ""
+  }
+}

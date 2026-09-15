@@ -1,0 +1,26 @@
+name: Comms integration
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  viewer:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shell validation
+        run: bash -n build.sh install.sh scripts/bundle-comms.sh scripts/install-local-comms.sh
+      - name: Client contract and process isolation
+        run: |
+          swiftc CommsNodeClient.swift scripts/validate-comms-client.swift -o /tmp/validate-comms-client
+          /tmp/validate-comms-client
+      - name: Release integrity without private credentials
+        run: python3 scripts/test-comms-bundle.py
+      - name: Compile GUI without private release access
+        env:
+          COMMS_SKIP_BUNDLE: '1'
+          NO_LAUNCH: '1'
+          ADHOC_SIGN: '1'
+        run: ./build.sh
