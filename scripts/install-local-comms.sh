@@ -6,6 +6,19 @@ config_dir="$HOME/.config/agent-monitor"
 metadata="$config_dir/comms-install.json"
 command_name=comms
 skill_name=open-comms
+skill_backup_root="${XDG_STATE_HOME:-$HOME/.local/state}/comms/skill-backups"
+
+# BEGIN COMMS_SKILL_BACKUP
+backup_comms_skill() {
+  local comms_skill_source="$1" comms_skill_harness="$2" comms_skill_name="$3" comms_backup_root="$4"
+  local comms_backup_batch
+  comms_backup_batch=$(umask 077; mkdir -p "$comms_backup_root"; mktemp -d "$comms_backup_root/$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")
+  mkdir -m 700 "$comms_backup_batch/$comms_skill_harness"
+  cp -Rp "$comms_skill_source" "$comms_backup_batch/$comms_skill_harness/$comms_skill_name"
+  printf 'Preserved skill backup: %s\n' "$comms_backup_batch/$comms_skill_harness/$comms_skill_name" >&2
+}
+# END COMMS_SKILL_BACKUP
+
 
 # BEGIN COMMS_COMMAND_DISCOVERY
 comms_command_present() {
@@ -38,11 +51,12 @@ for line in reversed(sys.stdin.read().splitlines()):
 else: raise SystemExit("Installer did not report a ready node data directory")
 ' <<< "$install_output")
 
-for skill_root in "$HOME/.claude/skills" "${CODEX_HOME:-$HOME/.codex}/skills"; do
+for skill_harness in claude codex; do
+  if [[ "$skill_harness" == claude ]]; then skill_root="$HOME/.claude/skills"; else skill_root="${CODEX_HOME:-$HOME/.codex}/skills"; fi
   target="$skill_root/$skill_name"
   if [[ -e "$target/SKILL.md" ]] && ! grep -q 'Agent Monitor managed comms v1' "$target/SKILL.md"; then
     # Preserve any manually installed/custom skill rather than claiming it.
-    cp -Rp "$target" "$target.backup-$(date -u +%Y%m%dT%H%M%SZ)"
+    backup_comms_skill "$target" "$skill_harness" "$skill_name" "$skill_backup_root"
   fi
   mkdir -p "$target"
   cp -R "$bundle/integration/open-comms/." "$target/"
@@ -50,11 +64,13 @@ for skill_root in "$HOME/.claude/skills" "${CODEX_HOME:-$HOME/.codex}/skills"; d
 # BEGIN COMMS_SKILL_RENDER
 import json,pathlib,re,sys
 p=pathlib.Path(sys.argv[1]); command=str(pathlib.Path(sys.argv[2]).absolute())
-skill,marker=sys.argv[3:5]
+skill,marker=sys.argv[3:5]; label=pathlib.Path(command).name
 escaped=re.sub(r'([\\$`"])',r'\\\1',command)
 resolver='${COMMS_BIN:-"'+escaped+'"}'
 executable='"'+resolver+'"'
 text=p.read_text().replace('name: open-comms\n','name: '+skill+'\n',1)
+preamble='Resolve the CLI from `COMMS_BIN` when set, otherwise use `comms`. In all\ncommands below, `comms` means that resolved executable. Quote the executable\nas `"${COMMS_BIN:-comms}"` in shell commands; never overwrite PATH or fall back\nto a legacy board when the new node is unavailable.\n'
+text=text.replace(preamble,'Resolve the CLI from `COMMS_BIN` when set; otherwise use `'+command+'`.\nIn prose, `'+label+'` names that executable. Shell examples honor the same override.\nNever change PATH or fall back to a legacy board when the node is unavailable.\n',1)
 def monitor(match):
     value=json.loads(match.group('command')).replace('${COMMS_BIN:-comms}',resolver)
     value=re.sub(r'^comms(?=\s|$)',lambda _:executable,value)
@@ -62,8 +78,10 @@ def monitor(match):
 text=re.sub(r'(?P<prefix>Monitor\(\{\s*command:\s*)(?P<command>"(?:\\.|[^"\\])*")',monitor,text)
 text=text.replace('${COMMS_BIN:-comms}',resolver)
 text=re.sub(r'(?m)^comms(?=\s)',lambda _:executable,text)
-text=re.sub(r'`comms(?= |`)',lambda _:'`'+executable,text)
-text+='\n<!-- '+marker+' -->\n\nInstalled executable: `'+command+'`. COMMS_BIN may explicitly override it.\n'
+text=re.sub(r'`comms(?= |`)',lambda _:'`'+label,text)
+codex_sentence='**Codex:** launch or explicitly resume through `'+label+' codex` first.'
+text=text.replace(codex_sentence,codex_sentence+'\n\n```sh\n'+executable+' codex\n```\n',1)
+text+='\n<!-- '+marker+' -->\n'
 p.write_text(text)
 # END COMMS_SKILL_RENDER
 PY

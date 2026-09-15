@@ -13,13 +13,18 @@ FIXTURE = r"""---
 name: open-comms
 description: Open agent communications.
 ---
-Resolve from COMMS_BIN when set, otherwise use `comms`.
-Quote the executable as `"${COMMS_BIN:-comms}"`.
+Resolve the CLI from `COMMS_BIN` when set, otherwise use `comms`. In all
+commands below, `comms` means that resolved executable. Quote the executable
+as `"${COMMS_BIN:-comms}"` in shell commands; never overwrite PATH or fall back
+to a legacy board when the new node is unavailable.
+
 ```sh
 comms open ALIAS
 ```
+```text
 Monitor({command: "\"${COMMS_BIN:-comms}\" stream ALIAS", persistent: true})
-Codex starts with `comms codex`; then use `comms open`.
+```
+**Codex:** launch or explicitly resume through `comms codex` first. The launcher stays independent.
 """
 
 
@@ -39,6 +44,29 @@ comms_command_present "$1"
             self.assertEqual(found.returncode, 0)
             absent = subprocess.run(['/bin/bash', '-c', discovery + '\ncommand() { return 1; }; comms_command_present "$1"', 'test', missing_local])
             self.assertNotEqual(absent.returncode, 0)
+
+    def test_backups_stay_outside_skill_discovery(self):
+        repo = Path(__file__).resolve().parent.parent
+        monitor = (repo / 'scripts/install-local-comms.sh').is_file()
+        source = (repo / ('scripts/install-local-comms.sh' if monitor else 'scripts/install.sh')).read_text()
+        function = source.split('# BEGIN COMMS_SKILL_BACKUP\n', 1)[1].split('# END COMMS_SKILL_BACKUP', 1)[0]
+        with tempfile.TemporaryDirectory(prefix='comms-skill-backup-') as directory:
+            root = Path(directory)
+            skill = root / 'discovered-skills/open-comms-v1'
+            skill.mkdir(parents=True)
+            (skill / 'SKILL.md').write_text('Original skill content.\n')
+            backups = root / 'private-state/comms/skill-backups'
+            script = 'set -euo pipefail\n' + function + '\nbackup_comms_skill "$1" claude open-comms-v1 "$2"'
+            for _ in range(2):
+                subprocess.run(['/bin/bash', '-c', script, 'test', str(skill), str(backups)],
+                               capture_output=True, text=True, check=True)
+            self.assertEqual(len(list((root / 'discovered-skills').glob('*/SKILL.md'))), 1)
+            saved = list(backups.glob('*/claude/open-comms-v1/SKILL.md'))
+            self.assertEqual(len(saved), 2)
+            for path in saved:
+                self.assertEqual(path.read_text(), 'Original skill content.\n')
+                self.assertEqual(path.parents[2].stat().st_mode & 0o077, 0)
+            self.assertEqual((skill / 'SKILL.md').read_text(), 'Original skill content.\n')
 
     def test_side_by_side_resolver_and_launcher(self):
         repo = Path(__file__).resolve().parent.parent
@@ -73,7 +101,11 @@ comms_command_present "$1"
             self.assertNotRegex(text, r'`comms(?: |`)')
             self.assertEqual(legacy.read_text(), 'Legacy skill must remain unchanged.\n')
             opener = re.search(r'```sh\n([^\n]+)', text).group(1)
-            launcher = re.search(r'`([^`\n]+ codex)`', text).group(1)
+            shell_blocks = re.findall(r'```sh\n(.*?)```', text, re.S)
+            launcher = next(line for block in shell_blocks for line in block.splitlines() if line.endswith(' codex'))
+            self.assertIn('`comms-v1 codex`', text)
+            prose = re.sub(r'```.*?```', '', text, flags=re.S)
+            self.assertNotIn('${COMMS_BIN:-', prose)
             monitor_literal = re.search(r'Monitor\(\{\s*command:\s*("(?:\\.|[^"\\])*")', text).group(1)
             stream = json.loads(monitor_literal)
             env = os.environ.copy()
