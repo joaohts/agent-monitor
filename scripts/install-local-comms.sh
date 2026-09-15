@@ -40,13 +40,26 @@ for skill_root in "$HOME/.claude/skills" "${CODEX_HOME:-$HOME/.codex}/skills"; d
   fi
   mkdir -p "$target"
   cp -R "$bundle/integration/open-comms/." "$target/"
-  python3 - "$target/SKILL.md" "$installed" "$skill_name" <<'PY'
-import pathlib,re,sys
-p=pathlib.Path(sys.argv[1]); command,skill=sys.argv[2:]
+  python3 - "$target/SKILL.md" "$installed" "$skill_name" 'Agent Monitor managed comms v1' <<'PY'
+# BEGIN COMMS_SKILL_RENDER
+import json,pathlib,re,sys
+p=pathlib.Path(sys.argv[1]); command=str(pathlib.Path(sys.argv[2]).absolute())
+skill,marker=sys.argv[3:5]
+escaped=re.sub(r'([\\$`"])',r'\\\1',command)
+resolver='${COMMS_BIN:-"'+escaped+'"}'
+executable='"'+resolver+'"'
 text=p.read_text().replace('name: open-comms\n','name: '+skill+'\n',1)
-text=re.sub(r'\bcomms (?=(open|stream|identities|who|post|status|inbox|log|close|export|pair|grant|ungrant|codex|broker|events|agents|sessions|serve|prune)\b)',pathlib.Path(command).name+' ',text)
-text+='\n<!-- Agent Monitor managed comms v1 -->\n\nInstalled executable: `'+command+'`. Use this absolute path if the command is absent from PATH.\n'
+def monitor(match):
+    value=json.loads(match.group('command')).replace('${COMMS_BIN:-comms}',resolver)
+    value=re.sub(r'^comms(?=\s|$)',lambda _:executable,value)
+    return match.group('prefix')+json.dumps(value,ensure_ascii=False)
+text=re.sub(r'(?P<prefix>Monitor\(\{\s*command:\s*)(?P<command>"(?:\\.|[^"\\])*")',monitor,text)
+text=text.replace('${COMMS_BIN:-comms}',resolver)
+text=re.sub(r'(?m)^comms(?=\s)',lambda _:executable,text)
+text=re.sub(r'`comms(?= |`)',lambda _:'`'+executable,text)
+text+='\n<!-- '+marker+' -->\n\nInstalled executable: `'+command+'`. COMMS_BIN may explicitly override it.\n'
 p.write_text(text)
+# END COMMS_SKILL_RENDER
 PY
 done
 
