@@ -9,6 +9,7 @@ struct NodeStatus: Decodable {
     let name: String
     let brokerEnabled: Bool
     let brokerConnected: Bool
+    let brokerUrl: String?
     let dataDir: String
 }
 

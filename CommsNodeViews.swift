@@ -170,6 +170,7 @@ struct CommsDashboardView: View {
     }
     private var agentsPane: some View {
         List(selection: $selected) {
+            Label("All local history", systemImage: "clock.arrow.circlepath").tag("__local_history__")
             Section("Local agents") {
                 ForEach(node.agents.filter { $0.retiredAt == nil }) { agent in
                     HStack(spacing: 8) {
@@ -201,7 +202,7 @@ struct CommsDashboardView: View {
     private var historyPane: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
-                Text(selected.flatMap { id in node.agents.first(where: { $0.id == id })?.alias } ?? selected ?? "Message history").font(.headline)
+                Text(historyTitle).font(.headline)
                 Spacer()
                 if loadingHistory { ProgressView().controlSize(.small) }
             }.padding(12)
@@ -237,12 +238,17 @@ struct CommsDashboardView: View {
             ?? message.senderAgentId
         return machine + ":" + alias
     }
+    private var historyTitle: String {
+        if selected == "__local_history__" { return "All local history" }
+        return selected.flatMap { id in node.agents.first(where: { $0.id == id })?.alias } ?? selected ?? "Message history"
+    }
     private func loadHistory(older: Bool = false) {
         guard let selected else { history = []; cursor = nil; return }
         if older && loadingHistory { return }
         let generation = UUID(); historyGeneration = generation
         loadingHistory = true; historyError = ""
-        var args = ["log", selected, "--operator", "--limit", "50"]
+        var args = ["log", "--operator", "--limit", "50"]
+        if selected != "__local_history__" { args.append(selected) }
         if older, let cursor { args += ["--cursor", cursor] }
         Task {
             do {
@@ -313,7 +319,15 @@ struct CommsNodeSettingsView: View {
             if !node.error.isEmpty { Text(node.error).font(.caption).foregroundStyle(.red).textSelection(.enabled) }
             Text("Claude receives through its own Monitor stream. Codex requires the supported app-server tool-output integration. Agent Monitor never types peer text as a user message.").font(.caption).foregroundStyle(.secondary)
         }
-        .onAppear { machineName = node.status?.name ?? ""; node.refresh() }
+        .onAppear {
+            machineName = node.status?.name ?? ""
+            brokerURL = node.status?.brokerUrl ?? ""
+            node.refresh()
+        }
+        .onChange(of: node.status?.machineId) { _ in
+            machineName = node.status?.name ?? ""
+            brokerURL = node.status?.brokerUrl ?? ""
+        }
     }
     private func peerRow(_ peer: NodePeer) -> some View {
         VStack(alignment: .leading, spacing: 5) {
