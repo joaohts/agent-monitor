@@ -196,7 +196,10 @@ Hooks are external shell scripts. Appending one JSON line is trivial (`echo >> f
 
 | Path | Purpose |
 |---|---|
-| `AgentMonitor.swift` | Single-file SwiftUI app (~700 lines) |
+| `AgentMonitor.swift` | Main SwiftUI viewer, activity providers, hooks, and session navigation |
+| `CommsNodeClient.swift` | Bounded local CLI/API client and observational event stream |
+| `CommsNodeViews.swift` | Node status, identities, history, pairing, and directional grants |
+| `comms-release.json` | Pinned comms release, API version, and archive checksums |
 | `build.sh` | Compiles to `.app` bundle, kills prior instance, launches |
 | `hooks/agent-monitor-hook.sh` | The Claude Code hook script |
 | `~/.claude/agents.jsonl` | Event log (the database) |
