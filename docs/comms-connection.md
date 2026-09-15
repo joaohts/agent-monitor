@@ -18,7 +18,7 @@ The node repository may be private. A source builder can use their own existing
 GitHub CLI authentication, or supply an already downloaded release directory:
 
 ```sh
-gh release download v0.1.0 --repo joaohts/comms \
+gh release download v0.1.1 --repo joaohts/comms \
   --pattern 'comms_Darwin_*.tar.gz' --pattern SHA256SUMS --dir /path/to/release
 COMMS_RELEASE_DIR=/path/to/release NO_LAUNCH=1 ./build.sh
 ```
@@ -95,6 +95,11 @@ On a machine with an existing `~/.local/bin/comms`, installation creates
 `open-comms-v1`. Its instructions contain the exact installed executable path.
 Existing receivers keep using the legacy command/skill while new sessions can
 test `/open-comms-v1 worker` and `comms-v1 who`.
+
+Skill backups live outside discovery roots, under
+`~/.local/state/comms/skill-backups/<unique timestamp>/<claude-or-codex>/<skill>`,
+or the configured `XDG_STATE_HOME`. They preserve old content without registering
+a duplicate live skill.
 
 After verifying migration, the owner can explicitly switch the default command
 and skill, preserving the old files as backups. The installer never rewrites
