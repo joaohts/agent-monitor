@@ -18,7 +18,7 @@ The node repository may be private. A source builder can use their own existing
 GitHub CLI authentication, or supply an already downloaded release directory:
 
 ```sh
-gh release download v0.1.1 --repo joaohts/comms \
+gh release download v0.1.3 --repo joaohts/comms \
   --pattern 'comms_Darwin_*.tar.gz' --pattern SHA256SUMS --dir /path/to/release
 COMMS_RELEASE_DIR=/path/to/release NO_LAUNCH=1 ./build.sh
 ```
