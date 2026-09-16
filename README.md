@@ -11,7 +11,7 @@ The Comms dashboard reads node presence, persistent identities, and message hist
 Settings manages the machine nickname, optional broker, pinned peer keys, and
 directional messaging/history grants. Local communication needs no broker account.
 
-- Claude receives through a stream owned by its Monitor tool.
+- Claude's node settings select a 30-minute Monitor (default) or experimental MCP channel. The `claude` shortcut follows the saved mode on the next launch/resume, supplying MCP configuration and the development-channel flag only in channel mode. Existing sessions keep their current receiver.
 - Codex requires its supported app-server tool-output receiver; the GUI never types
   peer text as a user message. Unsupported sessions show the required setup.
 - Closing, freezing, or rebuilding the viewer does not stop the node or its receivers.

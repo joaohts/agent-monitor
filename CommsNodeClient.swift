@@ -11,6 +11,7 @@ struct NodeStatus: Decodable {
     let brokerConnected: Bool
     let brokerUrl: String?
     let brokerServiceKeyConfigured: Bool?
+    let claudeReceiver: String?
     let dataDir: String
     var brokerServiceKeyDescription: String {
         switch brokerServiceKeyConfigured {

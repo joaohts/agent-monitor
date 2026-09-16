@@ -108,6 +108,10 @@ p.write_text(text)
 PY
 done
 
+if [[ -f "$bundle/integration/claude-alias.py" ]]; then
+  python3 "$bundle/integration/claude-alias.py" "$installed" >&2
+fi
+
 umask 077
 mkdir -p "$config_dir"
 python3 - "$metadata" "$installed" "$skill_name" "$data_dir" <<'PY'

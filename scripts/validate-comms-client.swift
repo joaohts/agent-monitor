@@ -8,7 +8,13 @@ struct ValidateCommsClient {
         let status = try CommsNodeClient.decode(NodeStatus.self, from: statusData)
         precondition(status.machineId == "m_test" && status.apiVersion == 1)
         precondition(status.brokerServiceKeyConfigured == nil && status.brokerServiceKeyDescription == "Status unavailable")
+        precondition(status.claudeReceiver == nil)
         var keyedStatus = try JSONSerialization.jsonObject(with: statusData) as! [String: Any]
+        for receiver in ["monitor", "channel"] {
+            keyedStatus["claude_receiver"] = receiver
+            let decoded = try CommsNodeClient.decode(NodeStatus.self, from: JSONSerialization.data(withJSONObject: keyedStatus))
+            precondition(decoded.claudeReceiver == receiver)
+        }
         for configured in [false, true] {
             keyedStatus["broker_service_key_configured"] = configured
             let decoded = try CommsNodeClient.decode(NodeStatus.self, from: JSONSerialization.data(withJSONObject: keyedStatus))
@@ -119,6 +125,13 @@ struct ValidateCommsClient {
         guard status.apiVersion == 1, status.dataDir == directory.path,
               status.brokerServiceKeyConfigured == serviceKeyConfigured else {
             throw NodeCommandError(message: "Live viewer must use its selected data directory and expose the expected safe service-key status.")
+        }
+        if status.claudeReceiver != nil {
+            precondition(status.claudeReceiver == "monitor")
+            _ = try await CommsNodeClient.command(["claude-receiver", "channel"])
+            let channelStatus = try await CommsNodeClient.query(NodeStatus.self, ["status"])
+            precondition(channelStatus.claudeReceiver == "channel")
+            _ = try await CommsNodeClient.command(["claude-receiver", "monitor"])
         }
         _ = try await CommsNodeClient.command(["open", "sender", "--harness", "service"])
         _ = try await CommsNodeClient.command(["open", "brain", "--harness", "service", "--persistent"])

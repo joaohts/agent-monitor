@@ -270,6 +270,7 @@ struct CommsNodeSettingsView: View {
     @ObservedObject private var node = CommsNodeModel.shared
     @State private var machineName = ""
     @State private var brokerURL = ""
+    @State private var claudeReceiver = "monitor"
     @State private var peerAlias = ""
     @State private var exportStatus = ""
 
@@ -288,6 +289,19 @@ struct CommsNodeSettingsView: View {
                     Button("Local only") { node.perform(["broker", "off"], success: "Broker disconnected. Local communication remains available.") }.disabled(node.busy)
                 }
                 Text(status.brokerConnected ? "Broker connected. Grants control remote access." : "Local comms is ready. Configure a broker only when enabling remote communication.").font(.caption).foregroundStyle(.secondary)
+                HStack {
+                    Picker("Claude receiver", selection: $claudeReceiver) {
+                        Text("Monitor (30 minutes)").tag("monitor")
+                        Text("MCP channel (experimental)").tag("channel")
+                    }
+                    Button("Save receiver") {
+                        node.perform(["claude-receiver", claudeReceiver], success: "Claude receiver saved. Applies on the next launch or resume through comms claude.")
+                    }.disabled(node.busy || status.claudeReceiver == nil || status.claudeReceiver == claudeReceiver)
+                }.disabled(status.claudeReceiver == nil)
+                Text(status.claudeReceiver == nil
+                     ? "Update the node to configure Claude's receiver."
+                     : "Used by comms claude and its Claude shortcut on the next launch or resume. Monitor runs for up to 30 minutes before re-arming. The experimental MCP channel stays connected for the session; Claude may require startup confirmation.")
+                    .font(.caption).foregroundStyle(.secondary)
                 HStack {
                     Button("Copy public identity") { exportIdentity() }
                     TextField("Nickname for imported peer", text: $peerAlias)
@@ -328,16 +342,21 @@ struct CommsNodeSettingsView: View {
             }
             if !node.actionStatus.isEmpty { Text(node.actionStatus).font(.caption).textSelection(.enabled) }
             if !node.error.isEmpty { Text(node.error).font(.caption).foregroundStyle(.red).textSelection(.enabled) }
-            Text("Claude receives through its own Monitor stream. Codex requires the supported app-server tool-output integration. Agent Monitor never types peer text as a user message.").font(.caption).foregroundStyle(.secondary)
+            Text("Claude receives through its selected Monitor or MCP channel. Codex uses its app-server tool-output integration. Agent Monitor never types peer text as a user message.").font(.caption).foregroundStyle(.secondary)
         }
         .onAppear {
             machineName = node.status?.name ?? ""
             brokerURL = node.status?.brokerUrl ?? ""
+            claudeReceiver = node.status?.claudeReceiver ?? "monitor"
             node.refresh()
         }
         .onChange(of: node.status?.machineId) { _ in
             machineName = node.status?.name ?? ""
             brokerURL = node.status?.brokerUrl ?? ""
+            claudeReceiver = node.status?.claudeReceiver ?? "monitor"
+        }
+        .onChange(of: node.status?.claudeReceiver) { value in
+            claudeReceiver = value ?? "monitor"
         }
     }
     private func peerRow(_ peer: NodePeer) -> some View {
