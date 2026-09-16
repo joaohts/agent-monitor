@@ -179,6 +179,8 @@ cat <<EOF
 ==> Uninstall complete. Clean slate.
 
 Not auto-revoked (manual cleanup if you want):
+  - The independently installed comms node, identity keys, and message history
+    (stopping the viewer must not interrupt agent communications)
   - TCC permissions (Full Disk Access, etc): System Settings → Privacy & Security
   - settings.json backups (.bak.YYYYMMDD_HHMMSS): kept as safety nets
   - The repo itself ($REPO_DIR): \`rm -rf\` or \`git clean\` manually

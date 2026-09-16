@@ -6,6 +6,26 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# BEGIN AGENT_MONITOR_INSTALL_OPTIONS
+parse_agent_monitor_install_options() {
+    agent_comms_install_options=()
+    while (($#)); do
+        case "$1" in
+            --broker-service-key-file)
+                if (($# < 2)) || [[ -z "$2" ]] || ((${#agent_comms_install_options[@]})); then
+                    printf 'Supply one nonempty --broker-service-key-file PATH.\n' >&2; return 2
+                fi
+                agent_comms_install_options=(--broker-service-key-file "$2"); shift 2 ;;
+            *) printf 'Unsupported installer option. Use --broker-service-key-file PATH when needed.\n' >&2; return 2 ;;
+        esac
+    done
+}
+run_agent_monitor_comms_install() {
+    bash "$1" "$2" ${agent_comms_install_options[@]+"${agent_comms_install_options[@]}"}
+}
+# END AGENT_MONITOR_INSTALL_OPTIONS
+parse_agent_monitor_install_options "$@"
+
 REPO_DIR="$(pwd)"
 HOOK_PATH="$REPO_DIR/hooks/agent-monitor-hook.sh"
 SETTINGS="$HOME/.claude/settings.json"
@@ -102,6 +122,7 @@ echo "==> Checking prerequisites..."
 missing=()
 command -v swiftc >/dev/null 2>&1 || missing+=("Swift compiler — run: xcode-select --install")
 command -v jq     >/dev/null 2>&1 || missing+=("jq — run: brew install jq")
+command -v python3 >/dev/null 2>&1 || missing+=("Python 3 — required by the verified comms installer")
 if ! command -v claude >/dev/null 2>&1 && ! command -v codex >/dev/null 2>&1; then
     missing+=("an agent CLI — install Claude Code or Codex")
 fi
@@ -127,7 +148,10 @@ echo
 # ── 3. Build ─────────────────────────────────────────────────────────────────
 echo "==> Building AgentMonitor.app..."
 chmod +x "$HOOK_PATH" build.sh
-./build.sh
+NO_LAUNCH=1 ./build.sh
+echo "==> Installing the bundled local comms node..."
+run_agent_monitor_comms_install "$REPO_DIR/scripts/install-local-comms.sh" "$REPO_DIR/AgentMonitor.app/Contents/Resources/CommsNode"
+open "$REPO_DIR/AgentMonitor.app"
 echo
 
 # ── 3. Verify hook script runs cleanly with sample input ────────────────────
