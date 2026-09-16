@@ -149,7 +149,7 @@ enum CommsNodeClient {
         var env = ProcessInfo.processInfo.environment
         // The viewer acts as the local OS owner. An environment inherited from
         // the terminal that launched it must not impersonate that agent.
-        for key in ["COMMS_AGENT", "COMMS_SESSION_ID", "CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID"] { env.removeValue(forKey: key) }
+        for key in ["COMMS_AGENT", "COMMS_SESSION_ID", "CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID", "COMMS_SOCKET"] { env.removeValue(forKey: key) }
         return env
     }
     static func command(_ arguments: [String], timeout: TimeInterval = 12) async throws -> Data {

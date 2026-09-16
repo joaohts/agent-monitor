@@ -24,6 +24,10 @@ struct ValidateCommsClient {
         setenv("COMMS_AGENT", "do-not-impersonate", 1)
         precondition(CommsNodeClient.environment()["COMMS_AGENT"] == nil)
         unsetenv("COMMS_AGENT")
+        let previousSocket = ProcessInfo.processInfo.environment["COMMS_SOCKET"]
+        setenv("COMMS_SOCKET", "/fixture/inherited-agent.sock", 1)
+        precondition(CommsNodeClient.environment()["COMMS_SOCKET"] == nil)
+        if let previousSocket { setenv("COMMS_SOCKET", previousSocket, 1) } else { unsetenv("COMMS_SOCKET") }
 
         // More output than a pipe's capacity catches wait-before-read deadlocks.
         let output = try CommsNodeClient.run(executable: URL(fileURLWithPath: "/usr/bin/python3"), arguments: ["-c", "print('x'*262144)"], timeout: 5)
@@ -92,6 +96,9 @@ struct ValidateCommsClient {
         let directory = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("cmv-" + UUID().uuidString.prefix(8))
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let node = Process(); node.executableURL = URL(fileURLWithPath: binary)
+        var isolatedEnvironment = CommsNodeClient.environment()
+        isolatedEnvironment.removeValue(forKey: "COMMS_BROKER_SERVICE_KEY_FILE")
+        node.environment = isolatedEnvironment
         node.arguments = ["serve", "--data-dir", directory.path]
         if serviceKeyConfigured {
             let key = directory.appendingPathComponent("synthetic-service-key")
@@ -109,8 +116,10 @@ struct ValidateCommsClient {
             try await Task.sleep(nanoseconds: 20_000_000)
         }
         let status = try await CommsNodeClient.query(NodeStatus.self, ["status"])
-        precondition(status.apiVersion == 1)
-        precondition(status.brokerServiceKeyConfigured == serviceKeyConfigured)
+        guard status.apiVersion == 1, status.dataDir == directory.path,
+              status.brokerServiceKeyConfigured == serviceKeyConfigured else {
+            throw NodeCommandError(message: "Live viewer must use its selected data directory and expose the expected safe service-key status.")
+        }
         _ = try await CommsNodeClient.command(["open", "sender", "--harness", "service"])
         _ = try await CommsNodeClient.command(["open", "brain", "--harness", "service", "--persistent"])
         _ = try await CommsNodeClient.command(["post", "--from", "sender", "--to", "brain", "Viewer integration message"])
