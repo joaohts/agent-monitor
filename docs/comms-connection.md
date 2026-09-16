@@ -18,7 +18,7 @@ The node repository may be private. A source builder can use their own existing
 GitHub CLI authentication, or supply an already downloaded release directory:
 
 ```sh
-gh release download v0.1.3 --repo joaohts/comms \
+gh release download v0.1.5 --repo joaohts/comms \
   --pattern 'comms_Darwin_*.tar.gz' --pattern SHA256SUMS --dir /path/to/release
 COMMS_RELEASE_DIR=/path/to/release NO_LAUNCH=1 ./build.sh
 ```
@@ -74,6 +74,15 @@ When a broker requires a shared service key, choose its private file in
 privately to each connecting machine; never put it in the notes vault or a
 public identity bundle. The default operator location is
 `~/.local/share/comms/broker-service-key`.
+
+A fresh source installation can configure that same private file in one step:
+
+```sh
+./install.sh --broker-service-key-file "$HOME/.local/share/comms/broker-service-key"
+```
+
+The top-level installer forwards the path to the bundled node installer; omit
+the option on ordinary updates to retain the existing configuration.
 
 The GUI passes only its path to the verified bundled installer using
 `--broker-service-key-file`. It does not read the contents, display a key, or

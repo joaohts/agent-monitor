@@ -41,7 +41,10 @@ struct ValidateCommsClient {
             _ = try CommsNodeClient.run(executable: URL(fileURLWithPath: "/bin/sleep"), arguments: ["5"], timeout: 0.1)
             preconditionFailure("command should time out")
         } catch { precondition(Date().timeIntervalSince(start) < 3) }
-        if let binary = ProcessInfo.processInfo.environment["COMMS_TEST_BINARY"] { try await liveNode(binary) }
+        if let binary = ProcessInfo.processInfo.environment["COMMS_TEST_BINARY"] {
+            try await liveNode(binary, serviceKeyConfigured: false)
+            try await liveNode(binary, serviceKeyConfigured: true)
+        }
         print("Comms viewer client validation passed: schema decoding, sender isolation, bounded subprocess I/O, errors and timeout.")
     }
 
@@ -85,11 +88,17 @@ struct ValidateCommsClient {
         print("Service-key UI/client checks passed: safe status, file-path forwarding, metadata validation and unchanged ordinary-update arguments.")
     }
 
-    static func liveNode(_ binary: String) async throws {
+    static func liveNode(_ binary: String, serviceKeyConfigured: Bool) async throws {
         let directory = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("cmv-" + UUID().uuidString.prefix(8))
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let node = Process(); node.executableURL = URL(fileURLWithPath: binary)
         node.arguments = ["serve", "--data-dir", directory.path]
+        if serviceKeyConfigured {
+            let key = directory.appendingPathComponent("synthetic-service-key")
+            try Data(repeating: 0x4b, count: 64).write(to: key)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: key.path)
+            node.arguments! += ["--broker-service-key-file", key.path]
+        }
         node.standardOutput = FileHandle.nullDevice; node.standardError = FileHandle.nullDevice
         try node.run()
         defer { if node.isRunning { node.terminate(); node.waitUntilExit() }; try? FileManager.default.removeItem(at: directory) }
@@ -101,6 +110,7 @@ struct ValidateCommsClient {
         }
         let status = try await CommsNodeClient.query(NodeStatus.self, ["status"])
         precondition(status.apiVersion == 1)
+        precondition(status.brokerServiceKeyConfigured == serviceKeyConfigured)
         _ = try await CommsNodeClient.command(["open", "sender", "--harness", "service"])
         _ = try await CommsNodeClient.command(["open", "brain", "--harness", "service", "--persistent"])
         _ = try await CommsNodeClient.command(["post", "--from", "sender", "--to", "brain", "Viewer integration message"])
@@ -111,6 +121,6 @@ struct ValidateCommsClient {
         let pending = try await CommsNodeClient.query(NodeHistoryPage.self, ["inbox", "brain", "--operator"])
         precondition(pending.records.count == 1, "history inspection must not consume mail")
         _ = try await CommsNodeClient.command(["stream", "brain", "--once"])
-        print("Live node viewer queries passed: status, identities, operator history and non-consuming inspection.")
+        print("Live node viewer queries passed: safe service-key status \(serviceKeyConfigured), identities, operator history and non-consuming inspection.")
     }
 }
