@@ -15,6 +15,7 @@ SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // ""' 2>/dev/null)
 CWD=$(echo "$INPUT" | jq -r '.cwd // ""' 2>/dev/null)
 HOOK=$(echo "$INPUT" | jq -r '.hook_event_name // ""' 2>/dev/null)
 TRANSCRIPT=$(echo "$INPUT" | jq -r '.transcript_path // ""' 2>/dev/null)
+TURN_ID=$(echo "$INPUT" | jq -r '.turn_id // ""' 2>/dev/null)
 SOURCE="claudeCode"
 case "$TRANSCRIPT" in */.codex/sessions/*) SOURCE="codex" ;; esac
 [ -n "${CODEX_THREAD_ID:-}" ] && SOURCE="codex"
@@ -140,9 +141,11 @@ jq -nc \
     --arg parent_sid "$PARENT_SID" \
     --arg tty "$TERMINAL_TTY" \
     --arg source "$SOURCE" \
+    --arg turn_id "$TURN_ID" \
     '{event: $event, session_id: $session_id, cwd: $cwd, ts: $ts, message: $message, transcript_path: $transcript, source: $source}
      + (if $agent_type  != "" then {agent_type: $agent_type} else {} end)
      + (if $parent_sid  != "" then {parent_session_id: $parent_sid} else {} end)
+     + (if $source == "codex" and $turn_id != "" then {turn_id: $turn_id} else {} end)
      + (if $tty         != "" then {tty: $tty} else {} end)' \
     >> "$OUT" 2>/dev/null
 

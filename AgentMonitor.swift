@@ -22,7 +22,7 @@ enum ISO8601 {
 
 enum AgentEventKind: String, Codable {
     case idle              // SessionStart: session opened, no prompt yet
-    case started           // UserPromptSubmit: a run began
+    case started           // UserPromptSubmit or an observed native Codex turn
     case needsAttention = "needs_attention"
     case stopped           // Stop: turn finished
     case apiError = "api_error"  // StopFailure: turn ended due to an API error
@@ -63,6 +63,7 @@ struct AgentEvent: Codable {
     var alias: String? = nil
     // Missing on historical events, which are Claude Code by definition.
     var source: AgentSource? = nil
+    var turnId: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case event
@@ -77,6 +78,7 @@ struct AgentEvent: Codable {
         case tty
         case alias
         case source
+        case turnId = "turn_id"
     }
 }
 
@@ -148,6 +150,7 @@ struct Agent: Identifiable {
     // construction site (and the hook pipeline) is unchanged; non-Claude providers
     // set it explicitly.
     var source: AgentSource = .claudeCode
+    var codexTurnId: String? = nil
     // Runtime tracking: ticks while .running, frozen when .needsAttention or .stopped
     var accumulatedSeconds: Double = 0
     var runStartedAt: Date? = nil
@@ -800,6 +803,64 @@ func unwrapTranscriptText(_ raw: String) -> String? {
 
 // MARK: - Transcript reader (with mtime cache)
 
+struct CodexTurnActivity {
+    let id: String
+    let startedAt: Date
+    var isActive = true
+
+    private static let fractionalDate: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+
+    static func ingest(_ obj: [String: Any], into activity: inout CodexTurnActivity?) {
+        guard obj["type"] as? String == "event_msg",
+              let payload = obj["payload"] as? [String: Any],
+              let type = payload["type"] as? String else { return }
+        switch type {
+        case "task_started":
+            guard let id = payload["turn_id"] as? String, !id.isEmpty,
+                  let timestamp = obj["timestamp"] as? String,
+                  let date = fractionalDate.date(from: timestamp) ?? ISO8601.formatter.date(from: timestamp) else { return }
+            activity = CodexTurnActivity(id: id, startedAt: date)
+        case "task_complete", "turn_aborted":
+            if let id = payload["turn_id"] as? String, id != activity?.id { return }
+            activity?.isActive = false
+        default:
+            break
+        }
+    }
+
+    func wakeEvent(for agent: Agent) -> AgentEvent? {
+        guard agent.source == .codex, agent.parentSessionId == nil, agent.agentType == nil,
+              agent.status == .idle || agent.status == .inactive || agent.status == .apiError,
+              isActive, id != agent.codexTurnId,
+              let lastUpdate = ISO8601.formatter.date(from: agent.lastUpdate) else { return nil }
+        // Legacy hook records have no turn ID and only whole-second timestamps.
+        // Avoid treating a delayed completion of that same turn as another wake.
+        if agent.codexTurnId == nil && agent.lastMessage != "session start" {
+            guard floor(startedAt.timeIntervalSince1970) > lastUpdate.timeIntervalSince1970 else { return nil }
+        } else {
+            guard startedAt >= lastUpdate else { return nil }
+        }
+        return AgentEvent(event: .started, sessionId: agent.id, cwd: agent.cwd,
+                          ts: ISO8601.formatter.string(from: startedAt),
+                          message: "Codex turn started", transcriptPath: agent.transcriptPath,
+                          source: .codex, turnId: id)
+    }
+}
+
+func shouldWatchTranscript(_ agent: Agent, hasCommsAttachment: Bool) -> Bool {
+    switch agent.status {
+    case .running, .away, .needsAttention, .idle, .apiError:
+        return true
+    case .inactive:
+        return agent.source == .codex && agent.parentSessionId == nil
+            && agent.agentType == nil && hasCommsAttachment
+    }
+}
+
 struct TranscriptInfo {
     let initialTask: String?
     let latestSummary: String?
@@ -810,6 +871,7 @@ struct TranscriptInfo {
     let isToolPending: Bool    // last tool_use has no matching tool_result yet
     let model: String?         // most recent assistant message's model
     let codexUsage: CodexUsage?
+    var codexTurn: CodexTurnActivity? = nil
 }
 
 @MainActor
@@ -830,6 +892,7 @@ final class TranscriptReader {
         var pendingToolUseIds: Set<String> = []
         var lastModel: String?
         var codexUsage: CodexUsage?
+        var codexTurn: CodexTurnActivity?
     }
     private struct CacheEntry {
         let mtime: TimeInterval
@@ -961,6 +1024,7 @@ final class TranscriptReader {
 
     /// Folds a single decoded transcript line into the running parse state.
     private func ingestLine(_ obj: [String: Any], into state: inout ParseState) {
+        CodexTurnActivity.ingest(obj, into: &state.codexTurn)
         if obj["type"] as? String == "event_msg",
            let payload = obj["payload"] as? [String: Any],
            payload["type"] as? String == "token_count",
@@ -1073,7 +1137,8 @@ final class TranscriptReader {
             lastModified: lastModified,
             isToolPending: !state.pendingToolUseIds.isEmpty,
             model: state.lastModel,
-            codexUsage: state.codexUsage
+            codexUsage: state.codexUsage,
+            codexTurn: state.codexTurn
         )
     }
 
@@ -3032,6 +3097,12 @@ final class AgentStore: ObservableObject {
         CommsNodeModel.shared.objectWillChange
             .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &cancellables)
+        CommsNodeModel.shared.$sessions
+            .map { sessions in Set(sessions.filter { $0.harness == "codex" && $0.endedAt == nil }.map(\.harnessSessionId)) }
+            .removeDuplicates()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.rebuildView() }
+            .store(in: &cancellables)
         loadGhosttyMap()
         loadCustomNames()
         registerProviders()
@@ -3496,6 +3567,7 @@ final class AgentStore: ObservableObject {
     ///   - .running → .away      when transcript silent > 60s (tool not pending)
     ///   - .away/.needsAttention → .running on fresh transcript writes (resume)
     ///   - .idle/.away → .inactive after 5min idle
+    ///   - idle/inactive Codex → .running on an explicit new task_started record
     ///   - subagent .inactive → cleared 5min after stop
     /// Never auto-transitions to .stopped — that requires a real Stop event.
     private func detectStaleness(_ agents: [Agent]) -> [AgentEvent] {
@@ -3509,6 +3581,11 @@ final class AgentStore: ObservableObject {
         }
 
         for a in agents {
+            if a.source == .codex, let path = a.transcriptPath, !path.isEmpty,
+               let event = transcriptReader.read(path: path).codexTurn?.wakeEvent(for: a) {
+                newEvents.append(event)
+                continue
+            }
             // Subagents go to .inactive immediately on stop (apply()), then
             // auto-clear 5min later. lastUpdate is the SubagentStop timestamp, so
             // the 5min countdown starts from when it actually finished.
@@ -3637,13 +3714,12 @@ final class AgentStore: ObservableObject {
     /// the away deadline — that's what lets us delete the steady poll entirely.
     private func reconcileTranscriptWatchers(_ agents: [Agent]) {
         var desired = Set<String>()
+        let attachedCodex = Set(CommsNodeModel.shared.sessions
+            .filter { $0.harness == "codex" && $0.endedAt == nil }.map(\.harnessSessionId))
         for a in agents {
-            switch a.status {
-            case .running, .away, .needsAttention, .idle, .apiError:
-                if let path = a.transcriptPath, !path.isEmpty { desired.insert(path) }
-            default:
-                break
-            }
+            guard shouldWatchTranscript(a, hasCommsAttachment: attachedCodex.contains(a.id)),
+                  let path = a.transcriptPath, !path.isEmpty else { continue }
+            desired.insert(path)
         }
 
         for (path, src) in transcriptWatchers where !desired.contains(path) {
@@ -3787,6 +3863,7 @@ final class AgentStore: ObservableObject {
         defer {
             if var a = byId[rec.sessionId] {
                 a.source = rec.source ?? a.source
+                if let turnId = rec.turnId, !turnId.isEmpty { a.codexTurnId = turnId }
                 byId[rec.sessionId] = a
             }
             // Whenever the hook reports the focused terminal id, trust it — this
@@ -6195,6 +6272,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+#if !AGENT_MONITOR_TESTS
 @main
 struct Main {
     static func main() {
@@ -6204,3 +6282,4 @@ struct Main {
         app.run()
     }
 }
+#endif

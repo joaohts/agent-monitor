@@ -65,6 +65,21 @@ The identity list provides copyable resume commands. Resuming belongs inside the
 target harness; the GUI does not impersonate it or take over an occupied identity.
 History reads are observations and never acknowledge or consume messages.
 
+### Codex activity after a peer wake
+
+Native peer delivery starts a turn with tool output and does not produce a
+human `UserPromptSubmit` hook. Agent Monitor reads `task_started`,
+`task_complete`, and `turn_aborted` records from the Codex transcript. A new
+active turn can restore an idle or inactive top-level Codex session to running.
+This creates an observational `started` event in the monitor log; peer content
+remains tool output in Codex.
+
+Transcript watchers stay armed for inactive Codex sessions with an open local
+comms attachment. Attachment changes refresh that watcher set. The hook also
+records Codex turn IDs so completion of an already-observed turn cannot be
+mistaken for another wake; older events without that field remain readable.
+Running turns and permission-waiting sessions retain their existing state.
+
 ## Pairing, grants and remote history
 
 ### Optional broker service-access key
