@@ -20,6 +20,8 @@ jobs:
         run: python3 scripts/test-comms-bundle.py
       - name: Migrated skill executable resolution
         run: python3 scripts/test_installed_skill.py
+      - name: Private service-key file installer arguments
+        run: python3 scripts/test_comms_install_options.py
       - name: Compile GUI without private release access
         env:
           COMMS_SKIP_BUNDLE: '1'

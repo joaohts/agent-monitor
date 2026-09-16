@@ -10,7 +10,15 @@ struct NodeStatus: Decodable {
     let brokerEnabled: Bool
     let brokerConnected: Bool
     let brokerUrl: String?
+    let brokerServiceKeyConfigured: Bool?
     let dataDir: String
+    var brokerServiceKeyDescription: String {
+        switch brokerServiceKeyConfigured {
+        case true?: return "Configured"
+        case false?: return "Not configured"
+        case nil: return "Status unavailable"
+        }
+    }
 }
 
 struct NodeAgent: Decodable, Identifiable {
@@ -154,13 +162,38 @@ enum CommsNodeClient {
     static func query<T: Decodable>(_ type: T.Type, _ arguments: [String]) async throws -> T {
         try decode(type, from: await command(arguments))
     }
-    static func install() async throws -> NodeInstallResult {
+    // Only file metadata is inspected here. The node validates/reads the key
+    // contents; no key value enters the GUI, its preferences, or process argv.
+    static func validateServiceKeyFile(_ path: String) throws {
+        guard path.hasPrefix("/"), !path.contains("\n"), !path.contains("\r") else {
+            throw NodeCommandError(message: "Choose an absolute path to a private broker service-key file.")
+        }
+        var info = stat()
+        guard lstat(path, &info) == 0 else {
+            throw NodeCommandError(message: "The selected broker service-key file is missing or unavailable.")
+        }
+        guard (info.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG),
+              info.st_uid == getuid(), (info.st_mode & 0o7777) == 0o600,
+              info.st_size >= 32, info.st_size <= 4096 else {
+            throw NodeCommandError(message: "Choose a regular file owned by this user, with permissions 0600 and a size of 32–4096 bytes.")
+        }
+    }
+    static func installArguments(resources: URL, node: URL, serviceKeyFile: String? = nil) throws -> [String] {
+        var arguments = [resources.appendingPathComponent("install-local-comms.sh").path, node.path]
+        if let serviceKeyFile {
+            try validateServiceKeyFile(serviceKeyFile)
+            arguments += ["--broker-service-key-file", serviceKeyFile]
+        }
+        return arguments
+    }
+    static func install(serviceKeyFile: String? = nil) async throws -> NodeInstallResult {
         guard let resources = Bundle.main.resourceURL, let node = resourceDirectory else {
             throw NodeCommandError(message: "The application is missing its bundled node release.")
         }
+        let arguments = try installArguments(resources: resources, node: node, serviceKeyFile: serviceKeyFile)
         let result = try await Task.detached(priority: .utility) {
             try run(executable: URL(fileURLWithPath: "/bin/bash"),
-                    arguments: [resources.appendingPathComponent("install-local-comms.sh").path, node.path],
+                    arguments: arguments,
                     timeout: 45)
         }.value
         return try decode(NodeInstallResult.self, from: result)

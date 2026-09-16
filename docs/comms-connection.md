@@ -67,6 +67,31 @@ History reads are observations and never acknowledge or consume messages.
 
 ## Pairing, grants and remote history
 
+### Optional broker service-access key
+
+When a broker requires a shared service key, choose its private file in
+**Settings → Comms node → Choose private service-key file**. Supply that file
+privately to each connecting machine; never put it in the notes vault or a
+public identity bundle. The default operator location is
+`~/.local/share/comms/broker-service-key`.
+
+The GUI passes only its path to the verified bundled installer using
+`--broker-service-key-file`. It does not read the contents, display a key, or
+save a value in preferences, logs, or installation metadata. The status API
+exposes only the optional `broker_service_key_configured` boolean. The file
+must be a regular file owned by the current user with permissions `0600`,
+containing 32–4096 printable ASCII characters. The GUI checks metadata only;
+the node validates the contents and fails closed for an invalid/missing
+configured file.
+
+Applying a different file gracefully restarts the local node. Ordinary updates
+omit the option and preserve the existing configured file. The chooser remains
+available when the node is unavailable so a missing file can be replaced.
+This broker access check leaves machine authentication, pairing, directional
+grants, and any application tool-authorization policy in place.
+
+### Peer identities and permissions
+
 1. Optionally configure the broker URL in **Settings → Comms node**.
 2. Copy the public identity bundle and exchange it outside the broker through a
    channel where the other machine's identity can be verified.

@@ -45,12 +45,13 @@ final class CommsNodeModel: ObservableObject {
             } catch { install() }
         }
     }
-    func install() {
-        guard !busy else { return }; busy = true; actionStatus = "Installing local comms…"
+    func install(serviceKeyFile: String? = nil) {
+        guard !busy else { return }; busy = true
+        actionStatus = serviceKeyFile == nil ? "Installing local comms…" : "Applying broker service-key file and restarting the local node…"
         Task {
             defer { busy = false }
             do {
-                let result = try await CommsNodeClient.install()
+                let result = try await CommsNodeClient.install(serviceKeyFile: serviceKeyFile)
                 actionStatus = "Local comms ready. Use /\(result.skill) in Claude or a supported Codex session."
                 error = ""; observe(); refresh()
             } catch { self.error = error.localizedDescription; actionStatus = "" }
@@ -311,6 +312,16 @@ struct CommsNodeSettingsView: View {
                     }
                 }
             } else { Text("Local node is not ready.").font(.headline) }
+            Divider()
+            HStack {
+                Text("Broker service key (optional)").fontWeight(.medium)
+                Spacer()
+                Text(node.status?.brokerServiceKeyDescription ?? "Status unavailable")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Button("Choose private service-key file…") { chooseServiceKeyFile() }.disabled(node.busy)
+            Text("Supply the broker's shared key privately, outside the notes vault. Select a regular 0600 file containing 32–4096 printable ASCII characters. The node validates its contents; Agent Monitor never opens or stores the key. Applying the file gracefully restarts the local node; ordinary updates preserve it.")
+                .font(.caption).foregroundStyle(.secondary)
             HStack {
                 Button(node.busy ? "Working…" : "Install / repair bundled node") { node.install() }.disabled(node.busy)
                 Button("Refresh") { node.refresh() }
@@ -347,6 +358,20 @@ struct CommsNodeSettingsView: View {
             var args = ["pair", "--file", url.path]
             if !peerAlias.isEmpty { args += ["--alias", peerAlias] }
             node.perform(args, success: "Peer identity pinned. Choose directional grants below.")
+        }
+    }
+    private func chooseServiceKeyFile() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.resolvesAliases = false
+        panel.showsHiddenFiles = true
+        panel.directoryURL = URL(fileURLWithPath: CommsNodeClient.dataDirectory, isDirectory: true)
+        panel.prompt = "Apply key file"
+        panel.message = "Choose the private broker service-key file. Its contents stay outside Agent Monitor."
+        if panel.runModal() == .OK, let url = panel.url {
+            node.install(serviceKeyFile: url.path)
         }
     }
     private func exportIdentity() {

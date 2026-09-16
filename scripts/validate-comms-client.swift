@@ -7,6 +7,15 @@ struct ValidateCommsClient {
         let statusData = Data(#"{"version":"0.1.0","api_version":1,"machine_id":"m_test","public_key":"public-only","name":"test","broker_enabled":false,"broker_connected":false,"data_dir":"/tmp/comms"}"#.utf8)
         let status = try CommsNodeClient.decode(NodeStatus.self, from: statusData)
         precondition(status.machineId == "m_test" && status.apiVersion == 1)
+        precondition(status.brokerServiceKeyConfigured == nil && status.brokerServiceKeyDescription == "Status unavailable")
+        var keyedStatus = try JSONSerialization.jsonObject(with: statusData) as! [String: Any]
+        for configured in [false, true] {
+            keyedStatus["broker_service_key_configured"] = configured
+            let decoded = try CommsNodeClient.decode(NodeStatus.self, from: JSONSerialization.data(withJSONObject: keyedStatus))
+            precondition(decoded.brokerServiceKeyConfigured == configured)
+            precondition(decoded.brokerServiceKeyDescription == (configured ? "Configured" : "Not configured"))
+        }
+        try serviceKeyArguments()
         let agent = try CommsNodeClient.decode(NodeAgent.self, from: Data(#"{"id":"a_brain","alias":"brain","persistent":true,"online":false,"scope":"local"}"#.utf8))
         precondition(agent.persistent && !agent.online)
         let presence = try CommsNodeClient.decode(NodePresence.self, from: Data(#"{"machine_id":"m_test","peer_alias":"","agent_id":"a_brain","alias":"brain","persistent":true,"online":false}"#.utf8))
@@ -34,6 +43,46 @@ struct ValidateCommsClient {
         } catch { precondition(Date().timeIntervalSince(start) < 3) }
         if let binary = ProcessInfo.processInfo.environment["COMMS_TEST_BINARY"] { try await liveNode(binary) }
         print("Comms viewer client validation passed: schema decoding, sender isolation, bounded subprocess I/O, errors and timeout.")
+    }
+
+    static func serviceKeyArguments() throws {
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("comms-key-ui-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let resources = directory.appendingPathComponent("Resources")
+        let node = resources.appendingPathComponent("CommsNode")
+        let regular = try CommsNodeClient.installArguments(resources: resources, node: node)
+        precondition(regular == [resources.appendingPathComponent("install-local-comms.sh").path, node.path])
+
+        let keyFile = directory.appendingPathComponent("private key $(literal).txt")
+        // The GUI must inspect only metadata: content validation belongs to the
+        // node. Deliberately non-ASCII fixture bytes pass only this preflight.
+        try Data(repeating: 0, count: 32).write(to: keyFile)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: keyFile.path)
+        let configured = try CommsNodeClient.installArguments(resources: resources, node: node, serviceKeyFile: keyFile.path)
+        precondition(configured == regular + ["--broker-service-key-file", keyFile.path])
+
+        func rejects(_ path: String) {
+            do {
+                _ = try CommsNodeClient.installArguments(resources: resources, node: node, serviceKeyFile: path)
+                preconditionFailure("invalid service-key file metadata was accepted")
+            } catch { precondition(error is NodeCommandError) }
+        }
+        rejects(directory.appendingPathComponent("missing").path)
+        rejects(directory.path)
+        rejects("")
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: keyFile.path)
+        rejects(keyFile.path)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: keyFile.path)
+        try Data(repeating: 0, count: 31).write(to: keyFile)
+        rejects(keyFile.path)
+        try Data(repeating: 0, count: 4097).write(to: keyFile)
+        rejects(keyFile.path)
+        try Data(repeating: 0, count: 32).write(to: keyFile)
+        let link = directory.appendingPathComponent("key-symlink")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: keyFile)
+        rejects(link.path)
+        print("Service-key UI/client checks passed: safe status, file-path forwarding, metadata validation and unchanged ordinary-update arguments.")
     }
 
     static func liveNode(_ binary: String) async throws {

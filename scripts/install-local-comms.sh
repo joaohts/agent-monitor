@@ -1,7 +1,30 @@
 #!/bin/bash
 # Called by the installer or first application launch. No GitHub/network access.
 set -euo pipefail
-bundle=${1:?usage: install-local-comms.sh BUNDLED_COMMS_DIRECTORY}
+bundle=${1:?usage: install-local-comms.sh BUNDLED_COMMS_DIRECTORY [--broker-service-key-file PATH]}
+shift
+
+# BEGIN COMMS_INSTALL_OPTIONS
+parse_comms_install_options() {
+  comms_key_options=()
+  while (($#)); do
+    case "$1" in
+      --broker-service-key-file)
+        if (($# < 2)) || [[ -z "$2" ]] || ((${#comms_key_options[@]})); then
+          printf 'Supply one nonempty --broker-service-key-file PATH.\n' >&2; return 2
+        fi
+        comms_key_options=(--broker-service-key-file "$2"); shift 2 ;;
+      *) printf 'Unknown installer option: %s\n' "$1" >&2; return 2 ;;
+    esac
+  done
+}
+run_comms_release_installer() {
+  # Omission preserves the configured file in the standalone installer. Never
+  # pass an empty override during an ordinary GUI install/repair/update.
+  bash "$1/scripts/install.sh" --binary-name "$2" --skip-skills ${comms_key_options[@]+"${comms_key_options[@]}"}
+}
+# END COMMS_INSTALL_OPTIONS
+parse_comms_install_options "$@"
 config_dir="$HOME/.config/agent-monitor"
 metadata="$config_dir/comms-install.json"
 command_name=comms
@@ -39,7 +62,7 @@ case "$command_name:$skill_name" in *[!A-Za-z0-9:._-]*) printf 'Invalid saved co
 
 # The release installer verifies internal checksums before executing the binary,
 # preserves the existing node data directory and broker role, then uses launchd.
-install_output=$(bash "$bundle/scripts/install.sh" --binary-name "$command_name" --skip-skills)
+install_output=$(run_comms_release_installer "$bundle" "$command_name")
 printf '%s\n' "$install_output" >&2
 installed="$HOME/.local/bin/$command_name"
 data_dir=$(python3 -c '
