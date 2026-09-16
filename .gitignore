@@ -1,6 +1,7 @@
 AgentMonitor.app/
 AgentMonitor
 *.dSYM/
+__pycache__/
 
 .DS_Store
 

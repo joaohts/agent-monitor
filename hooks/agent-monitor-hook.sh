@@ -122,6 +122,13 @@ if [ "$TERM_PROGRAM" = "ghostty" ]; then
     done
 fi
 
+# Remote Codex hooks descend from its detached app-server. Comms records the
+# exact owning TUI process when the session opens an attachment.
+if [ "$SOURCE" = "codex" ] && [ -z "$TERMINAL_TTY" ]; then
+    HOOK_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+    TERMINAL_TTY=$(python3 "$HOOK_DIR/codex-terminal.py" "${PARENT_SID:-$SESSION_ID}" 2>/dev/null)
+fi
+
 jq -nc \
     --arg event "$EVENT" \
     --arg session_id "$SESSION_ID" \
