@@ -86,7 +86,7 @@ It's a drop-in upgrade — **rebuild and you're done:**
 - AI-generated session titles via a side-car `claude -p` call
 - Live "what's happening right now" subtitle while a session is actively processing
 - Sound alerts when a session needs your attention or finishes
-- **Push notifications to your phone** (optional) via the jsplayground MCP
+- **Push notifications to your phone** (optional) via any MCP server exposing a `send_push` tool
 - **Stats overlay** with daily / weekly / monthly / all-time tabs: sessions, steps, time totals, per-step averages, concurrency duration, top-3 projects, hour-of-day histogram
 - Two-column layout: things that need you on the left, active sessions on the right
 - **Floating bubbles overlay** (`⌥⌘B`): an ambient, click-through, always-on-top view that floats over fullscreen apps — one colored bubble per session
@@ -343,7 +343,7 @@ Trimmed to the essentials — everything configurable now lives in the Settings 
 A grouped overlay with independent sections:
 
 - **Bubbles** — show overlay · include inactive sessions · corner picker
-- **Notifications** — sound alerts · macOS banners · push to phone (auto-disabled with a hint when the jsplayground MCP isn't configured)
+- **Notifications** — sound alerts · macOS banners · push to phone (auto-disabled with a hint when no push server is configured)
 - **AI** — toggle AI session-title generation (tags are generated on demand via ✨ when naming an agent)
 - **Shortcuts** — reference list; jump shortcuts (`⌥1…9`, `` ⌥` ``) are shown only when Ghostty is detected
 
@@ -469,7 +469,7 @@ Both generators run output through `ClaudeP.sanitizeShortPhrase`:
 
 ## Push notifications (optional)
 
-The 🔔 bell button in the header sends pushes to your phone via the **jsplayground MCP server** when:
+The 🔔 bell button in the header sends pushes to your phone through an **HTTP MCP server that exposes a `send_push` tool** (see [Wire format](#wire-format)) when:
 
 - A session transitions to **`.needsAttention`** → urgent push: `🟠 <project> needs attention`
 - A session transitions to **`.idle`** from `running` / `away` / `needs_attention` (real turn completion) → info push: `✅ <project> finished`
@@ -478,14 +478,14 @@ Skipped: brand-new sessions (`nil → idle`), automatic decay (`idle → inactiv
 
 ### Configuration
 
-The app reads jsplayground server config from `~/.claude.json` at launch. Add this block under `mcpServers`:
+The app reads the push server from `~/.claude.json` at launch: the `mcpServers` entry named `push` by default. Point it at your own server:
 
 ```json
 {
   "mcpServers": {
-    "jsplayground": {
+    "push": {
       "type": "http",
-      "url": "https://mcp.jsplayground.cc/mcp",
+      "url": "https://your-push-server.example/mcp",
       "headers": {
         "Authorization": "Bearer <YOUR_TOKEN>"
       }
@@ -494,7 +494,13 @@ The app reads jsplayground server config from `~/.claude.json` at launch. Add th
 }
 ```
 
-jsplayground is a personal push service and is not generally available; without it the bell stays disabled and everything else works.
+If your server already has another name in `~/.claude.json`, point the app at it instead:
+
+```bash
+defaults write com.local.agentmonitor agentMonitor.pushServer YOUR_SERVER_NAME
+```
+
+Without a push server the bell stays disabled and everything else works.
 
 ### Button states
 

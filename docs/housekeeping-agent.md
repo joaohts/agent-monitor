@@ -166,7 +166,7 @@ project / date in the filename + frontmatter, for a navigable vault:
   session_id: <full uuid>
   host: personal        # personal | work, from hostname
   projects: [agent-monitor]
-  cwd: /Users/joaohts/fun/agent-monitor
+  cwd: /Users/you/code/agent-monitor
   branch: feat/housekeeping-agent   # app-captured (git rev-parse in cwd), not model-emitted
   started: <iso>
   updated: <iso>

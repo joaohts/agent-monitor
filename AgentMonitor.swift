@@ -437,20 +437,26 @@ enum StatsCompute {
     }
 }
 
-// MARK: - Push notifications via jsplayground MCP
+// MARK: - Push notifications via an MCP server exposing `send_push`
 
-struct JsPlaygroundConfig {
+struct PushServerConfig {
     let url: URL
     let bearer: String
 
-    /// Reads jsplayground server config + bearer token from ~/.claude.json.
+    /// Name of the HTTP MCP server in ~/.claude.json's `mcpServers` that exposes a
+    /// `send_push` tool. Override with `defaults write com.local.agentmonitor agentMonitor.pushServer NAME`.
+    static var serverName: String {
+        UserDefaults.standard.string(forKey: "agentMonitor.pushServer") ?? "push"
+    }
+
+    /// Reads the push server's URL + bearer token from ~/.claude.json.
     /// Returns nil if not configured (button stays disabled in that case).
-    static func load() -> JsPlaygroundConfig? {
+    static func load() -> PushServerConfig? {
         let path = NSHomeDirectory() + "/.claude.json"
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let mcpServers = obj["mcpServers"] as? [String: Any],
-              let jsp = mcpServers["jsplayground"] as? [String: Any],
+              let jsp = mcpServers[serverName] as? [String: Any],
               let urlStr = jsp["url"] as? String,
               let url = URL(string: urlStr),
               let headers = jsp["headers"] as? [String: Any],
@@ -458,7 +464,7 @@ struct JsPlaygroundConfig {
             return nil
         }
         let bearer = auth.hasPrefix("Bearer ") ? String(auth.dropFirst(7)) : auth
-        return JsPlaygroundConfig(url: url, bearer: bearer)
+        return PushServerConfig(url: url, bearer: bearer)
     }
 }
 
@@ -467,17 +473,17 @@ final class PushNotifier: ObservableObject {
     @Published var enabled: Bool {
         didSet { UserDefaults.standard.set(enabled, forKey: "agentMonitor.pushEnabled") }
     }
-    @Published private(set) var config: JsPlaygroundConfig?
+    @Published private(set) var config: PushServerConfig?
 
     var isAvailable: Bool { config != nil }
 
     init() {
         self.enabled = UserDefaults.standard.bool(forKey: "agentMonitor.pushEnabled")
-        self.config = JsPlaygroundConfig.load()
+        self.config = PushServerConfig.load()
     }
 
     func reloadConfig() {
-        config = JsPlaygroundConfig.load()
+        config = PushServerConfig.load()
     }
 
     func send(title: String, message: String, category: String = "alert") {
@@ -486,7 +492,7 @@ final class PushNotifier: ObservableObject {
             return
         }
         guard let config = config else {
-            Self.debugLog("push: skipped (no jsplayground config)")
+            Self.debugLog("push: skipped (no push server config)")
             return
         }
         Self.debugLog("push: sending → \(title)")
@@ -5084,7 +5090,7 @@ struct SettingsView: View {
                     Toggle("Push to phone", isOn: pushEnabled)
                         .disabled(!store.pushNotifier.isAvailable)
                     if !store.pushNotifier.isAvailable {
-                        Text("Push needs the jsplayground MCP configured in ~/.claude.json")
+                        Text("Push needs an MCP server with a send_push tool in ~/.claude.json (see README)")
                             .font(.caption).foregroundStyle(.secondary)
                     }
                     Button("Send test banner") { store.localNotifier.sendTest() }
