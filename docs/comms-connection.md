@@ -14,19 +14,17 @@ the release's `SHA256SUMS`, its internal `CHECKSUMS`, and the embedded version.
 The verified executable, installer, and integration skill are bundled in
 `AgentMonitor.app/Contents/Resources/CommsNode/`.
 
-The node repository may be private. A source builder can use their own existing
-GitHub CLI authentication, or supply an already downloaded release directory:
+`./build.sh` downloads the pinned public release (`comms-release.json`) and verifies
+it against both the pinned SHA256 and the release's `SHA256SUMS`. To build offline,
+supply an already downloaded release directory:
 
 ```sh
-gh release download v0.1.5 --repo joaohts/comms \
-  --pattern 'comms_Darwin_*.tar.gz' --pattern SHA256SUMS --dir /path/to/release
 COMMS_RELEASE_DIR=/path/to/release NO_LAUNCH=1 ./build.sh
 ```
 
 No token is embedded in the app, committed to this repository, or needed at
-runtime. Binary archives and app bundles are ignored by Git. Public CI performs
-compiler/client checks without obtaining the private release; release packaging
-must use the verified pinned artifacts.
+runtime. Binary archives and app bundles are ignored by Git. Release packaging
+always uses the verified pinned artifacts.
 
 `./install.sh` installs the node before launching the viewer. Opening a built app
 also installs it on first use if needed. The installation is per OS user:
