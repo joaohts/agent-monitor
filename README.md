@@ -67,8 +67,8 @@ self-updating report** of what each one is *doing*, in an IDE-style workspace.
 It's a drop-in upgrade — **rebuild and you're done:**
 
 - **Existing activity hooks keep working.** `./build.sh` also bundles the pinned
-  comms release. Source builders need authorized release access or a provided
-  release directory; the finished app needs no GitHub credentials.
+  comms release. The download is public and checksum-verified; the
+  finished app needs no GitHub credentials.
 - **No new hard requirements.** The summary agent uses an already logged-in `claude`
   or `codex` CLI. Claude is preferred when both exist; Codex is a fully independent
   fallback. An Anthropic API key file remains an optional metered Haiku route.
@@ -238,7 +238,7 @@ Hooks are external shell scripts. Appending one JSON line is trivial (`echo >> f
 - Xcode Command Line Tools (`swiftc`, `xcodebuild`) — install with `xcode-select --install`
 - `jq` — `brew install jq`
 - Python 3 for release checksum verification and per-user service installation
-- Source builds: access to the pinned comms release through `gh`, or
+- Source builds: network access to download the pinned public comms release, or
   `COMMS_RELEASE_DIR=/path/to/verified-release-files`
 - At least one logged-in agent CLI: `claude` or `codex`. When both are present,
   Agent Monitor prefers Claude for local AI labels; Codex is the automatic fallback.

@@ -14,8 +14,9 @@ else
   release_dir="$repo_dir/.build/comms-downloads/$release_tag"
   mkdir -p "$release_dir"
   if [[ ! -f "$release_dir/$artifact" || ! -f "$release_dir/SHA256SUMS" ]]; then
-    command -v gh >/dev/null 2>&1 || { printf 'Use an authenticated gh CLI or provide COMMS_RELEASE_DIR with verified release files.\n' >&2; exit 1; }
-    gh release download "$release_tag" --repo "$repository" --dir "$release_dir" --pattern "$artifact" --pattern SHA256SUMS --clobber
+    base="https://github.com/$repository/releases/download/$release_tag"
+    curl -fsSL -o "$release_dir/$artifact" "$base/$artifact"
+    curl -fsSL -o "$release_dir/SHA256SUMS" "$base/SHA256SUMS"
   fi
 fi
 
