@@ -22,7 +22,7 @@ enum ISO8601 {
 
 enum AgentEventKind: String, Codable {
     case idle              // SessionStart: session opened, no prompt yet
-    case started           // UserPromptSubmit: a run began
+    case started           // UserPromptSubmit or an observed native Codex turn
     case needsAttention = "needs_attention"
     case stopped           // Stop: turn finished
     case apiError = "api_error"  // StopFailure: turn ended due to an API error
@@ -63,6 +63,7 @@ struct AgentEvent: Codable {
     var alias: String? = nil
     // Missing on historical events, which are Claude Code by definition.
     var source: AgentSource? = nil
+    var turnId: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case event
@@ -77,6 +78,7 @@ struct AgentEvent: Codable {
         case tty
         case alias
         case source
+        case turnId = "turn_id"
     }
 }
 
@@ -148,6 +150,7 @@ struct Agent: Identifiable {
     // construction site (and the hook pipeline) is unchanged; non-Claude providers
     // set it explicitly.
     var source: AgentSource = .claudeCode
+    var codexTurnId: String? = nil
     // Runtime tracking: ticks while .running, frozen when .needsAttention or .stopped
     var accumulatedSeconds: Double = 0
     var runStartedAt: Date? = nil
@@ -434,20 +437,26 @@ enum StatsCompute {
     }
 }
 
-// MARK: - Push notifications via jsplayground MCP
+// MARK: - Push notifications via an MCP server exposing `send_push`
 
-struct JsPlaygroundConfig {
+struct PushServerConfig {
     let url: URL
     let bearer: String
 
-    /// Reads jsplayground server config + bearer token from ~/.claude.json.
+    /// Name of the HTTP MCP server in ~/.claude.json's `mcpServers` that exposes a
+    /// `send_push` tool. Override with `defaults write com.local.agentmonitor agentMonitor.pushServer NAME`.
+    static var serverName: String {
+        UserDefaults.standard.string(forKey: "agentMonitor.pushServer") ?? "push"
+    }
+
+    /// Reads the push server's URL + bearer token from ~/.claude.json.
     /// Returns nil if not configured (button stays disabled in that case).
-    static func load() -> JsPlaygroundConfig? {
+    static func load() -> PushServerConfig? {
         let path = NSHomeDirectory() + "/.claude.json"
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let mcpServers = obj["mcpServers"] as? [String: Any],
-              let jsp = mcpServers["jsplayground"] as? [String: Any],
+              let jsp = mcpServers[serverName] as? [String: Any],
               let urlStr = jsp["url"] as? String,
               let url = URL(string: urlStr),
               let headers = jsp["headers"] as? [String: Any],
@@ -455,7 +464,7 @@ struct JsPlaygroundConfig {
             return nil
         }
         let bearer = auth.hasPrefix("Bearer ") ? String(auth.dropFirst(7)) : auth
-        return JsPlaygroundConfig(url: url, bearer: bearer)
+        return PushServerConfig(url: url, bearer: bearer)
     }
 }
 
@@ -464,17 +473,17 @@ final class PushNotifier: ObservableObject {
     @Published var enabled: Bool {
         didSet { UserDefaults.standard.set(enabled, forKey: "agentMonitor.pushEnabled") }
     }
-    @Published private(set) var config: JsPlaygroundConfig?
+    @Published private(set) var config: PushServerConfig?
 
     var isAvailable: Bool { config != nil }
 
     init() {
         self.enabled = UserDefaults.standard.bool(forKey: "agentMonitor.pushEnabled")
-        self.config = JsPlaygroundConfig.load()
+        self.config = PushServerConfig.load()
     }
 
     func reloadConfig() {
-        config = JsPlaygroundConfig.load()
+        config = PushServerConfig.load()
     }
 
     func send(title: String, message: String, category: String = "alert") {
@@ -483,7 +492,7 @@ final class PushNotifier: ObservableObject {
             return
         }
         guard let config = config else {
-            Self.debugLog("push: skipped (no jsplayground config)")
+            Self.debugLog("push: skipped (no push server config)")
             return
         }
         Self.debugLog("push: sending → \(title)")
@@ -800,6 +809,64 @@ func unwrapTranscriptText(_ raw: String) -> String? {
 
 // MARK: - Transcript reader (with mtime cache)
 
+struct CodexTurnActivity {
+    let id: String
+    let startedAt: Date
+    var isActive = true
+
+    private static let fractionalDate: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+
+    static func ingest(_ obj: [String: Any], into activity: inout CodexTurnActivity?) {
+        guard obj["type"] as? String == "event_msg",
+              let payload = obj["payload"] as? [String: Any],
+              let type = payload["type"] as? String else { return }
+        switch type {
+        case "task_started":
+            guard let id = payload["turn_id"] as? String, !id.isEmpty,
+                  let timestamp = obj["timestamp"] as? String,
+                  let date = fractionalDate.date(from: timestamp) ?? ISO8601.formatter.date(from: timestamp) else { return }
+            activity = CodexTurnActivity(id: id, startedAt: date)
+        case "task_complete", "turn_aborted":
+            if let id = payload["turn_id"] as? String, id != activity?.id { return }
+            activity?.isActive = false
+        default:
+            break
+        }
+    }
+
+    func wakeEvent(for agent: Agent) -> AgentEvent? {
+        guard agent.source == .codex, agent.parentSessionId == nil, agent.agentType == nil,
+              agent.status == .idle || agent.status == .inactive || agent.status == .apiError,
+              isActive, id != agent.codexTurnId,
+              let lastUpdate = ISO8601.formatter.date(from: agent.lastUpdate) else { return nil }
+        // Legacy hook records have no turn ID and only whole-second timestamps.
+        // Avoid treating a delayed completion of that same turn as another wake.
+        if agent.codexTurnId == nil && agent.lastMessage != "session start" {
+            guard floor(startedAt.timeIntervalSince1970) > lastUpdate.timeIntervalSince1970 else { return nil }
+        } else {
+            guard startedAt >= lastUpdate else { return nil }
+        }
+        return AgentEvent(event: .started, sessionId: agent.id, cwd: agent.cwd,
+                          ts: ISO8601.formatter.string(from: startedAt),
+                          message: "Codex turn started", transcriptPath: agent.transcriptPath,
+                          source: .codex, turnId: id)
+    }
+}
+
+func shouldWatchTranscript(_ agent: Agent, hasCommsAttachment: Bool) -> Bool {
+    switch agent.status {
+    case .running, .away, .needsAttention, .idle, .apiError:
+        return true
+    case .inactive:
+        return agent.source == .codex && agent.parentSessionId == nil
+            && agent.agentType == nil && hasCommsAttachment
+    }
+}
+
 struct TranscriptInfo {
     let initialTask: String?
     let latestSummary: String?
@@ -810,6 +877,7 @@ struct TranscriptInfo {
     let isToolPending: Bool    // last tool_use has no matching tool_result yet
     let model: String?         // most recent assistant message's model
     let codexUsage: CodexUsage?
+    var codexTurn: CodexTurnActivity? = nil
 }
 
 @MainActor
@@ -830,6 +898,7 @@ final class TranscriptReader {
         var pendingToolUseIds: Set<String> = []
         var lastModel: String?
         var codexUsage: CodexUsage?
+        var codexTurn: CodexTurnActivity?
     }
     private struct CacheEntry {
         let mtime: TimeInterval
@@ -961,6 +1030,7 @@ final class TranscriptReader {
 
     /// Folds a single decoded transcript line into the running parse state.
     private func ingestLine(_ obj: [String: Any], into state: inout ParseState) {
+        CodexTurnActivity.ingest(obj, into: &state.codexTurn)
         if obj["type"] as? String == "event_msg",
            let payload = obj["payload"] as? [String: Any],
            payload["type"] as? String == "token_count",
@@ -1073,7 +1143,8 @@ final class TranscriptReader {
             lastModified: lastModified,
             isToolPending: !state.pendingToolUseIds.isEmpty,
             model: state.lastModel,
-            codexUsage: state.codexUsage
+            codexUsage: state.codexUsage,
+            codexTurn: state.codexTurn
         )
     }
 
@@ -2666,7 +2737,7 @@ final class AgentStore: ObservableObject {
     /// session by, and it's explicitly released on `comms close`. `/name` sits
     /// above the name set here because it's the fresher in-session signal.
     func displayName(for agent: Agent) -> String? {
-        agent.commsAlias ?? sessionNames[agent.id] ?? customName(for: agent.id)
+        CommsNodeModel.shared.alias(harnessID: agent.id) ?? agent.commsAlias ?? sessionNames[agent.id] ?? customName(for: agent.id)
     }
 
     func setCustomName(_ name: String?, for id: String) {
@@ -2984,18 +3055,10 @@ final class AgentStore: ObservableObject {
     // overlay is visible, never on the live hot path.
     private var statsRefreshTimer: Timer?
 
-    // ── Comms-board presence ──
-    // The board's `/who`, polled on a slow tick so a bubble can show whether that
-    // session is actually *listening* (holding a doorbell) and not merely
-    // registered. Keyed by bare alias on THIS host — bubbles are local sessions,
-    // so no other host's ids can match one. Value = doorbell armed.
-    @Published private(set) var commsPresence: [String: Bool] = [:]
+    // Local-node snapshots back up its observational events. Neither this timer
+    // nor a bubble is part of the agent delivery path.
     private var commsPollTimer: Timer?
-    private var commsPollFailures = 0
     static let commsPresenceInterval: TimeInterval = 10
-    // Tolerate a couple of blips (broker restart / tunnel hiccup) before blanking
-    // the indicators — otherwise every restart flickers every bubble.
-    static let commsPresenceFailuresBeforeBlank = 3
 
     // ── Session names set inside the session (`/name`) ──
     // Claude Code keeps its own registry at ~/.claude/sessions/<pid>.json, which
@@ -3037,6 +3100,15 @@ final class AgentStore: ObservableObject {
         localNotifier.objectWillChange
             .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &cancellables)
+        CommsNodeModel.shared.objectWillChange
+            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .store(in: &cancellables)
+        CommsNodeModel.shared.$sessions
+            .map { sessions in Set(sessions.filter { $0.harness == "codex" && $0.endedAt == nil }.map(\.harnessSessionId)) }
+            .removeDuplicates()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.rebuildView() }
+            .store(in: &cancellables)
         loadGhosttyMap()
         loadCustomNames()
         registerProviders()
@@ -3047,8 +3119,8 @@ final class AgentStore: ObservableObject {
     }
 
     /// The one slow tick, carrying everything that has no event to hang off:
-    /// the board's `/who` (comms indicator) and the local Claude/Codex session
-    /// registries. One GET plus small local reads per tick.
+    /// local-node presence and the local Claude/Codex session registries.
+    /// Remote discovery is refreshed only while the comms dashboard is open.
     private func startSlowPolling() {
         refreshCommsPresence()
         refreshSessionNames()
@@ -3097,61 +3169,13 @@ final class AgentStore: ObservableObject {
     }
 
     private func refreshCommsPresence() {
-        guard let c = commsCredentials(), let url = URL(string: c.api + "/who") else {
-            commsPollFailures = 0
-            if !commsPresence.isEmpty { commsPresence = [:] }
-            return
-        }
-        var r = URLRequest(url: url)
-        r.setValue("Bearer \(c.token)", forHTTPHeaderField: "Authorization")
-        r.setValue("comms-cli/1.0", forHTTPHeaderField: "User-Agent")  // Cloudflare blocks default UAs
-        r.timeoutInterval = 8
-        URLSession.shared.dataTask(with: r) { d, resp, _ in
-            var presence: [String: Bool]? = nil
-            if let d, (resp as? HTTPURLResponse)?.statusCode == 200,
-               let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
-               let arr = o["agents"] as? [[String: Any]] {
-                var m: [String: Bool] = [:]
-                for a in arr {
-                    let parts = (a["id"] as? String ?? "").components(separatedBy: ":")
-                    guard parts.count == 2, parts[0] == c.host else { continue }
-                    m[parts[1]] = a["armed"] as? Bool ?? false
-                }
-                presence = m
-            }
-            Task { @MainActor [weak self] in self?.applyCommsPresence(presence) }
-        }.resume()
+        CommsNodeModel.shared.refresh()
     }
 
-    private func applyCommsPresence(_ presence: [String: Bool]?) {
-        guard let presence else {
-            commsPollFailures += 1
-            if commsPollFailures >= Self.commsPresenceFailuresBeforeBlank, !commsPresence.isEmpty {
-                commsPresence = [:]   // board unreachable long enough that "armed" would be a lie
-            }
-            return
-        }
-        commsPollFailures = 0
-        if presence != commsPresence { commsPresence = presence }
-    }
-
-    /// Where a session sits on the comms board: `.armed` = holding a doorbell, so
-    /// mail wakes it; `.present` = registered but with no live `comms wait`, i.e.
-    /// deaf until it re-arms; `.gone` = not on the board at all.
+    /// Match immutable harness-session IDs, not a legacy alias that may have
+    /// moved to a different session. The viewer never owns the receiver.
     func commsTier(for agent: Agent) -> PresenceTier {
-        guard let alias = agent.commsAlias, ownsAlias(agent, alias: alias),
-              let armed = commsPresence[alias] else { return .gone }
-        return armed ? .armed : .present
-    }
-
-    /// An alias belongs to whichever session registered it last — a dead session
-    /// keeps showing its old alias, and must not borrow the board presence of the
-    /// newer session that took the name over.
-    private func ownsAlias(_ agent: Agent, alias: String) -> Bool {
-        let newest = agents
-            .filter { $0.commsAlias == alias }
-            .max(by: { ($0.commsAliasAt ?? "") < ($1.commsAliasAt ?? "") })
-        return newest?.id == agent.id
+        CommsNodeModel.shared.tier(harnessID: agent.id)
     }
 
     /// Builds the external-source registry. To add a tool, append its provider here.
@@ -3549,6 +3573,7 @@ final class AgentStore: ObservableObject {
     ///   - .running → .away      when transcript silent > 60s (tool not pending)
     ///   - .away/.needsAttention → .running on fresh transcript writes (resume)
     ///   - .idle/.away → .inactive after 5min idle
+    ///   - idle/inactive Codex → .running on an explicit new task_started record
     ///   - subagent .inactive → cleared 5min after stop
     /// Never auto-transitions to .stopped — that requires a real Stop event.
     private func detectStaleness(_ agents: [Agent]) -> [AgentEvent] {
@@ -3562,6 +3587,11 @@ final class AgentStore: ObservableObject {
         }
 
         for a in agents {
+            if a.source == .codex, let path = a.transcriptPath, !path.isEmpty,
+               let event = transcriptReader.read(path: path).codexTurn?.wakeEvent(for: a) {
+                newEvents.append(event)
+                continue
+            }
             // Subagents go to .inactive immediately on stop (apply()), then
             // auto-clear 5min later. lastUpdate is the SubagentStop timestamp, so
             // the 5min countdown starts from when it actually finished.
@@ -3690,13 +3720,12 @@ final class AgentStore: ObservableObject {
     /// the away deadline — that's what lets us delete the steady poll entirely.
     private func reconcileTranscriptWatchers(_ agents: [Agent]) {
         var desired = Set<String>()
+        let attachedCodex = Set(CommsNodeModel.shared.sessions
+            .filter { $0.harness == "codex" && $0.endedAt == nil }.map(\.harnessSessionId))
         for a in agents {
-            switch a.status {
-            case .running, .away, .needsAttention, .idle, .apiError:
-                if let path = a.transcriptPath, !path.isEmpty { desired.insert(path) }
-            default:
-                break
-            }
+            guard shouldWatchTranscript(a, hasCommsAttachment: attachedCodex.contains(a.id)),
+                  let path = a.transcriptPath, !path.isEmpty else { continue }
+            desired.insert(path)
         }
 
         for (path, src) in transcriptWatchers where !desired.contains(path) {
@@ -3840,6 +3869,7 @@ final class AgentStore: ObservableObject {
         defer {
             if var a = byId[rec.sessionId] {
                 a.source = rec.source ?? a.source
+                if let turnId = rec.turnId, !turnId.isEmpty { a.codexTurnId = turnId }
                 byId[rec.sessionId] = a
             }
             // Whenever the hook reports the focused terminal id, trust it — this
@@ -4708,7 +4738,7 @@ struct ContentView: View {
                     .foregroundStyle(store.commsOverlayOpen ? Color.accentColor : Color.secondary)
             }
             .buttonStyle(.borderless)
-            .help(store.commsOverlayOpen ? "Close comms board" : "Comms board")
+            .help(store.commsOverlayOpen ? "Close comms" : "Comms")
 
             Button {
                 store.reload()
@@ -5004,443 +5034,7 @@ struct AgentRow: View {
 
 // MARK: - Settings overlay
 
-// MARK: - Comms board dashboard (viewer of the inter-agent comms broker)
-
-/// The broker connection, read live from `~/.claude/settings.json` env (the same
-/// place Claude Code sessions inherit it from) — nothing is hardcoded or cached,
-/// so reconnecting in Settings takes effect on the next poll.
-func commsCredentials() -> (api: String, token: String, host: String)? {
-    let url = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".claude/settings.json")
-    guard let data = try? Data(contentsOf: url),
-          let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-          let env = root["env"] as? [String: Any],
-          let api = env["COMMS_API"] as? String, !api.isEmpty,
-          let token = env["COMMS_TOKEN"] as? String, !token.isEmpty else { return nil }
-    return (api, token, env["COMMS_HOST"] as? String ?? "")
-}
-
-struct CommsAgent: Identifiable {
-    let id: String        // full host:alias
-    let host: String
-    let name: String      // alias
-    let owner: String
-    let armed: Bool
-}
-
-struct CommsMsg: Identifiable {
-    let id: String
-    let from: String
-    let to: String
-    let scope: String
-    let body: String
-    let ts: String
-}
-
-/// How "live" an agent is, derived purely from the comms board's /who presence.
-/// armed = holding a /wait doorbell (idle & instantly reachable); present = a fresh
-/// presence row but no held wait (busy mid-turn); gone = reaped/closed.
-enum PresenceTier: Int, Comparable {
-    case gone = 0, present = 1, armed = 2
-    static func < (l: PresenceTier, r: PresenceTier) -> Bool { l.rawValue < r.rawValue }
-    var color: Color {
-        switch self {
-        case .armed:   return .green
-        case .present: return .yellow
-        case .gone:    return Color.secondary.opacity(0.35)
-        }
-    }
-    var label: String {
-        switch self {
-        case .armed:   return "armed"
-        case .present: return "present"
-        case .gone:    return "gone"
-        }
-    }
-}
-
-/// A WhatsApp-style thread: either the pinned global "Everyone" feed, or every
-/// message exchanged between one unordered pair of agent ids (host:alias).
-struct CommsConversation: Identifiable {
-    let id: String          // canonical pair key, or "__everyone__"
-    let isEveryone: Bool
-    let a: String           // canonical-ordered participant ids ("" for everyone)
-    let b: String
-    var msgs: [CommsMsg]    // chronological ascending
-    var lastTs: String { msgs.last?.ts ?? "" }
-    var lastBody: String { msgs.last?.body ?? "" }
-}
-
-struct CommsDashboardView: View {
-    @EnvironmentObject var store: AgentStore
-    @State private var agents: [CommsAgent] = []
-    @State private var conversations: [CommsConversation] = []
-    @State private var selectedId: String? = nil   // nil = showing the conversation list
-    @State private var loaded = false
-    @AppStorage("agentMonitor.commsFontScale") private var commsFontScale: Double = 1.0
-    @State private var keyMonitor: Any? = nil
-    private let timer = Timer.publish(every: 10, on: .main, in: .common).autoconnect()
-
-    // Explicit font scaling — macOS ignores dynamicTypeSize, so (like the report view)
-    // we multiply concrete point sizes by this factor. ⌘± / A−/A+ bump it.
-    private var scale: CGFloat { CGFloat(commsFontScale) }
-    private func sysFont(_ size: CGFloat, _ w: Font.Weight = .regular) -> Font {
-        .system(size: size * scale, weight: w)
-    }
-    private func stepType(_ d: Int) {
-        commsFontScale = min(2.4, max(0.8, commsFontScale + Double(d) * 0.1))
-    }
-
-    var body: some View {
-        VStack(spacing: 0) {
-            header
-            Divider()
-            if commsCreds() == nil {
-                notConnected
-            } else {
-                HStack(spacing: 0) {
-                    agentsPane.frame(width: 240)
-                    Divider()
-                    mainPane
-                }
-            }
-        }
-        .onAppear {
-            refresh()
-            installTypeKeyMonitor()
-        }
-        .onDisappear {
-            if let m = keyMonitor { NSEvent.removeMonitor(m); keyMonitor = nil }
-        }
-        .onReceive(timer) { _ in if store.commsOverlayOpen { refresh() } }
-    }
-
-    // ⌘+ / ⌘= / ⌘- resize text. A local key monitor is more reliable than SwiftUI
-    // keyboardShortcut here (no menu item, and "+" needs Shift on most layouts).
-    private func installTypeKeyMonitor() {
-        guard keyMonitor == nil else { return }
-        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { ev in
-            guard store.commsOverlayOpen, ev.modifierFlags.contains(.command) else { return ev }
-            switch ev.charactersIgnoringModifiers {
-            case "+", "=": stepType(1);  return nil
-            case "-", "_": stepType(-1); return nil
-            default:       return ev
-            }
-        }
-    }
-
-    // ---- presence ----
-    private func tier(_ id: String) -> PresenceTier {
-        guard let a = agents.first(where: { $0.id == id }) else { return .gone }
-        return a.armed ? .armed : .present
-    }
-    /// A conversation lights up at the strongest tier among its participants.
-    private func convTier(_ c: CommsConversation) -> PresenceTier {
-        if c.isEveryone {
-            let ids = Set(c.msgs.flatMap { [$0.from, $0.to] }).filter { !$0.isEmpty }
-            return ids.map(tier).max() ?? .gone
-        }
-        return Swift.max(tier(c.a), tier(c.b))
-    }
-    private func alias(_ id: String) -> String { id.components(separatedBy: ":").last ?? id }
-
-    private var header: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "bubble.left.and.bubble.right").foregroundStyle(.tint)
-            Text("Comms Board").font(.headline)
-            Spacer()
-            Text("\(conversations.count) chats · \(agents.filter { $0.armed }.count)/\(agents.count) live")
-                .font(.caption).foregroundStyle(.secondary)
-            Button { stepType(-1) } label: { Image(systemName: "textformat.size.smaller") }
-                .buttonStyle(.borderless).help("Smaller text (⌘−)")
-            Button { stepType(1) } label: { Image(systemName: "textformat.size.larger") }
-                .buttonStyle(.borderless).help("Larger text (⌘+)")
-            Button { refresh() } label: { Image(systemName: "arrow.clockwise") }
-                .buttonStyle(.borderless).help("Refresh")
-            Button { store.commsOverlayOpen = false } label: { Image(systemName: "xmark.circle.fill") }
-                .buttonStyle(.borderless).help("Close")
-        }
-        .padding(.horizontal, 12).padding(.vertical, 9)
-    }
-
-    // ---- agents sidebar (left) ----
-    private var agentsPane: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Text("AGENTS").font(sysFont(10, .semibold)).foregroundStyle(.secondary)
-                .padding(.horizontal, 12).padding(.vertical, 6)
-            if agents.isEmpty {
-                Text(loaded ? "No agents online." : "Loading…")
-                    .font(sysFont(11)).foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 12)
-                Spacer()
-            } else {
-                List(agents) { a in
-                    HStack(spacing: 8) {
-                        Circle().fill(tier(a.id).color).frame(width: 8 * scale, height: 8 * scale)
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(a.name).font(sysFont(13, .medium)).lineLimit(1)
-                            Text(a.owner.isEmpty ? a.host : "\(a.host) · \(a.owner)")
-                                .font(sysFont(10)).foregroundStyle(.secondary).lineLimit(1)
-                        }
-                        Spacer()
-                    }
-                    .help("\(a.id) — \(tier(a.id).label)")
-                }
-                .listStyle(.inset)
-            }
-        }
-    }
-
-    // ---- main pane (right): conversation list, or an opened thread ----
-    @ViewBuilder
-    private var mainPane: some View {
-        if let c = conversations.first(where: { $0.id == selectedId }) {
-            thread(c)
-        } else {
-            conversationList
-        }
-    }
-
-    private var conversationList: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Text("CONVERSATIONS").font(sysFont(10, .semibold)).foregroundStyle(.secondary)
-                .padding(.horizontal, 12).padding(.vertical, 6)
-            if conversations.isEmpty {
-                Text(loaded ? "No conversations yet." : "Loading…")
-                    .font(sysFont(11)).foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                List(conversations) { c in
-                    Button { selectedId = c.id } label: { convRow(c) }
-                        .buttonStyle(.plain)
-                        .contentShape(Rectangle())
-                }
-                .listStyle(.inset)
-            }
-        }
-    }
-
-    private func convTitle(_ c: CommsConversation) -> String {
-        c.isEveryone ? "📣 Everyone" : "\(c.a) ⇄ \(c.b)"
-    }
-
-    @ViewBuilder
-    private func convRow(_ c: CommsConversation) -> some View {
-        let t = convTier(c)
-        HStack(spacing: 8) {
-            Circle().fill(t.color).frame(width: 9 * scale, height: 9 * scale)
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 6) {
-                    Text(convTitle(c)).font(sysFont(13, .medium)).lineLimit(1)
-                    Spacer(minLength: 4)
-                    Text(shortTime(c.lastTs)).font(sysFont(10)).foregroundStyle(.secondary)
-                }
-                Text(c.msgs.isEmpty ? "" : "\(alias(c.msgs.last!.from)): \(c.lastBody)")
-                    .font(sysFont(11)).foregroundStyle(.secondary).lineLimit(1)
-            }
-            Image(systemName: "chevron.right").font(sysFont(10)).foregroundStyle(.tertiary)
-        }
-        .padding(.vertical, 4)
-        .opacity(t == .gone ? 0.5 : 1)
-    }
-
-    @ViewBuilder
-    private func thread(_ c: CommsConversation) -> some View {
-        VStack(spacing: 0) {
-            threadHeader(c)
-            Divider()
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 6) {
-                        ForEach(c.msgs) { m in bubble(m, in: c) }
-                    }
-                    .padding(12)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .onAppear { scrollToEnd(proxy, c) }
-                .onChange(of: c.lastTs) { scrollToEnd(proxy, c) }
-                .onChange(of: selectedId) { scrollToEnd(proxy, c) }
-            }
-        }
-    }
-
-    private func scrollToEnd(_ proxy: ScrollViewProxy, _ c: CommsConversation) {
-        guard let last = c.msgs.last else { return }
-        DispatchQueue.main.async { proxy.scrollTo(last.id, anchor: .bottom) }
-    }
-
-    @ViewBuilder
-    private func threadHeader(_ c: CommsConversation) -> some View {
-        HStack(spacing: 10) {
-            Button { selectedId = nil } label: {
-                Image(systemName: "chevron.left").font(.body.weight(.semibold))
-            }
-            .buttonStyle(.borderless).help("Back to conversations")
-            .keyboardShortcut(.escape, modifiers: [])
-            if c.isEveryone {
-                Text("📣 Everyone").font(sysFont(15, .semibold))
-                Text("global broadcasts").font(sysFont(11)).foregroundStyle(.secondary)
-            } else {
-                participantTag(c.a)
-                Image(systemName: "arrow.left.arrow.right").font(sysFont(11)).foregroundStyle(.secondary)
-                participantTag(c.b)
-            }
-            Spacer()
-            Text("\(c.msgs.count) msgs").font(sysFont(10)).foregroundStyle(.secondary)
-        }
-        .padding(.horizontal, 12).padding(.vertical, 8)
-    }
-
-    @ViewBuilder
-    private func participantTag(_ id: String) -> some View {
-        let t = tier(id)
-        HStack(spacing: 5) {
-            Circle().fill(t.color).frame(width: 8 * scale, height: 8 * scale)
-            Text(alias(id)).font(sysFont(13, .semibold))
-            Text(id.components(separatedBy: ":").first ?? "")
-                .font(sysFont(10)).foregroundStyle(.secondary)
-        }
-        .help("\(id) — \(t.label)")
-    }
-
-    @ViewBuilder
-    private func bubble(_ m: CommsMsg, in c: CommsConversation) -> some View {
-        // In a pair thread, agent `b` sits on the right; everyone-thread is all-left.
-        let right = !c.isEveryone && m.from == c.b
-        HStack {
-            if right { Spacer(minLength: 48) }
-            VStack(alignment: .leading, spacing: 3) {
-                Text(alias(m.from)).font(sysFont(10, .semibold)).foregroundStyle(.secondary)
-                Text(m.body).font(sysFont(13)).textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
-                Text(shortTime(m.ts)).font(sysFont(9)).foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .trailing)
-            }
-            .padding(.horizontal, 10).padding(.vertical, 7)
-            .background(RoundedRectangle(cornerRadius: 13)
-                .fill(right ? Color.accentColor.opacity(0.18) : Color.secondary.opacity(0.12)))
-            if !right { Spacer(minLength: 48) }
-        }
-        .id(m.id)
-    }
-
-    private var notConnected: some View {
-        VStack(spacing: 10) {
-            Image(systemName: "antenna.radiowaves.left.and.right.slash")
-                .font(.largeTitle).foregroundStyle(.secondary)
-            Text("Not connected to a comms board.").foregroundStyle(.secondary)
-            Button("Open Settings → Comms Board") {
-                store.commsOverlayOpen = false
-                store.settingsOverlayOpen = true
-            }
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
-    // ---- networking ----
-    private func commsCreds() -> (api: String, token: String, host: String)? {
-        commsCredentials()
-    }
-
-    private func get(_ path: String, _ done: @escaping ([String: Any]?) -> Void) {
-        guard let c = commsCreds(), let url = URL(string: c.api + path) else { done(nil); return }
-        var r = URLRequest(url: url)
-        r.setValue("Bearer \(c.token)", forHTTPHeaderField: "Authorization")
-        r.setValue("comms-cli/1.0", forHTTPHeaderField: "User-Agent")
-        r.timeoutInterval = 12
-        URLSession.shared.dataTask(with: r) { d, _, _ in
-            var obj: [String: Any]? = nil
-            if let d = d { obj = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] }
-            DispatchQueue.main.async { done(obj) }
-        }.resume()
-    }
-
-    private func refresh() {
-        get("/who") { o in
-            guard let arr = o?["agents"] as? [[String: Any]] else { return }
-            agents = arr.map { a in
-                let id = a["id"] as? String ?? "?"
-                return CommsAgent(id: id,
-                                  host: a["host"] as? String ?? "",
-                                  name: id.components(separatedBy: ":").last ?? id,
-                                  owner: a["owner"] as? String ?? "",
-                                  armed: a["armed"] as? Bool ?? false)
-            }
-        }
-        get("/log?all=1") { o in
-            loaded = true
-            guard let arr = o?["messages"] as? [[String: Any]] else { return }
-            let ms = arr.map { m in
-                CommsMsg(id: m["id"] as? String ?? UUID().uuidString,
-                         from: m["from"] as? String ?? "",
-                         to: m["to"] as? String ?? "",
-                         scope: m["scope"] as? String ?? "",
-                         body: m["body"] as? String ?? "",
-                         ts: m["ts"] as? String ?? "")
-            }
-            conversations = buildConversations(ms)  // server returns ts ascending
-            // Keep showing the list by default; only drop back if the open thread vanished.
-            if let s = selectedId, !conversations.contains(where: { $0.id == s }) {
-                selectedId = nil
-            }
-        }
-    }
-
-    /// Group the flat message log into pairwise threads + one pinned Everyone feed.
-    /// Threads are sorted most-recent-first; Everyone is always pinned on top.
-    private func buildConversations(_ msgs: [CommsMsg]) -> [CommsConversation] {
-        var pairs: [String: [CommsMsg]] = [:]
-        var everyone: [CommsMsg] = []
-        for m in msgs {
-            let broadcast = m.scope == "global" || m.to.isEmpty || m.to == "all" || m.to == "everyone"
-            if broadcast {
-                everyone.append(m)
-            } else {
-                let key = [m.from, m.to].sorted().joined(separator: "\u{1}")
-                pairs[key, default: []].append(m)
-            }
-        }
-        var convs: [CommsConversation] = pairs.map { key, ms in
-            let parts = key.components(separatedBy: "\u{1}")
-            return CommsConversation(id: key, isEveryone: false,
-                                     a: parts.first ?? "",
-                                     b: parts.count > 1 ? parts[1] : "",
-                                     msgs: ms.sorted { $0.ts < $1.ts })
-        }
-        convs.sort { $0.lastTs > $1.lastTs }
-        if !everyone.isEmpty {
-            convs.insert(CommsConversation(id: "__everyone__", isEveryone: true, a: "", b: "",
-                                           msgs: everyone.sorted { $0.ts < $1.ts }), at: 0)
-        }
-        return convs
-    }
-
-    // Server timestamps are UTC ISO8601 ("…T14:32:05Z"); render them in the client's
-    // local timezone — today as HH:mm, older as "d MMM, HH:mm".
-    private static let isoParser: ISO8601DateFormatter = {
-        let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime]; return f
-    }()
-    private static let isoParserFrac: ISO8601DateFormatter = {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]; return f
-    }()
-    private static let localTime: DateFormatter = {
-        let f = DateFormatter(); f.locale = .current; f.dateFormat = "HH:mm"; return f
-    }()
-    private static let localDayTime: DateFormatter = {
-        let f = DateFormatter(); f.locale = .current
-        f.setLocalizedDateFormatFromTemplate("d MMM HH:mm"); return f
-    }()
-
-    private func shortTime(_ iso: String) -> String {
-        guard let d = Self.isoParser.date(from: iso) ?? Self.isoParserFrac.date(from: iso) else {
-            return iso.split(separator: "T").last.map { String($0.prefix(5)) } ?? iso
-        }
-        return Calendar.current.isDateInToday(d)
-            ? Self.localTime.string(from: d)
-            : Self.localDayTime.string(from: d)
-    }
-}
+// Comms node models, client, dashboard and settings live in CommsNode*.swift.
 
 struct SettingsView: View {
     @EnvironmentObject var store: AgentStore
@@ -5451,13 +5045,6 @@ struct SettingsView: View {
     @AppStorage("agentMonitor.housekeepingHeartbeatSec") private var hkHeartbeat = 1800.0
     @AppStorage("agentMonitor.housekeepingMarkdownDir") private var hkMarkdownDir = ""
     @AppStorage("agentMonitor.bubbleScale") private var bubbleScale = 1.08
-
-    // Comms board connection — persisted in ~/.claude/settings.json env, loaded on appear.
-    @State private var commsApi = ""
-    @State private var commsHost = ""
-    @State private var commsToken = ""
-    @State private var commsStatus = ""
-    @State private var commsBusy = false
 
     private var nativeBanners: Binding<Bool> {
         Binding(get: { store.localNotifier.enabled },
@@ -5503,7 +5090,7 @@ struct SettingsView: View {
                     Toggle("Push to phone", isOn: pushEnabled)
                         .disabled(!store.pushNotifier.isAvailable)
                     if !store.pushNotifier.isAvailable {
-                        Text("Push needs the jsplayground MCP configured in ~/.claude.json")
+                        Text("Push needs an MCP server with a send_push tool in ~/.claude.json (see README)")
                             .font(.caption).foregroundStyle(.secondary)
                     }
                     Button("Send test banner") { store.localNotifier.sendTest() }
@@ -5564,23 +5151,8 @@ struct SettingsView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
 
-                Section("Comms Board") {
-                    TextField("Host (e.g. personal)", text: $commsHost)
-                    TextField("Server URL (https://…)", text: $commsApi)
-                    SecureField("API token", text: $commsToken)
-                    HStack {
-                        Button(commsBusy ? "Connecting…" : "Connect & Verify") { commsConnect() }
-                            .disabled(commsBusy || commsApi.isEmpty || commsHost.isEmpty || commsToken.isEmpty)
-                        Spacer()
-                        if !commsStatus.isEmpty {
-                            Text(commsStatus)
-                                .font(.caption)
-                                .foregroundStyle(commsStatus.hasPrefix("✓") ? Color.green : Color.red)
-                                .lineLimit(1).truncationMode(.tail)
-                        }
-                    }
-                    Text("Connect this Mac to the inter-agent comms board: saves your credentials to ~/.claude/settings.json, installs the comms CLI (~/.local/bin/comms, added to your shell PATH) and the open-comms skill, and verifies — so your Claude Code sessions can join in one click. Get the host, URL, and token from the board operator.")
-                        .font(.caption).foregroundStyle(.secondary)
+                Section("Comms node") {
+                    CommsNodeSettingsView()
                 }
 
                 Section("Shortcuts") {
@@ -5597,121 +5169,6 @@ struct SettingsView: View {
                 }
             }
             .formStyle(.grouped)
-            .onAppear { loadCommsConfig() }
-        }
-    }
-
-    private func loadCommsConfig() {
-        let url = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".claude/settings.json")
-        guard let data = try? Data(contentsOf: url),
-              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let env = root["env"] as? [String: Any] else { return }
-        commsApi = env["COMMS_API"] as? String ?? ""
-        commsHost = env["COMMS_HOST"] as? String ?? ""
-        commsToken = env["COMMS_TOKEN"] as? String ?? ""
-    }
-
-    // Persist the creds into ~/.claude/settings.json env (so Claude Code sessions inherit them),
-    // then verify the connection against the broker's /who.
-    private func commsConnect() {
-        commsBusy = true; commsStatus = ""
-        let api = commsApi.trimmingCharacters(in: .whitespaces)
-        let host = commsHost.trimmingCharacters(in: .whitespaces)
-        let token = commsToken.trimmingCharacters(in: .whitespaces)
-
-        let settingsURL = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".claude/settings.json")
-        var root: [String: Any] = [:]
-        if let data = try? Data(contentsOf: settingsURL),
-           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            root = obj
-        }
-        var env = (root["env"] as? [String: Any]) ?? [:]
-        env["COMMS_API"] = api; env["COMMS_TOKEN"] = token; env["COMMS_HOST"] = host
-        root["env"] = env
-        do {
-            try FileManager.default.createDirectory(at: settingsURL.deletingLastPathComponent(),
-                                                     withIntermediateDirectories: true)
-            let out = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
-            try out.write(to: settingsURL)
-        } catch {
-            commsStatus = "⚠︎ settings.json: \(error.localizedDescription)"; commsBusy = false; return
-        }
-
-        guard let url = URL(string: api + "/who") else {
-            commsStatus = "⚠︎ invalid URL"; commsBusy = false; return
-        }
-        var req = URLRequest(url: url)
-        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        req.setValue("comms-cli/1.0", forHTTPHeaderField: "User-Agent")  // Cloudflare blocks default UAs
-        req.timeoutInterval = 12
-        URLSession.shared.dataTask(with: req) { data, resp, err in
-            DispatchQueue.main.async {
-                commsBusy = false
-                if let err = err { commsStatus = "⚠︎ \(err.localizedDescription)"; return }
-                let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
-                if code == 200 {
-                    var n = 0
-                    if let d = data,
-                       let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
-                       let agents = o["agents"] as? [Any] { n = agents.count }
-                    commsStatus = "✓ Connected — installing CLI + skill…"
-                    installCommsTooling(api: api, token: token) { ok in
-                        commsStatus = ok
-                            ? "✓ Connected as \(host) — \(n) on the board, CLI + skill installed"
-                            : "✓ Connected as \(host) — \(n) on the board (CLI/skill install failed)"
-                    }
-                } else if code == 401 {
-                    commsStatus = "⚠︎ unauthorized (check token)"
-                } else {
-                    commsStatus = "⚠︎ HTTP \(code)"
-                }
-            }
-        }.resume()
-    }
-
-    // Download the CLI + skill from the broker's bearer-gated endpoints and install them,
-    // so a brand-new machine is fully set up to participate — in one click.
-    private func installCommsTooling(api: String, token: String, done: @escaping (Bool) -> Void) {
-        let group = DispatchGroup()
-        var ok = true
-        func fetch(_ path: String, to dest: URL, exec: Bool) {
-            group.enter()
-            guard let url = URL(string: api + path) else { ok = false; group.leave(); return }
-            var r = URLRequest(url: url)
-            r.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-            r.setValue("comms-cli/1.0", forHTTPHeaderField: "User-Agent")
-            r.timeoutInterval = 12
-            URLSession.shared.dataTask(with: r) { d, resp, _ in
-                defer { group.leave() }
-                guard let d = d, (resp as? HTTPURLResponse)?.statusCode == 200 else { ok = false; return }
-                do {
-                    try FileManager.default.createDirectory(at: dest.deletingLastPathComponent(),
-                                                            withIntermediateDirectories: true)
-                    try d.write(to: dest)
-                    if exec {
-                        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dest.path)
-                    }
-                } catch { ok = false }
-            }.resume()
-        }
-        let home = NSHomeDirectory()
-        fetch("/cli", to: URL(fileURLWithPath: home).appendingPathComponent(".local/bin/comms"), exec: true)
-        fetch("/skill", to: URL(fileURLWithPath: home).appendingPathComponent(".claude/skills/open-comms/SKILL.md"), exec: false)
-        group.notify(queue: .main) { ensureLocalBinOnPath(); done(ok) }
-    }
-
-    // On a fresh Mac, ~/.local/bin is NOT on the default PATH, so the installed `comms`
-    // wouldn't be found. Add it to the user's zsh profile (idempotent), so new shells —
-    // and thus Claude Code's tool calls — can resolve it. Creates the profile if missing.
-    private func ensureLocalBinOnPath() {
-        let home = NSHomeDirectory()
-        let exportLine = "export PATH=\"$HOME/.local/bin:$PATH\"  # added by AgentMonitor comms wizard\n"
-        for name in [".zprofile", ".zshrc"] {
-            let f = URL(fileURLWithPath: home).appendingPathComponent(name)
-            let existing = (try? String(contentsOf: f, encoding: .utf8)) ?? ""
-            if existing.contains(".local/bin") { continue }   // already wired up in this file
-            let sep = (existing.isEmpty || existing.hasSuffix("\n")) ? "" : "\n"
-            try? (existing + sep + exportLine).write(to: f, atomically: true, encoding: .utf8)
         }
     }
 
@@ -6472,8 +5929,8 @@ struct BubbleView: View {
                 .foregroundStyle(comms.color)
                 .shadow(color: comms.color.opacity(0.7), radius: 3)
                 .help(comms == .armed
-                      ? "Listening on the comms board — doorbell armed"
-                      : "On the comms board but no doorbell armed — it won't be woken")
+                      ? "Local node receiver connected — peer messages can wake this session"
+                      : "Identity registered; attach its receiver to receive messages")
         }
     }
 
@@ -6646,6 +6103,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
+        CommsNodeModel.shared.start()
 
         makeMainWindow()
         makeBubblePanel()
@@ -6677,6 +6135,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if store.localNotifier.enabled {
             store.localNotifier.requestAuthorization()
         }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        // Stop only the viewer's observational helper. The launchd node and
+        // harness-owned delivery receivers continue running.
+        CommsNodeModel.shared.stopObserving()
     }
 
     // Regular, normal-level window — behaves like any app window (not pinned
@@ -6814,6 +6278,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+#if !AGENT_MONITOR_TESTS
 @main
 struct Main {
     static func main() {
@@ -6823,3 +6288,4 @@ struct Main {
         app.run()
     }
 }
+#endif

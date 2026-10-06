@@ -2,7 +2,42 @@
 
 A native macOS floating window that shows live status of every running coding-agent session across your machine — **Claude Code, Codex, and Cursor**, side by side in one list. Status, runtime, AI-generated titles, and live "what's happening now" descriptions. Claude Code and Codex are driven by hooks writing JSON-line events; Cursor is read live from its local SQLite store (no hooks needed). Each row is tagged with its source.
 
-Built in a single Swift file with no external dependencies (no Xcode project, no Swift Package Manager). Compiles to a `.app` bundle in ~3 seconds.
+Built with native SwiftUI and a small comms integration module (no Xcode project or Swift Package Manager). The app bundles a pinned standalone comms node release; the node runs independently under the user's service supervisor.
+
+## Part of a three-repo stack
+
+| Repo | What it is | Runs on |
+|---|---|---|
+| [brain](https://github.com/joaohts/brain) | A long-running personal agent: LLM loop, tools, memory, and channels (WhatsApp, comms, CLI) | Linux / Raspberry Pi |
+| [comms](https://github.com/joaohts/comms) | Encrypted messaging between agent sessions and machines: node, CLI, optional broker | macOS, Linux |
+| **agent-monitor** (this repo) | macOS app: live view of every Claude Code / Codex / Cursor session, plus a comms dashboard | macOS |
+
+Each works alone. Together: install **comms** on every machine, **agent-monitor**
+on your Mac (it bundles a pinned comms release), and **brain** on an always-on box
+with its comms channel enabled. Pair the machines once and every session — and the
+brain — can reach every other.
+
+How the parts connect:
+
+- **agent-monitor ↔ comms** — the app bundles a pinned comms release, installs it as a per-user service, and shows its agents, history, pairing and grants. See [agent-monitor: comms connection](https://github.com/joaohts/agent-monitor/blob/main/docs/comms-connection.md).
+- **brain ↔ comms** — the brain joins comms as a persistent agent (alias `brain`), so any session can message it and it can message back. See [comms: brain integration](https://github.com/joaohts/comms/blob/main/docs/BRAIN.md).
+- **Claude Code / Codex ↔ comms** — sessions launched through `comms claude` / `comms codex` receive peer messages. See [comms: Claude](https://github.com/joaohts/comms/blob/main/docs/CLAUDE.md) and [Codex](https://github.com/joaohts/comms/blob/main/docs/CODEX.md).
+
+## Local agent communications
+
+Every installation includes local comms for Claude and supported Codex sessions.
+The Comms dashboard reads node presence, persistent identities, and message history;
+Settings manages the machine nickname, optional broker, pinned peer keys, and
+directional messaging/history grants. Local communication needs no broker account.
+
+- Claude's node settings select a 30-minute Monitor (default) or experimental MCP channel. The `claude` shortcut follows the saved mode on the next launch/resume, supplying MCP configuration and the development-channel flag only in channel mode. Existing sessions keep their current receiver.
+- Codex requires its supported app-server tool-output receiver; the GUI never types
+  peer text as a user message. Unsupported sessions show the required setup.
+- Closing, freezing, or rebuilding the viewer does not stop the node or its receivers.
+- Existing legacy commands, credentials, and history remain separate during migration.
+
+See [node setup and migration](docs/comms-connection.md) for release acquisition,
+installation paths, pairing, updates, rollback, and a direct independence test.
 
 > **New:** floating bubbles overlay, jump-to-session hotkeys (Ghostty), custom + AI-generated tags, and native macOS notifications. See **[docs/features-and-setup.md](docs/features-and-setup.md)** for the full feature map, portability tiers (what works without Ghostty), and the guided setup wizard.
 
@@ -31,9 +66,9 @@ self-updating report** of what each one is *doing*, in an IDE-style workspace.
 
 It's a drop-in upgrade — **rebuild and you're done:**
 
-- **Installation is unchanged.** `./build.sh` as before. **No hook changes, no
-  `settings.json` changes, no new dependencies/frameworks** — the only changed source is
-  `AgentMonitor.swift`. Your existing hooks keep working as-is.
+- **Existing activity hooks keep working.** `./build.sh` also bundles the pinned
+  comms release. Source builders need authorized release access or a provided
+  release directory; the finished app needs no GitHub credentials.
 - **No new hard requirements.** The summary agent uses an already logged-in `claude`
   or `codex` CLI. Claude is preferred when both exist; Codex is a fully independent
   fallback. An Anthropic API key file remains an optional metered Haiku route.
@@ -57,7 +92,7 @@ It's a drop-in upgrade — **rebuild and you're done:**
 - AI-generated session titles via a side-car `claude -p` call
 - Live "what's happening right now" subtitle while a session is actively processing
 - Sound alerts when a session needs your attention or finishes
-- **Push notifications to your phone** (optional) via the jsplayground MCP
+- **Push notifications to your phone** (optional) via any MCP server exposing a `send_push` tool
 - **Stats overlay** with daily / weekly / monthly / all-time tabs: sessions, steps, time totals, per-step averages, concurrency duration, top-3 projects, hour-of-day histogram
 - Two-column layout: things that need you on the left, active sessions on the right
 - **Floating bubbles overlay** (`⌥⌘B`): an ambient, click-through, always-on-top view that floats over fullscreen apps — one colored bubble per session
@@ -180,7 +215,10 @@ Hooks are external shell scripts. Appending one JSON line is trivial (`echo >> f
 
 | Path | Purpose |
 |---|---|
-| `AgentMonitor.swift` | Single-file SwiftUI app (~700 lines) |
+| `AgentMonitor.swift` | Main SwiftUI viewer, activity providers, hooks, and session navigation |
+| `CommsNodeClient.swift` | Bounded local CLI/API client and observational event stream |
+| `CommsNodeViews.swift` | Node status, identities, history, pairing, and directional grants |
+| `comms-release.json` | Pinned comms release, API version, and archive checksums |
 | `build.sh` | Compiles to `.app` bundle, kills prior instance, launches |
 | `hooks/agent-monitor-hook.sh` | The Claude Code hook script |
 | `~/.claude/agents.jsonl` | Event log (the database) |
@@ -199,6 +237,9 @@ Hooks are external shell scripts. Appending one JSON line is trivial (`echo >> f
 - macOS 13+ (uses `URL.appending(path:)`)
 - Xcode Command Line Tools (`swiftc`, `xcodebuild`) — install with `xcode-select --install`
 - `jq` — `brew install jq`
+- Python 3 for release checksum verification and per-user service installation
+- Source builds: access to the pinned comms release through `gh`, or
+  `COMMS_RELEASE_DIR=/path/to/verified-release-files`
 - At least one logged-in agent CLI: `claude` or `codex`. When both are present,
   Agent Monitor prefers Claude for local AI labels; Codex is the automatic fallback.
 
@@ -275,6 +316,7 @@ The first time you trigger an AI title (or live status), macOS may prompt for **
 ```bash
 ./build.sh           # debug build (~3s, recommended for iteration)
 RELEASE=1 ./build.sh # optimized build (~15s)
+NO_LAUNCH=1 ./build.sh # verify without closing/launching the current GUI
 ```
 
 ---
@@ -307,7 +349,7 @@ Trimmed to the essentials — everything configurable now lives in the Settings 
 A grouped overlay with independent sections:
 
 - **Bubbles** — show overlay · include inactive sessions · corner picker
-- **Notifications** — sound alerts · macOS banners · push to phone (auto-disabled with a hint when the jsplayground MCP isn't configured)
+- **Notifications** — sound alerts · macOS banners · push to phone (auto-disabled with a hint when no push server is configured)
 - **AI** — toggle AI session-title generation (tags are generated on demand via ✨ when naming an agent)
 - **Shortcuts** — reference list; jump shortcuts (`⌥1…9`, `` ⌥` ``) are shown only when Ghostty is detected
 
@@ -433,7 +475,7 @@ Both generators run output through `ClaudeP.sanitizeShortPhrase`:
 
 ## Push notifications (optional)
 
-The 🔔 bell button in the header sends pushes to your phone via the **jsplayground MCP server** when:
+The 🔔 bell button in the header sends pushes to your phone through an **HTTP MCP server that exposes a `send_push` tool** (see [Wire format](#wire-format)) when:
 
 - A session transitions to **`.needsAttention`** → urgent push: `🟠 <project> needs attention`
 - A session transitions to **`.idle`** from `running` / `away` / `needs_attention` (real turn completion) → info push: `✅ <project> finished`
@@ -442,14 +484,14 @@ Skipped: brand-new sessions (`nil → idle`), automatic decay (`idle → inactiv
 
 ### Configuration
 
-The app reads jsplayground server config from `~/.claude.json` at launch. Add this block under `mcpServers`:
+The app reads the push server from `~/.claude.json` at launch: the `mcpServers` entry named `push` by default. Point it at your own server:
 
 ```json
 {
   "mcpServers": {
-    "jsplayground": {
+    "push": {
       "type": "http",
-      "url": "https://mcp.jsplayground.cc/mcp",
+      "url": "https://your-push-server.example/mcp",
       "headers": {
         "Authorization": "Bearer <YOUR_TOKEN>"
       }
@@ -458,7 +500,13 @@ The app reads jsplayground server config from `~/.claude.json` at launch. Add th
 }
 ```
 
-Token comes from however jsplayground issues them (it's João's personal Pager API service — not generally available).
+If your server already has another name in `~/.claude.json`, point the app at it instead:
+
+```bash
+defaults write com.local.agentmonitor agentMonitor.pushServer YOUR_SERVER_NAME
+```
+
+Without a push server the bell stays disabled and everything else works.
 
 ### Button states
 

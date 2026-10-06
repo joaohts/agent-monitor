@@ -1,0 +1,9 @@
+{
+  "repository": "joaohts/comms",
+  "version": "v0.1.6-dev.claude-receiver.2",
+  "api_version": 1,
+  "sha256": {
+    "comms_Darwin_amd64.tar.gz": "74c030c555df9867f59d6241aa75f080993ade342acc4f84d14fd63d0ddeebf2",
+    "comms_Darwin_arm64.tar.gz": "dce97a8209d05fd56ac5fc4e019d294b4e6087b51a6b4f9c29a233d9013054d0"
+  }
+}

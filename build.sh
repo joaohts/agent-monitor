@@ -7,11 +7,23 @@ APP_DIR="$APP_NAME.app"
 BIN_DIR="$APP_DIR/Contents/MacOS"
 RES_DIR="$APP_DIR/Contents/Resources"
 
-# Stop any running instance so we can replace the binary
-pkill -x "$APP_NAME" 2>/dev/null || true
-sleep 0.2
+# Headless verification must not stop the user's running GUI. The independent
+# comms service is never killed or restarted by a viewer build.
+if [ "${NO_LAUNCH:-0}" != "1" ]; then
+    pkill -x "$APP_NAME" 2>/dev/null || true
+    sleep 0.2
+fi
 
 mkdir -p "$BIN_DIR" "$RES_DIR"
+
+if [ "${COMMS_SKIP_BUNDLE:-0}" = "1" ]; then
+    [ "${NO_LAUNCH:-0}" = "1" ] || { echo "COMMS_SKIP_BUNDLE is only allowed for headless compiler checks" >&2; exit 1; }
+    rm -rf "$RES_DIR/CommsNode"
+    rm -f "$RES_DIR/comms-bundle.json" "$RES_DIR/install-local-comms.sh"
+    echo "→ compiler-only check: no distributable comms bundle"
+else
+    bash scripts/bundle-comms.sh "$RES_DIR"
+fi
 
 # Generate AppIcon.icns from assets/icon.png if present.
 # Pads to square (larger dim) so non-square sources don't get distorted.
@@ -50,7 +62,7 @@ OPT_FLAGS=""
 if [ "${RELEASE:-0}" = "1" ]; then
     OPT_FLAGS="-O"
 fi
-swiftc AgentMonitor.swift \
+swiftc AgentMonitor.swift CommsNodeClient.swift CommsNodeViews.swift \
     -o "$BIN_DIR/$APP_NAME" \
     -parse-as-library \
     -framework SwiftUI -framework AppKit -framework Carbon -framework UserNotifications \
@@ -100,12 +112,16 @@ sign_stable() {
     codesign --force --sign "$HASH" "$APP_DIR" 2>/dev/null
 }
 
-if sign_stable; then
+if [ "${ADHOC_SIGN:-0}" != "1" ] && sign_stable; then
     echo "→ signed with stable identity '$SIGN_IDENTITY'"
 else
     echo "→ ad-hoc signing (run ./install.sh for a persistent identity)"
     codesign --force --sign - "$APP_DIR"
 fi
 
-echo "→ launching $APP_DIR"
-open "$APP_DIR"
+if [ "${NO_LAUNCH:-0}" != "1" ]; then
+    echo "→ launching $APP_DIR"
+    open "$APP_DIR"
+else
+    echo "→ built $APP_DIR without launching"
+fi
