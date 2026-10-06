@@ -17,6 +17,12 @@ on your Mac (it bundles a pinned comms release), and **brain** on an always-on b
 with its comms channel enabled. Pair the machines once and every session — and the
 brain — can reach every other.
 
+How the parts connect:
+
+- **agent-monitor ↔ comms** — the app bundles a pinned comms release, installs it as a per-user service, and shows its agents, history, pairing and grants. See [agent-monitor: comms connection](https://github.com/joaohts/agent-monitor/blob/main/docs/comms-connection.md).
+- **brain ↔ comms** — the brain joins comms as a persistent agent (alias `brain`), so any session can message it and it can message back. See [comms: brain integration](https://github.com/joaohts/comms/blob/main/docs/BRAIN.md).
+- **Claude Code / Codex ↔ comms** — sessions launched through `comms claude` / `comms codex` receive peer messages. See [comms: Claude](https://github.com/joaohts/comms/blob/main/docs/CLAUDE.md) and [Codex](https://github.com/joaohts/comms/blob/main/docs/CODEX.md).
+
 ## Local agent communications
 
 Every installation includes local comms for Claude and supported Codex sessions.
