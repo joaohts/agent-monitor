@@ -4,8 +4,12 @@ A side-car that maintains a slow-growing **working summary** + **quick facts** p
 Claude Code session, by folding each step's activity into a bounded running state
 instead of re-reading the whole transcript.
 
-Status: **built** on `feat/housekeeping-agent` (projector → fold/provider → side-car →
-settings + dashboard), validated live. Decisions below are settled unless under "Open".
+Status: **built** (projector → fold/provider → side-car → settings + dashboard),
+validated live. Decisions below are settled unless under "Open".
+
+Auto-folding is **opt-in**: it is off for new installs and is enabled in
+Settings → Housekeeping (`agentMonitor.housekeepingEnabled`). It runs on the
+logged-in Claude/Codex subscription, or a metered API key when selected.
 
 ---
 
@@ -148,7 +152,7 @@ markdown — so they're separate):
   The fold reads it in and writes it back; the UI and the future comms board render
   from it.
 - **Markdown export — derived, optional.** Config `summaryMarkdownDir`, unset by
-  default; point it at the synced vault (e.g. `~/notes/jonathan/claude-sessions/`).
+  default; point it at any folder, e.g. a synced notes vault (`~/Documents/agent-summaries/`).
   Generated from the JSON; **the fold never parses it back.** Throttled to `Stop` /
   `SessionEnd` (not every intra-turn fold) so the vault's git auto-sync isn't spammed
   with churn.
@@ -213,9 +217,8 @@ list and the summaries dashboard into one screen.
 
 ## Visualization (downstream)
 
-This agent is the **data layer** for the v2 "Contexto amplo" / orchestration view
-(`~/notes/jonathan/projects/agent-monitor-v2.md`). The per-session JSON state is what
-that dashboard renders.
+This agent is the **data layer** for the v2 orchestration view. The per-session
+JSON state is what that dashboard renders.
 
 Surface split (the groundwork already exists in the code):
 - **Bubbles overlay** (`BubblesView` on the click-through `OverlayPanel`) = the ambient
