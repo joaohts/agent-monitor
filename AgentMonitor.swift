@@ -1893,9 +1893,11 @@ final class HousekeepingGenerator {
     var onFoldingChanged: ((String, Bool) -> Void)?   // (sessionId, isFolding)
 
     // Config (UserDefaults; sensible defaults so it works with no setup).
+    // Auto-folding spends the user's agent subscription, so it is opt-in: off unless
+    // the key was stored (existing installs keep whatever they chose).
     private var enabled: Bool {
         if UserDefaults.standard.bool(forKey: "agentMonitor.classicView") { return false }  // classic = no summaries
-        return UserDefaults.standard.object(forKey: "agentMonitor.housekeepingEnabled") as? Bool ?? true
+        return UserDefaults.standard.object(forKey: "agentMonitor.housekeepingEnabled") as? Bool ?? false
     }
     private var heartbeat: TimeInterval {
         let v = UserDefaults.standard.double(forKey: "agentMonitor.housekeepingHeartbeatSec")
@@ -5040,7 +5042,7 @@ struct SettingsView: View {
     @EnvironmentObject var store: AgentStore
 
     // Housekeeping config — same UserDefaults keys HousekeepingGenerator reads.
-    @AppStorage("agentMonitor.housekeepingEnabled") private var hkEnabled = true
+    @AppStorage("agentMonitor.housekeepingEnabled") private var hkEnabled = false  // opt-in; stored value wins
     @AppStorage("agentMonitor.housekeepingProvider") private var hkProvider = "auto"
     @AppStorage("agentMonitor.housekeepingHeartbeatSec") private var hkHeartbeat = 1800.0
     @AppStorage("agentMonitor.housekeepingMarkdownDir") private var hkMarkdownDir = ""
@@ -5118,6 +5120,8 @@ struct SettingsView: View {
                 Section("Housekeeping") {
                     Toggle("Keep live session summaries", isOn: $hkEnabled)
                         .disabled(store.classicView)
+                    Text("Off by default. Summaries run on your logged-in Claude/Codex subscription (or an API key, if selected below).")
+                        .font(.caption).foregroundStyle(.secondary)
                     if !hkEnabled && !store.classicView {
                         Text("Auto-folding is off. The “Fold now” button on each pane still generates a summary on demand.")
                             .font(.caption).foregroundStyle(.secondary)

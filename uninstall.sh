@@ -8,6 +8,8 @@
 # - Removes the AgentMonitor.app build artifact in the repo
 # Does NOT delete the repo itself — git rm or rm -rf manually if you want.
 # Does NOT revoke TCC permissions — see message at end for manual steps.
+# Does NOT remove the comms node (CLI, launchd service, skills, shell alias,
+# identity) — the closing message prints how to remove it.
 #
 # Pass --keep-data to preserve agents.jsonl and the debug log.
 set -euo pipefail
@@ -178,9 +180,23 @@ echo
 cat <<EOF
 ==> Uninstall complete. Clean slate.
 
-Not auto-revoked (manual cleanup if you want):
-  - The independently installed comms node, identity keys, and message history
-    (stopping the viewer must not interrupt agent communications)
+Not removed: the comms node. It runs independently so stopping the viewer
+never interrupts agent communications. To remove it too (only if nothing else
+uses it):
+  - Stop the service:   launchctl bootout gui/\$(id -u)/com.joaohts.comms
+                        rm ~/Library/LaunchAgents/com.joaohts.comms.plist
+  - CLI:                rm ~/.local/bin/comms   (or comms-v1 if that was installed)
+  - Skills:             rm -rf ~/.claude/skills/open-comms ~/.codex/skills/open-comms
+                        (or open-comms-v1; see ~/.config/agent-monitor/comms-install.json)
+  - Shell alias:        delete the "# BEGIN COMMS CLAUDE ALIAS" ... "# END COMMS CLAUDE ALIAS"
+                        block from ~/.zshrc or ~/.bashrc
+  - Install metadata:   rm ~/.config/agent-monitor/comms-install.json
+  - Identity, keys and message history: ~/.local/share/comms/
+                        (deleting it loses this machine's identity permanently)
+
+Also not auto-revoked (manual cleanup if you want):
+  - Ghostty wizard edits (~/.config/ghostty/config, Claude env, ~/.codex/config.toml):
+    restore the .bak.* copies or remove the lines
   - TCC permissions (Full Disk Access, etc): System Settings → Privacy & Security
   - settings.json backups (.bak.YYYYMMDD_HHMMSS): kept as safety nets
   - The repo itself ($REPO_DIR): \`rm -rf\` or \`git clean\` manually
