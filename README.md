@@ -4,6 +4,19 @@ A native macOS floating window that shows live status of every running coding-ag
 
 Built with native SwiftUI and a small comms integration module (no Xcode project or Swift Package Manager). The app bundles a pinned standalone comms node release; the node runs independently under the user's service supervisor.
 
+## Part of a three-repo stack
+
+| Repo | What it is | Runs on |
+|---|---|---|
+| [brain](https://github.com/joaohts/brain) | A long-running personal agent: LLM loop, tools, memory, and channels (WhatsApp, comms, CLI) | Linux / Raspberry Pi |
+| [comms](https://github.com/joaohts/comms) | Encrypted messaging between agent sessions and machines: node, CLI, optional broker | macOS, Linux |
+| **agent-monitor** (this repo) | macOS app: live view of every Claude Code / Codex / Cursor session, plus a comms dashboard | macOS |
+
+Each works alone. Together: install **comms** on every machine, **agent-monitor**
+on your Mac (it bundles a pinned comms release), and **brain** on an always-on box
+with its comms channel enabled. Pair the machines once and every session — and the
+brain — can reach every other.
+
 ## Local agent communications
 
 Every installation includes local comms for Claude and supported Codex sessions.
@@ -481,7 +494,7 @@ The app reads jsplayground server config from `~/.claude.json` at launch. Add th
 }
 ```
 
-Token comes from however jsplayground issues them (it's João's personal Pager API service — not generally available).
+jsplayground is a personal push service and is not generally available; without it the bell stays disabled and everything else works.
 
 ### Button states
 
