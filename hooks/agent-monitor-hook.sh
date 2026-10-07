@@ -92,6 +92,19 @@ case "$HOOK" in
         [ -z "$AGENT_ID" ] && exit 0
         PARENT_SID="$SESSION_ID"
         SESSION_ID="$AGENT_ID"
+        # Track the subagent's own transcript, not the parent's: a background
+        # subagent keeps writing there while the parent sits quiet, so liveness
+        # follows the subagent. Claude stores it next to the parent transcript.
+        SUB_TRANSCRIPT=$(echo "$INPUT" | jq -r '.agent_transcript_path // ""' 2>/dev/null)
+        if [ -z "$SUB_TRANSCRIPT" ] && [ "${TRANSCRIPT%.jsonl}" != "$TRANSCRIPT" ]; then
+            SUB_TRANSCRIPT="${TRANSCRIPT%.jsonl}/subagents/agent-$AGENT_ID.jsonl"
+        fi
+        # Claude's short internal helpers fire SubagentStop with no start and no
+        # transcript; they are not user-visible subagents.
+        if [ "$HOOK" = "SubagentStop" ] && [ -n "$SUB_TRANSCRIPT" ] && [ ! -f "$SUB_TRANSCRIPT" ]; then
+            exit 0
+        fi
+        [ -n "$SUB_TRANSCRIPT" ] && TRANSCRIPT="$SUB_TRANSCRIPT"
         if [ "$HOOK" = "SubagentStart" ]; then
             EVENT="started"
         else
