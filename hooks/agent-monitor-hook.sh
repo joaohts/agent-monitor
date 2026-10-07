@@ -149,6 +149,39 @@ jq -nc \
      + (if $tty         != "" then {tty: $tty} else {} end)' \
     >> "$OUT" 2>/dev/null
 
+# Porter (opt-in): mirror top-level session state into `comms porter`, which
+# shares it with granted peers such as the phone. Enabled by the presence of
+# ~/.config/porter/config.toml. Synchronous so events keep their order; silent
+# when the installed comms predates porter.
+if [ -f "$HOME/.config/porter/config.toml" ] && [ -z "$PARENT_SID" ]; then
+    P_KIND="" P_NEEDS_KIND="" P_NEEDS_TEXT=""
+    case "$EVENT" in
+        idle) P_KIND="start" ;;
+        started) P_KIND="prompt" ;;
+        stopped|api_error) P_KIND="stop" ;;
+        cleared) P_KIND="end" ;;
+        needs_attention)
+            P_KIND="needs"
+            P_NEEDS_KIND="input"
+            P_NEEDS_TEXT="$MSG"
+            TOOL=$(echo "$INPUT" | jq -r '.tool_name // ""' 2>/dev/null)
+            if [ -n "$TOOL" ]; then
+                P_NEEDS_KIND="permission"
+                DETAIL=$(echo "$INPUT" | jq -r '.tool_input | (.command // .file_path // .url // .pattern // "") | tostring' 2>/dev/null)
+                P_NEEDS_TEXT="$TOOL${DETAIL:+: ${DETAIL:0:80}}"
+            fi
+            ;;
+    esac
+    P_HARNESS="claude"
+    [ "$SOURCE" = "codex" ] && P_HARNESS="codex"
+    if [ -n "$P_KIND" ]; then
+        "${COMMS_BIN:-$HOME/.local/bin/comms}" porter event --agent "$SESSION_ID" --kind "$P_KIND" \
+            --harness "$P_HARNESS" --at "$TS" ${CWD:+--project "$(basename "$CWD")"} \
+            ${P_NEEDS_KIND:+--needs-kind "$P_NEEDS_KIND"} ${P_NEEDS_TEXT:+--needs-text "$P_NEEDS_TEXT"} \
+            </dev/null >/dev/null 2>&1
+    fi
+fi
+
 # Codex's Stop/SubagentStop hooks require a JSON response on successful exit.
 # An empty object means "observe only" and is accepted by every lifecycle hook.
 [ "$SOURCE" = "codex" ] && printf '{}\n'
