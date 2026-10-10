@@ -4,7 +4,7 @@ Notable user-facing changes to Agent Monitor. Newest first.
 
 ## Unreleased
 
-- **Bundled comms is now v0.2.1**, which adds porter: agent state shared with
+- **Bundled comms is now v0.2.2**, which adds porter: agent state shared with
   João's phone (Monitor app), notifications and questions, phone approvals.
   Enable per machine with `comms porter setup --approver <phone>` and
   `comms porter install-hooks`; off by default.
