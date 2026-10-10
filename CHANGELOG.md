@@ -11,7 +11,8 @@ Notable user-facing changes to Agent Monitor. Newest first.
 - **Subagents no longer vanish while they work.** Their rows follow their own
   transcript, Claude's internal no-start helper stops are ignored, and a parent
   stays visible while any subagent is live.
-
+- **New app icon** — three hexagons (two white outlines, one orange) on a near-black
+  rounded square, shared with the Monitor phone app. Run `./update.sh main` to pick it up.
 - **Live session summaries are now opt-in.** The housekeeping summary agent is off
   for new installs, so a fresh install spends nothing on summaries until you enable
   **Settings → Housekeeping → Keep live session summaries**. Existing installs that
