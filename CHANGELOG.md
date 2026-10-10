@@ -4,6 +4,8 @@ Notable user-facing changes to Agent Monitor. Newest first.
 
 ## Unreleased
 
+- **New app icon** — three hexagons (two white outlines, one orange) on a near-black
+  rounded square, shared with the Pager app. Run `./update.sh main` to pick it up.
 - **Live session summaries are now opt-in.** The housekeeping summary agent is off
   for new installs, so a fresh install spends nothing on summaries until you enable
   **Settings → Housekeeping → Keep live session summaries**. Existing installs that

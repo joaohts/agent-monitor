@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="147 110 960 960" width="1024" height="1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0B0B0C"/>
+      <stop offset="1" stop-color="#000000"/>
+    </linearGradient>
+    <linearGradient id="hot" x1="0.8" y1="0" x2="0.25" y2="1">
+      <stop offset="0" stop-color="#FF8A0D"/>
+      <stop offset="0.55" stop-color="#F2560B"/>
+      <stop offset="1" stop-color="#E0330A"/>
+    </linearGradient>
+  </defs>
+  <rect x="147" y="110" width="960" height="960" rx="228" fill="url(#bg)"/>
+  <rect x="148" y="111" width="958" height="958" rx="227" fill="none" stroke="#FFFFFF" stroke-opacity="0.06" stroke-width="2"/>
+  <polygon points="568.6,425.9 657.0,272.8 833.8,272.8 922.2,425.9 833.8,579.0 657.0,579.0" fill="url(#hot)" stroke="url(#hot)" stroke-width="10" stroke-linejoin="round"/>
+  <polygon points="290.2,590.0 375.7,441.9 546.7,441.9 632.2,590.0 546.7,738.1 375.7,738.1" fill="none" stroke="#F4F4F4" stroke-width="20" stroke-linejoin="round"/>
+  <polygon points="574.4,754.1 659.9,606.0 830.9,606.0 916.4,754.1 830.9,902.2 659.9,902.2" fill="none" stroke="#F4F4F4" stroke-width="20" stroke-linejoin="round"/>
+</svg>
