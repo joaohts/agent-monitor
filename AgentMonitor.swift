@@ -3588,6 +3588,15 @@ final class AgentStore: ObservableObject {
                        cwd: nil, ts: nowTs, message: nil, transcriptPath: nil)
         }
 
+        // A parent stays at least idle while any of its subagents is still
+        // working: it must not go .inactive (and vanish) under them.
+        let parentsWithLiveSubagents = Set(agents.compactMap { a -> String? in
+            guard let pid = a.parentSessionId,
+                  a.status == .running || a.status == .away || a.status == .needsAttention
+            else { return nil }
+            return pid
+        })
+
         for a in agents {
             if a.source == .codex, let path = a.transcriptPath, !path.isEmpty,
                let event = transcriptReader.read(path: path).codexTurn?.wakeEvent(for: a) {
@@ -3614,7 +3623,8 @@ final class AgentStore: ObservableObject {
                    let mtime = transcriptReader.read(path: path).lastModified {
                     lastActivity = max(lastActivity, mtime)
                 }
-                if now.timeIntervalSince(lastActivity) > Self.inactiveThresholdSec {
+                if now.timeIntervalSince(lastActivity) > Self.inactiveThresholdSec,
+                   !parentsWithLiveSubagents.contains(a.id) {
                     newEvents.append(makeEvent(.inactiveStart, sessionId: a.id))
                 }
                 continue
@@ -3642,7 +3652,8 @@ final class AgentStore: ObservableObject {
                 guard let lastUpdateDate = Self.iso8601.date(from: a.lastUpdate) else { continue }
                 if mtime > lastUpdateDate.addingTimeInterval(1.0) {
                     newEvents.append(makeEvent(.awayEnd, sessionId: a.id))
-                } else if now.timeIntervalSince(lastUpdateDate) > Self.inactiveThresholdSec {
+                } else if now.timeIntervalSince(lastUpdateDate) > Self.inactiveThresholdSec,
+                          !parentsWithLiveSubagents.contains(a.id) {
                     // .away → .inactive after 5min — abandoned sessions
                     // (interrupted, no Stop hook, no further transcript writes).
                     newEvents.append(makeEvent(.inactiveStart, sessionId: a.id))
